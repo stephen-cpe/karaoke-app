@@ -1,0 +1,78 @@
+# --- Python ---------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# --- Virtual environments -------------------------------------------------
+.venv/
+venv/
+env/
+
+# --- Local configuration / secrets ---------------------------------------
+.env
+.env.*
+!.env.example
+instance/
+
+# --- Logs and generated tooling data --------------------------------------
+*.log
+karaoke.log*
+tools/.cache/
+
+# --- Copyrighted media (never commit) -------------------------------------
+# Keep these directories in the repository with .gitkeep placeholders, but
+# ignore everything users add to them. The two helper scripts in songs/ are
+# source code and stay tracked.
+/songs/*
+!/songs/.gitkeep
+!/songs/normalize_audio.py
+!/songs/transpose.py
+/original_songs/*
+!/original_songs/.gitkeep
+/lyrics/*
+!/lyrics/.gitkeep
+/transposed/*
+!/transposed/.gitkeep
+/background/*
+!/background/.gitkeep
+
+# Also catch stray media anywhere else in the tree.
+*.mp3
+*.wav
+*.flac
+*.m4a
+*.aac
+*.ogg
+*.opus
+*.wma
+*.aiff
+*.mp4
+*.webm
+*.mov
+*.m4v
+*.ogv
+*.srt
+*.words.json
+
+# --- Generated / temporary files ------------------------------------------
+.transpose-*
+.tmp-*
+.normalize-*
+*.tmp
+*.bak
+*.orig
+
+# --- OS / editor junk -----------------------------------------------------
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+*.swp
+*~

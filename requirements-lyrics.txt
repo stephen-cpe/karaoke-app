@@ -1,0 +1,8 @@
+# Lyric timing pipeline (tools/generate_lyrics.py).
+# These packages are large and are not needed to run the web app.
+# Install the CUDA build of PyTorch from the official PyTorch index first if
+# you want GPU acceleration; otherwise the pipeline uses the CPU fallback.
+faster-whisper>=1.2.1
+demucs>=4.1.0
+torch>=2.10.0
+ctranslate2>=4.8.2

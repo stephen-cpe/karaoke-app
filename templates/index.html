@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="theme-color" content="#0f0f0f" />
+  <title>KARAOKE APP</title>
+  <link rel="icon" href="/static/favicon.ico" />
+  <link rel="stylesheet" href="/static/styles.css" />
+  <script defer src="/static/scripts.js"></script>
+</head>
+<body>
+  <!-- Inline icon set: no icon-font dependency, works offline once cached. -->
+  <svg class="icon-sprite" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+    <symbol id="icon-play" viewBox="0 0 24 24"><path d="M8 5.14v13.72c0 .8.88 1.29 1.56.87l10.5-6.86a1.03 1.03 0 0 0 0-1.74L9.56 4.27A1.03 1.03 0 0 0 8 5.14Z"/></symbol>
+    <symbol id="icon-pause" viewBox="0 0 24 24"><path d="M6.5 5h3.5v14H6.5zm7.5 0h3.5v14H14z"/></symbol>
+    <symbol id="icon-replay" viewBox="0 0 24 24"><path d="M12 5V2L7.5 6.5 12 11V8a5 5 0 1 1-5 5H5a7 7 0 1 0 7-8Z"/></symbol>
+    <symbol id="icon-skip" viewBox="0 0 24 24"><path d="M6 18.14 14.5 12 6 5.86v12.28ZM16 6h2v12h-2z"/></symbol>
+    <symbol id="icon-search" viewBox="0 0 24 24"><path d="M10.5 4a6.5 6.5 0 0 1 5.21 10.39l4.95 4.95-1.41 1.41-4.95-4.95A6.5 6.5 0 1 1 10.5 4Zm0 2a4.5 4.5 0 1 0 0 9 4.5 4.5 0 0 0 0-9Z"/></symbol>
+    <symbol id="icon-queue" viewBox="0 0 24 24"><path d="M3 6h12v2H3V6Zm0 4h12v2H3v-2Zm0 4h8v2H3v-2Zm15-8h3v10.5a2.5 2.5 0 1 1-2-2.45V8h-1V6Z"/></symbol>
+    <symbol id="icon-tune" viewBox="0 0 24 24"><path d="M3 17v2h6v-2H3ZM3 5v2h10V5H3Zm10 16v-2h8v-2h-8v-2h-2v6h2ZM7 9v2H3v2h4v2h2V9H7Zm14 4v-2H11v2h10Zm-6-4h2V7h4V5h-4V3h-2v6Z"/></symbol>
+    <symbol id="icon-plus" viewBox="0 0 24 24"><path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2Z"/></symbol>
+    <symbol id="icon-check" viewBox="0 0 24 24"><path d="m9.55 17.05-4.6-4.6L6.36 11l3.19 3.19 8.09-8.1 1.41 1.42-9.5 9.54Z"/></symbol>
+    <symbol id="icon-lyrics" viewBox="0 0 24 24"><path d="M5 4h14a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2Zm0 2v12h14V6H5Zm2 2h8v2H7V8Zm0 4h10v2H7v-2Z"/></symbol>
+    <symbol id="icon-music" viewBox="0 0 24 24"><path d="M12 3v10.55A4 4 0 1 0 14 17V7h4V3h-6Z"/></symbol>
+    <symbol id="icon-key" viewBox="0 0 24 24"><path d="M14.5 3a6.5 6.5 0 0 0-6.26 8.27L3 16.5V21h4.5l5.23-5.24A6.5 6.5 0 1 0 14.5 3Zm0 2a4.5 4.5 0 1 1 0 9 4.5 4.5 0 0 1 0-9Zm-1 2v2h2V7h-2Zm-4.6 4.4L5.4 17.9V19H7l4.5-4.5-2.6-1.1Z"/></symbol>
+    <symbol id="icon-close" viewBox="0 0 24 24"><path d="m6.4 5 5.6 5.6L17.6 5 19 6.4 13.4 12l5.6 5.6-1.4 1.4-5.6-5.6L6.4 19 5 17.6 10.6 12 5 6.4 6.4 5Z"/></symbol>
+  </svg>
+
+  <video id="background-video" autoplay muted playsinline preload="auto" class="background-video" aria-hidden="true">
+    <source src="/background/sample_background_1.mp4" type="video/mp4" />
+  </video>
+  <div class="background-scrim" aria-hidden="true"></div>
+
+  <header class="app-header">
+    <div class="header-inner">
+      <a class="brand" href="/" aria-label="KARAOKE APP home">
+        <img class="brand-image" src="/static/logo.webp"
+             width="40" height="40" alt="" />
+        <span class="brand-name">KARAOKE <span>APP</span></span>
+      </a>
+
+      <div class="search" role="search">
+        <svg class="icon search-icon" aria-hidden="true"><use href="#icon-search"></use></svg>
+        <input id="search-input" type="search" placeholder="Search songs, artists, or IDs" autocomplete="off" spellcheck="false" aria-label="Search songs" />
+        <kbd class="search-shortcut" aria-hidden="true">/</kbd>
+      </div>
+
+      <nav class="header-actions" aria-label="Main navigation">
+        <a class="header-action" href="#queue-heading" id="queue-button">
+          <svg class="icon" aria-hidden="true"><use href="#icon-queue"></use></svg>
+          <span class="header-action-label">Up next</span>
+          <span class="queue-badge" id="queue-count" aria-label="0 songs in queue">0</span>
+        </a>
+        <a class="header-action sync-editor-link" href="/sync_editor.html">
+          <svg class="icon" aria-hidden="true"><use href="#icon-tune"></use></svg>
+          <span class="header-action-label">Sync editor</span>
+        </a>
+      </nav>
+    </div>
+  </header>
+
+  <main class="app-main">
+    <section class="page-heading" aria-labelledby="library-title">
+      <div>
+        <p class="eyebrow">Your library</p>
+        <h1 id="library-title">Songs</h1>
+        <p class="page-subtitle" id="song-summary">Loading your library…</p>
+      </div>
+      <div class="heading-side">
+        <div class="host-join" id="host-join">
+          <div class="host-join-status">
+            <span class="status-dot" id="host-status-dot" aria-hidden="true"></span>
+            <span id="host-status-text" aria-live="polite">Connecting player…</span>
+          </div>
+          <p class="host-join-label">Phones can join here</p>
+          <div class="host-join-row">
+            <code id="host-join-url">Finding this server…</code>
+            <button class="join-copy" id="copy-join-url" type="button" title="Copy the join link">Copy</button>
+          </div>
+        </div>
+        <p class="heading-note">
+          <svg class="icon" aria-hidden="true"><use href="#icon-lyrics"></use></svg>
+          Word-by-word lyrics take the stage when a song starts.
+        </p>
+      </div>
+    </section>
+
+    <div class="content-layout">
+      <section class="surface library" aria-labelledby="all-songs-title">
+        <div class="library-toolbar">
+          <h2 id="all-songs-title">All songs</h2>
+          <span class="library-meta">Sorted A–Z</span>
+        </div>
+        <div id="song-list-content" class="song-list" aria-live="polite"></div>
+      </section>
+
+      <aside class="surface queue-panel" aria-labelledby="queue-heading">
+        <div class="queue-header">
+          <div>
+            <p class="eyebrow">Sing next</p>
+            <h2 id="queue-heading">Up next</h2>
+          </div>
+          <div class="queue-header-actions">
+            <span class="queue-summary" id="queue-summary">Empty</span>
+            <button class="queue-clear" id="queue-clear" type="button" hidden>Clear</button>
+          </div>
+        </div>
+        <div id="queue-display" class="queue-list" aria-live="polite">
+          <div class="queue-empty">
+            <span class="empty-icon" aria-hidden="true">
+              <svg class="icon"><use href="#icon-queue"></use></svg>
+            </span>
+            <p class="empty-title">Your queue is empty</p>
+            <p class="empty-copy">Add songs from the library and they’ll line up here.</p>
+          </div>
+        </div>
+      </aside>
+    </div>
+  </main>
+
+  <section class="lyrics-stage" id="lyrics-stage" aria-label="Current lyrics" aria-live="polite">
+    <p id="lyrics-line" class="lyrics-text"></p>
+  </section>
+
+  <div class="audio-unlock" id="audio-unlock">
+    <span>Sound is waiting for one click on this screen.</span>
+    <button id="audio-unlock-button" type="button">Enable sound</button>
+  </div>
+
+  <footer class="player-bar" aria-label="Player">
+    <div class="player-inner">
+      <div class="now-playing-block">
+        <div class="now-playing-art" id="now-playing-art" aria-hidden="true">
+          <svg class="icon"><use href="#icon-music"></use></svg>
+        </div>
+        <div class="now-playing-meta">
+          <p id="now-playing" class="now-playing-text">Nothing playing</p>
+          <p class="now-playing-artist" id="now-playing-artist">Choose a song to start the queue</p>
+        </div>
+      </div>
+
+      <div class="player-center">
+        <div class="player-controls" aria-label="Playback controls">
+          <button class="icon-button" id="restart-button" type="button" onclick="toggleRepeat()" title="Restart song" aria-label="Restart song" disabled>
+            <svg class="icon" aria-hidden="true"><use href="#icon-replay"></use></svg>
+          </button>
+          <button class="icon-button play-button" id="play-pause-button" type="button" onclick="togglePlayPause()" title="Play" aria-label="Play" disabled>
+            <svg class="icon icon-play" aria-hidden="true"><use href="#icon-play"></use></svg>
+            <svg class="icon icon-pause" aria-hidden="true"><use href="#icon-pause"></use></svg>
+          </button>
+          <button class="icon-button" id="skip-button" type="button" onclick="cancelSong()" title="Skip song" aria-label="Skip song" disabled>
+            <svg class="icon" aria-hidden="true"><use href="#icon-skip"></use></svg>
+          </button>
+        </div>
+
+        <div class="progress-row">
+          <span class="time-label" id="current-time">0:00</span>
+          <div class="progress-track" id="progress-track" role="slider" tabindex="0"
+               aria-label="Seek in song" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+            <div class="progress-fill" id="progress-fill"></div>
+          </div>
+          <span class="time-label" id="duration-time">0:00</span>
+        </div>
+      </div>
+
+      <div class="player-right">
+        <div class="key-control" id="transpose-indicator-wrapper" aria-label="Song key">
+          <span class="key-label">
+            <svg class="icon" aria-hidden="true"><use href="#icon-key"></use></svg>
+            Key
+          </span>
+          <button class="key-step" id="key-down" type="button" onclick="changeTranspose(-1)" title="Lower the key" aria-label="Lower the key" disabled>−</button>
+          <div id="transpose-indicator-bar" class="key-track" aria-hidden="true"></div>
+          <button class="key-step" id="key-up" type="button" onclick="changeTranspose(1)" title="Raise the key" aria-label="Raise the key" disabled>+</button>
+          <span class="key-value" id="transpose-value" aria-live="polite">0</span>
+        </div>
+      </div>
+    </div>
+  </footer>
+
+  <div class="host-overlay" id="host-overlay" hidden>
+    <div class="host-overlay-card" role="alertdialog" aria-modal="true"
+         aria-labelledby="host-overlay-title" aria-describedby="host-overlay-text">
+      <img class="host-overlay-logo" src="/static/logo.webp" width="56" height="56" alt="" />
+      <h2 id="host-overlay-title">Player paused</h2>
+      <p id="host-overlay-text">Another browser is controlling the karaoke player.</p>
+      <div class="host-overlay-actions">
+        <button class="overlay-primary" id="host-takeover-button" type="button">Use this screen as the player</button>
+        <button class="overlay-secondary" id="host-reload-button" type="button">Reload</button>
+      </div>
+    </div>
+  </div>
+</body>
+</html>

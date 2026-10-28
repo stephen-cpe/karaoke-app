@@ -1,0 +1,6 @@
+# Optional CUDA 12 runtime DLLs for CTranslate2 on Windows/Linux x86_64.
+# These are proprietary NVIDIA redistributables and are not part of the app.
+# Install only with a matching CUDA-enabled PyTorch build.
+nvidia-cublas-cu12>=12.9.2
+nvidia-cudnn-cu12>=9.27.0
+nvidia-cuda-nvrtc-cu12>=12.9.86
