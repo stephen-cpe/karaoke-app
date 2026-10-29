@@ -18,7 +18,9 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
-from utils import is_finite_number
+from constants import HOST_TIMEOUT_SECONDS as DEFAULT_HOST_TIMEOUT_SECONDS
+from constants import MAX_SEMITONES
+from utils import is_finite_number, parse_int
 
 
 class PlaybackError(Exception):
@@ -60,8 +62,8 @@ def format_sse(event: str, data: dict[str, Any]) -> str:
 class PlaybackState:
     """Thread-safe shared playback state for one Flask app instance."""
 
-    HOST_TIMEOUT_SECONDS = 8.0
-    STATUSES = {"idle", "loading", "playing", "paused", "error"}
+    HOST_TIMEOUT_SECONDS = DEFAULT_HOST_TIMEOUT_SECONDS
+    STATUSES = frozenset({"idle", "loading", "playing", "paused", "error"})
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
@@ -134,13 +136,16 @@ class PlaybackState:
         last_seen_age = None
         if self._host_id is not None and self._host_last_seen > 0:
             last_seen_age = round(max(0.0, now - self._host_last_seen), 1)
+        position = self._position_locked()
+        if self._duration > 0:
+            position = min(position, self._duration)
         return {
             "server_id": self._server_id,
             "revision": self._revision,
             "host_connected": connected,
             "host_last_seen_seconds": last_seen_age,
             "status": self._status,
-            "position": round(self._position_locked(), 3),
+            "position": round(position, 3),
             "duration": round(max(0.0, self._duration), 3),
             "current": dict(self._current) if self._current else None,
             "queue": [dict(song) for song in self._queue],
@@ -159,17 +164,27 @@ class PlaybackState:
     # ------------------------------------------------------------------
 
     def subscribe(self, role: str, client_id: str) -> Subscriber:
+        # Replay commands that were produced while the host was between SSE
+        # connections. The host ignores duplicates by command id.
+        return self.subscribe_with_snapshot(role, client_id)[0]
+
+    def subscribe_with_snapshot(self, role: str, client_id: str
+                                ) -> tuple[Subscriber, dict[str, Any]]:
+        """Register a subscriber and capture its initial snapshot atomically.
+
+        Registering and snapshotting under the same lock prevents a newer
+        state event from being queued before the initial snapshot and then
+        delivered out of order.
+        """
         subscriber = Subscriber(role=role, client_id=client_id)
         with self._lock:
             subscriber_id = self._next_subscriber_id
             self._next_subscriber_id += 1
             self._subscribers[subscriber_id] = subscriber
-            # Replay commands that were produced while the host was between
-            # SSE connections. The host ignores duplicates by command id.
             if role == "host" and client_id and client_id == self._host_id:
                 for command in self._pending_commands:
                     subscriber.push("command", command)
-        return subscriber
+            return subscriber, self._snapshot_locked()
 
     def unsubscribe(self, subscriber: Subscriber) -> None:
         with self._lock:
@@ -212,10 +227,29 @@ class PlaybackState:
         self._broadcast_locked("command", command, role="host", client_id=self._host_id)
         return command
 
+    def _begin_song_locked(self, song: dict[str, Any], *,
+                           send_load_command: bool) -> None:
+        """Reset transport state and optionally tell the host to load a song."""
+        self._current = dict(song)
+        self._status = "loading"
+        self._position = 0.0
+        self._duration = 0.0
+        self._transpose = 0
+        self._last_error = None
+        self._position_updated_at = time.monotonic()
+        if send_load_command and self._host_connected_locked():
+            self._send_command_locked(
+                "load",
+                song=dict(self._current),
+                position=0.0,
+                autoplay=True,
+                transpose=0,
+            )
+
     def _ack_commands_locked(self, last_command_id: Any) -> None:
         try:
-            acked = int(last_command_id)
-        except (TypeError, ValueError):
+            acked = parse_int(last_command_id)
+        except ValueError:
             return
         # A client cannot acknowledge commands the server never issued.
         acked = max(0, min(acked, self._command_id))
@@ -235,9 +269,7 @@ class PlaybackState:
         if not client_id or client_id != self._host_id:
             raise PlaybackError("This browser is not the active player.", 409)
 
-    def _require_host_locked(self, client_id: str | None = None) -> None:
-        if client_id is not None:
-            self._require_host_id_locked(client_id)
+    def _require_host_locked(self) -> None:
         if not self._host_connected_locked():
             raise PlaybackError("The player is offline.", 409)
 
@@ -272,17 +304,37 @@ class PlaybackState:
             # songs were added while the player page was closed), start the
             # first one now. The host loads it from the returned snapshot.
             if self._current is None and self._queue:
-                self._current = self._queue.pop(0)
-                self._status = "loading"
-                self._position = 0.0
-                self._duration = 0.0
-                self._transpose = 0
-                self._last_error = None
-                self._position_updated_at = time.monotonic()
+                self._begin_song_locked(
+                    self._queue.pop(0), send_load_command=False)
                 self._touch_locked()
 
             self._broadcast_state_locked()
             return self._snapshot_locked()
+
+    def register_host_with_commands(self, client_id: str) -> dict[str, Any]:
+        """Register a host and return its snapshot plus pending commands atomically."""
+        with self._lock:
+            return {
+                "state": self.register_host(client_id),
+                "commands": [dict(command) for command in self._pending_commands],
+            }
+
+    def report_host_with_commands(self, client_id: str,
+                                  report: dict[str, Any]) -> dict[str, Any]:
+        """Report host state and return the snapshot plus pending commands atomically."""
+        with self._lock:
+            return {
+                "state": self.report_host(client_id, report),
+                "commands": [dict(command) for command in self._pending_commands],
+            }
+
+    def commands_payload(self, client_id: str) -> dict[str, Any]:
+        """Return polling commands and the matching state under one lock."""
+        with self._lock:
+            return {
+                "commands": self.commands_for_host(client_id),
+                "state": self._snapshot_locked(),
+            }
 
     def disconnect_host(self, client_id: str) -> dict[str, Any]:
         with self._lock:
@@ -293,6 +345,10 @@ class PlaybackState:
                 self._host_id = None
                 self._host_last_seen = 0.0
                 self._host_offline_reported = True
+                # Commands belong to the host that received them. A different
+                # browser must never inherit a stale load/pause/stop.
+                self._pending_commands = []
+                self._acked_command_id = self._command_id
                 self._broadcast_state_locked()
             return self._snapshot_locked()
 
@@ -355,14 +411,16 @@ class PlaybackState:
                 if not is_finite_number(duration):
                     raise PlaybackError("duration must be a number.", 400)
                 self._duration = max(0.0, float(duration))
+                if self._duration > 0:
+                    self._position = min(self._position, self._duration)
 
             transpose = report.get("transpose")
             if transpose is not None:
                 try:
-                    transpose = int(transpose)
-                except (TypeError, ValueError):
+                    transpose = parse_int(transpose)
+                except ValueError:
                     raise PlaybackError("transpose must be an integer.", 400)
-                self._transpose = max(-4, min(4, transpose))
+                self._transpose = max(-MAX_SEMITONES, min(MAX_SEMITONES, transpose))
 
             volume = report.get("volume")
             if volume is not None:
@@ -414,20 +472,7 @@ class PlaybackState:
         with self._lock:
             started = False
             if self._current is None and self._host_connected_locked() and not self._queue:
-                self._current = dict(song)
-                self._status = "loading"
-                self._position = 0.0
-                self._duration = 0.0
-                self._transpose = 0
-                self._last_error = None
-                self._position_updated_at = time.monotonic()
-                self._send_command_locked(
-                    "load",
-                    song=dict(self._current),
-                    position=0.0,
-                    autoplay=True,
-                    transpose=0,
-                )
+                self._begin_song_locked(song, send_load_command=True)
                 started = True
             else:
                 self._queue.append(dict(song))
@@ -439,8 +484,8 @@ class PlaybackState:
 
     def remove_queue(self, index: Any) -> dict[str, Any]:
         try:
-            index = int(index)
-        except (TypeError, ValueError):
+            index = parse_int(index)
+        except ValueError:
             raise PlaybackError("Queue index must be an integer.", 400)
         with self._lock:
             if index < 0 or index >= len(self._queue):
@@ -457,9 +502,9 @@ class PlaybackState:
 
     def reorder_queue(self, from_index: Any, to_index: Any) -> dict[str, Any]:
         try:
-            from_index = int(from_index)
-            to_index = int(to_index)
-        except (TypeError, ValueError):
+            from_index = parse_int(from_index)
+            to_index = parse_int(to_index)
+        except ValueError:
             raise PlaybackError("Queue indexes must be integers.", 400)
         with self._lock:
             if not (0 <= from_index < len(self._queue)):
@@ -472,33 +517,20 @@ class PlaybackState:
             return self._snapshot_locked()
 
     def _advance_locked(self) -> dict[str, Any]:
-        if self._current is not None:
-            self._current = self._queue.pop(0) if self._queue else None
-        elif self._queue:
-            self._current = self._queue.pop(0)
-        else:
-            self._current = None
-
-        self._transpose = 0
-        self._position = 0.0
-        self._duration = 0.0
-        self._last_error = None
-        self._position_updated_at = time.monotonic()
+        self._current = self._queue.pop(0) if self._queue else None
 
         if self._current is None:
             self._status = "idle"
+            self._transpose = 0
+            self._position = 0.0
+            self._duration = 0.0
+            self._last_error = None
+            self._position_updated_at = time.monotonic()
             if self._host_connected_locked():
                 self._send_command_locked("stop")
         else:
-            self._status = "loading"
-            if self._host_connected_locked():
-                self._send_command_locked(
-                    "load",
-                    song=dict(self._current),
-                    position=0.0,
-                    autoplay=True,
-                    transpose=0,
-                )
+            self._begin_song_locked(
+                self._current, send_load_command=True)
 
         self._broadcast_state_locked()
         return self._snapshot_locked()
@@ -515,26 +547,15 @@ class PlaybackState:
         with self._lock:
             self._require_host_locked()
             if self._current is None:
-                if self._queue:
-                    self._current = self._queue.pop(0)
-                    self._status = "loading"
-                    self._position = 0.0
-                    self._duration = 0.0
-                    self._transpose = 0
-                    self._position_updated_at = time.monotonic()
-                    self._send_command_locked(
-                        "load",
-                        song=dict(self._current),
-                        position=0.0,
-                        autoplay=True,
-                        transpose=0,
-                    )
-                else:
+                if not self._queue:
                     raise PlaybackError("There is nothing to play.", 409)
+                self._begin_song_locked(
+                    self._queue.pop(0), send_load_command=True)
             else:
                 # Respond immediately; the host acknowledges the command with
                 # its real playback state on the next report.
                 self._status = "playing"
+                self._last_error = None
                 self._position_updated_at = time.monotonic()
                 self._send_command_locked("play")
             self._broadcast_state_locked()
@@ -582,11 +603,14 @@ class PlaybackState:
 
     def set_transpose(self, semitones: Any) -> dict[str, Any]:
         try:
-            semitones = int(semitones)
-        except (TypeError, ValueError):
+            semitones = parse_int(semitones)
+        except ValueError:
             raise PlaybackError("transpose must be an integer.", 400)
-        if abs(semitones) > 4:
-            raise PlaybackError("transpose must be between -4 and 4.", 400)
+        if abs(semitones) > MAX_SEMITONES:
+            raise PlaybackError(
+                f"transpose must be between -{MAX_SEMITONES} and {MAX_SEMITONES}.",
+                400,
+            )
         with self._lock:
             self._require_host_locked()
             if self._current is None:

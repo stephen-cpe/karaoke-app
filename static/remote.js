@@ -15,7 +15,7 @@
         `remote-${Date.now()}-${Math.random().toString(16).slice(2)}`;
       sessionStorage.setItem(key, created);
       return created;
-    } catch (err) {
+    } catch {
       return `remote-${Date.now()}-${Math.random().toString(16).slice(2)}`;
     }
   })();
@@ -72,8 +72,7 @@
   let receivedAt = 0;                // performance.now() when it arrived
   let reachable = false;             // Can this phone reach Flask?
   let hadNetworkError = false;
-  let networkFailures = 0;
-  let live = false;                  // SSE connection is open
+    let live = false;                  // SSE connection is open
   let eventSource = null;
   let reconnectTimer = null;
   let reconnectAttempts = 0;
@@ -174,7 +173,7 @@
   async function readJson(response) {
     try {
       return await response.json();
-    } catch (err) {
+    } catch {
       return {};
     }
   }
@@ -219,8 +218,13 @@
   function markReachable() {
     reachable = true;
     hadNetworkError = false;
-    networkFailures = 0;
     updateConnectionUI();
+    renderTransport();
+    renderKey();
+    renderVolume();
+    renderQueueCounts();
+    renderProgress();
+    schedulePlaybackLoop();
   }
 
   function markUnreachable() {
@@ -228,7 +232,13 @@
     hadNetworkError = true;
     live = false;
     closeEvents();
+    stopPlaybackLoop();
     updateConnectionUI();
+    renderTransport();
+    renderKey();
+    renderVolume();
+    renderQueueCounts();
+    renderProgress();
     startPolling();
     scheduleReconnect(1500);
   }
@@ -249,8 +259,6 @@
       server_id: snapshot.server_id || null,
       revision: Number.isFinite(revision) ? revision : 0,
       host_connected: !!snapshot.host_connected,
-      host_last_seen_seconds: Number.isFinite(Number(snapshot.host_last_seen_seconds))
-        ? Number(snapshot.host_last_seen_seconds) : null,
       status: typeof snapshot.status === "string" ? snapshot.status : "idle",
       position: Number.isFinite(Number(snapshot.position))
         ? Math.max(0, Number(snapshot.position)) : 0,
@@ -264,13 +272,11 @@
         ? clamp(Math.trunc(Number(snapshot.transpose)), -4, 4) : 0,
       volume: Number.isFinite(Number(snapshot.volume))
         ? clamp(Number(snapshot.volume), 0, 1) : 1,
-      error: snapshot.error ? String(snapshot.error) : null,
-      last_command_id: Number(snapshot.last_command_id) || 0
+      error: snapshot.error ? String(snapshot.error) : null
     };
     receivedAt = performance.now();
     reachable = true;
     hadNetworkError = false;
-    networkFailures = 0;
 
     const song = shared.current;
     const nextKey = song ? song.filename : null;
@@ -312,7 +318,7 @@
   function projectedPosition() {
     if (!shared || !shared.current) return 0;
     let position = Number(shared.position) || 0;
-    if (shared.status === "playing" && hostIsOnline()) {
+    if (shared.status === "playing" && canControl()) {
       position += Math.max(0, performance.now() - receivedAt) / 1000;
     }
     if (shared.duration > 0) position = Math.min(position, shared.duration);
@@ -323,6 +329,10 @@
     // The server owns host presence. A regular heartbeat below makes the
     // server notice a player that stopped reporting, even when SSE is quiet.
     return !!(shared && shared.host_connected);
+  }
+
+  function canControl() {
+    return reachable && hostIsOnline();
   }
 
   // --- CONNECTION --------------------------------------------------------
@@ -388,11 +398,15 @@
         console.warn("State request failed:", data.error || response.status);
       }
     } catch (err) {
-      networkFailures += 1;
       if (isNetworkError(err) && !live) {
         reachable = false;
         hadNetworkError = true;
         updateConnectionUI();
+        renderTransport();
+        renderKey();
+        renderVolume();
+        renderProgress();
+        renderQueueCounts();
       }
     } finally {
       pollInFlight = false;
@@ -441,7 +455,7 @@
     try {
       source = new EventSource(
         `/api/events?role=remote&client_id=${encodeURIComponent(CLIENT_ID)}`);
-    } catch (err) {
+    } catch {
       startPolling();
       scheduleReconnect(2000);
       return;
@@ -538,7 +552,7 @@
   function renderTransport() {
     const song = shared ? shared.current : null;
     const queue = shared ? shared.queue : [];
-    const online = hostIsOnline();
+    const online = canControl();
     const loading = shared ? shared.status === "loading" : false;
     const playing = shared ? shared.status === "playing" : false;
     const canStart = !!song || queue.length > 0;
@@ -559,7 +573,7 @@
 
   function renderKey() {
     const transpose = shared ? shared.transpose : 0;
-    const online = hostIsOnline();
+    const online = canControl();
     const hasSong = !!(shared && shared.current);
 
     if (ui.keyReadout) ui.keyReadout.textContent = signedSemitones(transpose);
@@ -582,7 +596,7 @@
 
   function renderVolume() {
     if (!ui.volumeSlider) return;
-    const online = hostIsOnline();
+    const online = canControl();
     ui.volumeSlider.disabled = !online;
 
     // Do not fight the user's finger while they are adjusting the slider.
@@ -652,7 +666,7 @@
       return;
     }
 
-    const canSeek = hostIsOnline() && shared.duration > 0;
+    const canSeek = canControl() && shared.duration > 0;
     ui.seekSlider.disabled = !canSeek;
     if (seekDragging) {
       updateSeekPreview();
@@ -681,7 +695,7 @@
 
   function schedulePlaybackLoop() {
     if (playbackHandle !== null) return;
-    if (document.hidden || !shared || !shared.current) return;
+    if (document.hidden || !shared || !shared.current || !canControl()) return;
 
     if (shared.status === "playing") {
       playbackIsRaf = true;
@@ -787,8 +801,10 @@
 
   function setLyricsPlaceholder(text) {
     if (!ui.lyricsLine) return;
-    ui.lyricsLine.className = "lyrics-line is-placeholder";
-    ui.lyricsLine.textContent = text;
+    if (ui.lyricsLine.className !== "lyrics-line is-placeholder") {
+      ui.lyricsLine.className = "lyrics-line is-placeholder";
+    }
+    if (ui.lyricsLine.textContent !== text) ui.lyricsLine.textContent = text;
     if (ui.lyricsNext) ui.lyricsNext.textContent = "";
     lastNextLine = "";
   }
@@ -1015,7 +1031,8 @@
 
   function queueFingerprint() {
     const queue = shared ? shared.queue : [];
-    return queue.map(song =>
+    const current = shared && shared.current ? shared.current.filename : "";
+    return current + "\u0003" + queue.map(song =>
       [song.filename, song.title, song.artist].join("\u0001")).join("\u0002");
   }
 
@@ -1444,7 +1461,7 @@
     ui.volumeSlider.setAttribute("aria-valuetext", percent + "% volume");
   }
 
-  function sendVolume(immediate = false) {
+  function sendVolume() {
     if (!ui.volumeSlider || !shared || !hostIsOnline()) return;
     clearTimeout(volumeTimer);
     const percent = clamp(Number(ui.volumeSlider.value), 0, 100);
@@ -1481,14 +1498,14 @@
 
     try {
       sessionStorage.setItem("karaoke.remote.tab", name);
-    } catch (err) { /* private mode */ }
+    } catch { /* private mode */ }
   }
 
   function setupTabs() {
     let saved = null;
     try {
       saved = sessionStorage.getItem("karaoke.remote.tab");
-    } catch (err) { /* private mode */ }
+    } catch { /* private mode */ }
     if (saved === "songs" || saved === "queue") activeTab = saved;
 
     const tabs = [ui.tabQueue, ui.tabSongs].filter(Boolean);
@@ -1532,7 +1549,7 @@
         deferredInstallPrompt.prompt();
         try {
           await deferredInstallPrompt.userChoice;
-        } catch (err) { /* the browser dismissed the prompt */ }
+        } catch { /* the browser dismissed the prompt */ }
         deferredInstallPrompt = null;
         ui.installButton.hidden = true;
       });
@@ -1604,11 +1621,11 @@
       ui.volumeSlider.addEventListener("input", () => {
         updateVolumePreview();
         clearTimeout(volumeTimer);
-        volumeTimer = setTimeout(() => sendVolume(false), 160);
+        volumeTimer = setTimeout(() => sendVolume(), 160);
       });
       ui.volumeSlider.addEventListener("change", () => {
         updateVolumePreview();
-        sendVolume(true);
+        sendVolume();
       });
     }
 

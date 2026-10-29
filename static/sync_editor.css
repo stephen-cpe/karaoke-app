@@ -98,22 +98,6 @@ a:hover {
   color: #fff;
 }
 
-.brand-mark {
-  display: grid;
-  place-items: center;
-  width: 34px;
-  height: 24px;
-  border-radius: 7px;
-  background: var(--accent);
-  box-shadow: 0 2px 10px rgba(255, 0, 51, 0.25);
-}
-
-.brand-mark svg {
-  width: 15px;
-  height: 15px;
-  fill: #fff;
-}
-
 .brand-image {
   display: block;
   width: 30px;
@@ -298,12 +282,6 @@ a:hover {
   border-color: #fff;
   background: #fff;
   color: #0f0f0f;
-}
-
-.btn-link {
-  border: 0;
-  background: transparent;
-  color: var(--focus);
 }
 
 .form-control,
@@ -789,6 +767,7 @@ a:hover {
   top: 0;
   bottom: 0;
   border: 0;
+  pointer-events: auto;
   border-right: 1px solid rgba(255, 255, 255, 0.12);
   border-left: 1px solid rgba(255, 255, 255, 0.12);
   background: rgba(255, 0, 51, 0.14);
@@ -1044,11 +1023,6 @@ a:hover {
     font-size: 11px;
   }
 
-  .brand-mark {
-    width: 30px;
-    height: 22px;
-  }
-
   .topbar-divider,
   .title-block p {
     display: none;
@@ -1098,4 +1072,12 @@ a:hover {
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
   }
+}
+
+.song-select {
+  max-width: 22rem;
+}
+
+.follow-toggle {
+  margin: 0;
 }

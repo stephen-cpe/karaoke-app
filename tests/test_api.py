@@ -261,9 +261,8 @@ def test_save_lyrics_rejects_invalid_word_timings(client, app, add_song):
             == "1\n00:00:00,000 --> 00:00:01,000\nHello\n")
 
 
-def test_save_lyrics_rejects_oversized_word_timings(client, add_song, monkeypatch):
-    import app as karaoke_app
-    monkeypatch.setattr(karaoke_app, "MAX_WORDS_BYTES", 64)
+def test_save_lyrics_rejects_oversized_word_timings(client, app, add_song, monkeypatch):
+    monkeypatch.setitem(app.config, "MAX_WORDS_BYTES", 64)
     song = add_song("1_a_b.mp3")
     res = client.post("/api/save-lyrics", json={
         "song_id": song, "lyrics": SRT, "words": WORDS})
@@ -275,3 +274,50 @@ def test_save_lyrics_rejects_oversized_payload_appended(client, app, add_song):
     oversized = "x" * 1_000_001
     res = client.post("/api/save-lyrics", json={"song_id": song, "lyrics": oversized})
     assert res.status_code == 400
+
+def test_save_lyrics_rejects_negative_and_non_boolean_word_metadata(client, add_song):
+    song = add_song("1_a_b.mp3")
+    cases = [
+        {"lines": [{"start": -1, "end": 2, "text": "hello", "instrumental": False,
+                    "words": [{"text": "hello", "start": 0, "end": 1}]}]},
+        {"lines": [{"start": 0, "end": 2, "text": "[Instrumental]",
+                    "instrumental": "false", "words": []}]},
+        {"lines": [{"start": 0, "end": 2, "text": "hello", "instrumental": False,
+                    "words": [{"text": "hello", "start": 0, "end": 1}]}],
+         "duration": float("nan")},
+    ]
+    for case in cases:
+        res = client.post("/api/save-lyrics",
+                          json={"song_id": song, "lyrics": SRT, "words": case})
+        assert res.status_code == 400, (case, res.get_json())
+
+
+def test_oversized_request_body_returns_json_413(client):
+    res = client.post("/api/save-lyrics", data=b"x" * 8_000_001,
+                      content_type="application/json")
+    assert res.status_code == 413
+    assert res.is_json
+    assert "too large" in res.get_json()["error"].lower()
+
+def test_pages_avoid_inline_javascript(client):
+    host = client.get("/").data
+    editor = client.get("/sync_editor.html").data
+    remote = client.get("/remote").data
+
+    assert b"onclick=" not in host
+    assert b"<script defer src=\"/static/sync_editor.js\"></script>" in editor
+    assert b"<script>" not in editor
+    assert b"onclick=" not in remote
+
+def test_relative_media_directories_resolve_from_working_directory(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "songs").mkdir()
+    (tmp_path / "songs" / "1_a_b.mp3").write_bytes(b"fake-audio")
+
+    app = create_app(songs_dir="songs", lyrics_dir="lyrics",
+                     transposed_dir="transposed")
+    response = app.test_client().get("/songs/1_a_b.mp3")
+
+    assert response.status_code == 200
+    assert response.data == b"fake-audio"
+    assert app.config["SONGS_DIR"] == (tmp_path / "songs").resolve()

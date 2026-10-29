@@ -2,11 +2,16 @@
 
 ## Project layout
 
-- `app.py` — Flask routes: role-aware pages, shared-session API, SSE, catalog,
-  transposition, lyrics saving, and PWA endpoints.
+- `app.py` — entry point: `create_app()`, logging, and Waitress/dev-server startup.
+- `karaoke/` — Flask application package:
+  - `__init__.py` — app factory, config, error handlers, request logging.
+  - `catalog.py`, `lyrics.py`, `transposition.py` — shared services.
+  - `http.py`, `logging.py`, `config.py` — request, logging, and config helpers.
+  - `routes/` — pages, shared-session API, library API, and browser-log blueprints.
+- `constants.py` — constants shared by the Flask package and session state.
 - `playback_state.py` — thread-safe in-memory session: queue, host lifecycle,
   presence timeout, ordered host commands, and command acknowledgement.
-- `utils.py` — shared finite-number validation and log-line sanitizing.
+- `utils.py` — shared finite-number validation, integer parsing, and log sanitizing.
 - `static/vendor/` — local Bootstrap and WaveSurfer builds plus their license files.
 - `requirements*.txt` — core, dev/test, media-helper, lyric-pipeline, and optional
   CUDA dependency groups.
@@ -16,6 +21,8 @@
 - `static/remote.js`, `static/remote.css`, `templates/remote.html` — controls-only
   phone remote. It must not create audio/video elements or play media.
 - `templates/index.html` — host player page, including the sync editor link.
+- `static/sync_editor.js`, `static/sync_editor.css`, `templates/sync_editor.html` —
+  lyric sync editor (logic kept out of the template).
 - `static/manifest.webmanifest`, `static/sw.js`, `static/icon-*.png` — phone PWA.
 - `tests/` — Flask app, API, shared-state, and PWA tests.
 - `original_songs/` — source tracks (full mix with vocals).
@@ -40,9 +47,11 @@
   ```powershell
   .\venv\Scripts\python -m pip install -r requirements-dev.txt
   .\venv\Scripts\python -m pytest -q
+  .\venv\Scripts\ruff check .
   node --check static\background.js
   node --check static\scripts.js
   node --check static\remote.js
+  node --check static\sync_editor.js
   node --check static\sw.js
   ```
 

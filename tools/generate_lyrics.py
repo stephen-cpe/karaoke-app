@@ -77,6 +77,23 @@ def run(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
                           errors="replace", **kwargs)
 
 
+def atomic_write_text(path: Path, text: str) -> None:
+    """Write a text file without exposing a partial file to the next run."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_path = tempfile.mkstemp(
+        dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(text)
+        os.replace(temp_path, path)
+    except BaseException:
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+        raise
+
+
 def norm_token(text: str) -> str:
     """Lowercase and strip punctuation so 'I'm', 'I? m' and 'Im' compare equal."""
     text = text.lower().replace("\u2019", "'").replace("\u2018", "'").replace("`", "'")
@@ -147,7 +164,7 @@ def duration_of(path: Path) -> float:
 
 def separate_vocals(stem: str, original: Path, cache_dir: Path, force: bool = False) -> Path:
     vocals = cache_dir / "stems" / "htdemucs" / stem / "vocals.wav"
-    if vocals.exists() and not force:
+    if vocals.is_file() and vocals.stat().st_size > 0 and not force:
         log.info("  vocals cached: %s", vocals)
         return vocals
 
@@ -163,7 +180,8 @@ def separate_vocals(stem: str, original: Path, cache_dir: Path, force: bool = Fa
     result = run([sys.executable, "-m", "demucs", "--two-stems=vocals",
                   "-n", "htdemucs", "-d", device,
                   "-o", str(cache_dir / "stems"), str(original)])
-    if not vocals.exists():
+    if (result.returncode != 0 or not vocals.is_file()
+            or vocals.stat().st_size == 0):
         details = (result.stderr or result.stdout or "")[-3000:]
         raise RuntimeError(f"Demucs did not produce {vocals}\n{details}")
     return vocals
@@ -328,11 +346,15 @@ def transcribe(stem: str, vocals: Path, prompt: str, cache_dir: Path,
                force: bool = False) -> dict:
     out = cache_dir / "transcripts" / f"{stem}.json"
     if out.exists() and not force:
-        cached = json.loads(out.read_text(encoding="utf-8"))
-        if cached.get("transcriber") == TRANSCRIBER_VERSION:
-            log.info("  transcript cached: %s", out)
-            return cached
-        log.info("  transcript cache is outdated; re-running Whisper")
+        try:
+            cached = json.loads(out.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            log.warning("  transcript cache is unreadable; re-running Whisper")
+        else:
+            if cached.get("transcriber") == TRANSCRIBER_VERSION:
+                log.info("  transcript cached: %s", out)
+                return cached
+            log.info("  transcript cache is outdated; re-running Whisper")
 
     configure_nvidia_dlls()
     try:
@@ -373,8 +395,7 @@ def transcribe(stem: str, vocals: Path, prompt: str, cache_dir: Path,
     if data is None:
         raise RuntimeError("no Whisper device could transcribe the vocals")
 
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    atomic_write_text(out, json.dumps(data, indent=2, ensure_ascii=False))
     return data
 
 
@@ -409,16 +430,15 @@ def lrclib_search(artist: str, title: str, cache_dir: Path) -> list[dict]:
             if not isinstance(data, list):
                 raise ValueError("LRCLIB returned an unexpected payload")
             if data:
-                cache.parent.mkdir(parents=True, exist_ok=True)
-                cache.write_text(json.dumps(data, indent=2, ensure_ascii=False),
-                                 encoding="utf-8")
+                atomic_write_text(cache, json.dumps(data, indent=2, ensure_ascii=False))
             else:
                 log.info("  LRCLIB returned no results (not cached; will retry next run)")
             return data
         except Exception as exc:
             last = exc
             log.warning("  LRCLIB attempt %d failed: %s", attempt, exc)
-            time.sleep(2 * attempt)
+            if attempt < 3:
+                time.sleep(2 * attempt)
     log.warning("  LRCLIB unavailable (%s); continuing with local transcript", last)
     return []
 
@@ -502,9 +522,9 @@ def vocal_onset(audio, start: float, end: float,
     if audio is None or end <= start:
         return None
     times, values = _window_rms(audio, sample_rate, start, end)
-    for time, value in zip(times, values):
+    for moment, value in zip(times, values):
         if value >= threshold:
-            return float(time)
+            return float(moment)
     return None
 
 
@@ -1438,11 +1458,6 @@ def write_outputs(stem: str, cues: list[dict], duration: float) -> tuple[Path, P
     srt_path = LYRICS_DIR / f"{stem}.srt"
     json_path = LYRICS_DIR / f"{stem}.words.json"
 
-    blocks = []
-    for index, cue in enumerate(cues, 1):
-        blocks.append(f"{index}\n{srt_time(cue['start'])} --> {srt_time(cue['end'])}\n{cue['text']}\n")
-    srt_path.write_text("\n".join(blocks), encoding="utf-8")
-
     payload = {
         "version": 1,
         "song": stem,
@@ -1464,7 +1479,14 @@ def write_outputs(stem: str, cues: list[dict], duration: float) -> tuple[Path, P
             for cue in cues
         ],
     }
-    json_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    # Write the sidecar first: the SRT is the "--missing" completion marker,
+    # so a crash between the two writes must not leave an unvalidated SRT.
+    atomic_write_text(json_path, json.dumps(payload, indent=2, ensure_ascii=False))
+
+    blocks = []
+    for index, cue in enumerate(cues, 1):
+        blocks.append(f"{index}\n{srt_time(cue['start'])} --> {srt_time(cue['end'])}\n{cue['text']}\n")
+    atomic_write_text(srt_path, "\n".join(blocks))
     return srt_path, json_path
 
 

@@ -2,7 +2,7 @@
 // Caches the remote shell only. Session state, songs, lyrics, and transcoded
 // audio always come from the network so stale data can never control the TV.
 
-const CACHE_VERSION = "karaoke-remote-v1";
+const CACHE_VERSION = "karaoke-remote-v2";
 const CORE_ASSETS = [
   "/remote",
   "/manifest.webmanifest",
@@ -24,7 +24,9 @@ const NETWORK_ONLY_PREFIXES = [
 ];
 
 function isRemotePage(pathname) {
-  return pathname === "/" || pathname === "/remote" || pathname === "/remote/";
+  // The host page at "/" is not part of the remote shell and must never fall
+  // back to the phone UI when offline.
+  return pathname === "/remote" || pathname === "/remote/";
 }
 
 self.addEventListener("install", event => {
@@ -54,22 +56,29 @@ self.addEventListener("fetch", event => {
   if (url.origin !== self.location.origin) return;
   if (NETWORK_ONLY_PREFIXES.some(prefix => url.pathname.startsWith(prefix))) return;
   if (url.pathname === "/transpose" || url.pathname.startsWith("/transpose/")) return;
-  if (url.pathname === "/api/events") return;
 
   // Pages: always try the network first, then fall back to the remote shell.
   if (request.mode === "navigate") {
     event.respondWith(
-      fetch(request).catch(() => {
-        if (isRemotePage(url.pathname)) {
-          return caches.match("/remote").then(cached =>
-            cached || new Response("Offline", {
-              status: 503,
-              headers: { "Content-Type": "text/plain; charset=utf-8" }
-            })
-          );
-        }
-        return Response.error();
-      })
+      fetch(request)
+        .then(response => {
+          if (response.ok && isRemotePage(url.pathname)) {
+            const copy = response.clone();
+            caches.open(CACHE_VERSION).then(cache => cache.put("/remote", copy));
+          }
+          return response;
+        })
+        .catch(() => {
+          if (isRemotePage(url.pathname)) {
+            return caches.match("/remote").then(cached =>
+              cached || new Response("Offline", {
+                status: 503,
+                headers: { "Content-Type": "text/plain; charset=utf-8" }
+              })
+            );
+          }
+          return Response.error();
+        })
     );
     return;
   }

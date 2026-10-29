@@ -3,8 +3,6 @@
 import os
 import subprocess
 
-import pytest
-
 
 def fake_ffmpeg(monkeypatch, calls):
     """Patch subprocess.run with a stub that 'produces' the output file."""

@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
 Generate lyrics for songs that do not have an SRT yet, then validate them.
 
@@ -17,12 +17,15 @@ Existing SRTs are never overwritten unless -Song is given explicitly.
 #>
 param(
     [string]$Song = "",
-    [switch]$Force
+    [switch]$Force,
+    [string]$Python = "python"
 )
 
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
-$log = Join-Path $root "tools\.cache\last_run.log"
+$cacheDir = Join-Path $root "tools\.cache"
+$log = Join-Path $cacheDir "last_run.log"
+New-Item -ItemType Directory -Force -Path $cacheDir | Out-Null
 $genArgs = @("tools\generate_lyrics.py", "--cache-dir", "tools\.cache")
 
 if ($Song) {
@@ -41,7 +44,7 @@ try {
     # lines into terminating NativeCommandError records.
     $previous = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
-    $output = & python @genArgs 2>&1
+    $output = & $Python @genArgs 2>&1
     $code = $LASTEXITCODE
     $ErrorActionPreference = $previous
     $output = @($output | ForEach-Object { $_.ToString() })
@@ -61,7 +64,7 @@ try {
     if ($Song) {
         $checkArgs += @("--song", $Song)
     }
-    $check = & python @checkArgs 2>&1
+    $check = & $Python @checkArgs 2>&1
     $checkCode = $LASTEXITCODE
     $check | ForEach-Object { Write-Host $_ }
     exit $checkCode

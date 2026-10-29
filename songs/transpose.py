@@ -1,9 +1,13 @@
 import argparse
 import concurrent.futures as futures
 import os
+import re
 import subprocess
 import sys
 import tempfile
+
+DEFAULT_FFMPEG_FILTER = "rubberband=pitch={pitch}"
+FFMPEG_TIMEOUT_SECONDS = 300
 
 
 def _run_ffmpeg(src, dst, semitones, bitrate):
@@ -12,15 +16,20 @@ def _run_ffmpeg(src, dst, semitones, bitrate):
     os.makedirs(parent, exist_ok=True)
 
     pitch = 2 ** (semitones / 12.0)
+    template = os.environ.get("KARAOKE_FFMPEG_FILTER", DEFAULT_FFMPEG_FILTER)
+    try:
+        audio_filter = template.format(pitch=pitch)
+    except (KeyError, IndexError, ValueError) as exc:
+        return (False, "Invalid KARAOKE_FFMPEG_FILTER template: %s" % exc)
     fd, tmp = tempfile.mkstemp(prefix=".transpose-", suffix=".tmp", dir=parent)
     os.close(fd)
     try:
         cmd = [
-            "ffmpeg", "-hide_banner", "-loglevel", "error",
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",
             "-y",
             "-i", src,
-            "-ar", "44100",
-            "-filter:a", "rubberband=pitch={0:.12f}".format(pitch),
+            "-vn", "-ar", "44100",
+            "-filter:a", audio_filter,
             "-b:a", bitrate,
             "-f", "mp3",
             tmp,
@@ -30,6 +39,8 @@ def _run_ffmpeg(src, dst, semitones, bitrate):
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
+            check=False,
+            timeout=FFMPEG_TIMEOUT_SECONDS,
         )
         if res.returncode != 0:
             return (False, str(res.stderr.decode("utf-8", errors="replace"))[:800])
@@ -84,9 +95,20 @@ def transpose_songs():
         "--incremental", action="store_true",
         help="Also re-transpose if the source file is newer than the destination.",
     )
+    parser.add_argument(
+        "--wait", action="store_true",
+        help="Wait for Enter before exiting (useful for double-click runs).",
+    )
     args = parser.parse_args()
 
     transposed_dir = os.path.abspath(args.output)
+    try:
+        output_inside_songs = os.path.commonpath([transposed_dir, songs_dir]) == songs_dir
+    except ValueError:
+        output_inside_songs = False
+    if output_inside_songs:
+        print("Error: --output must not be inside the songs source directory.")
+        return 2
     semitones_list = args.semitones
     target_bitrate = args.bitrate
 
@@ -107,8 +129,22 @@ def transpose_songs():
     songs = [
         f for f in files_in_dir
         if f.lower().endswith((".mp3", ".wav"))
+        and not re.match(r"^[+-]\d+_", f)
         and os.path.isfile(os.path.join(songs_dir, f))
     ]
+    # Avoid two sources with the same stem (for example foo.wav and foo.mp3)
+    # racing to write the same transposed cache file.
+    songs.sort(key=lambda f: (os.path.splitext(f)[0].lower(), 0 if f.lower().endswith(".mp3") else 1))
+    deduped = []
+    seen_stems = set()
+    for filename in songs:
+        stem = os.path.splitext(filename)[0].lower()
+        if stem in seen_stems:
+            print("Skipping duplicate stem: {0}".format(filename))
+            continue
+        seen_stems.add(stem)
+        deduped.append(filename)
+    songs = deduped
 
     if not songs:
         print("No .mp3/.wav files found in '{0}'.".format(songs_dir))
@@ -195,8 +231,7 @@ def transpose_songs():
 
 def main():
     rc = transpose_songs()
-    want_wait = "--wait" in sys.argv
-    if want_wait and rc != 130:
+    if "--wait" in sys.argv and rc != 130:
         try:
             input("\nPress Enter to exit...")
         except EOFError:

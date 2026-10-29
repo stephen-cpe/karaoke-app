@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import subprocess
 import sys
@@ -19,7 +20,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 LYRICS_DIR = ROOT / "lyrics"
-VOCAL_STEMS = ROOT / "tools" / ".cache" / "stems" / "htdemucs"
+DEFAULT_CACHE_DIR = ROOT / "tools" / ".cache"
 SAMPLE_RATE = 16000
 ONSET_RMS = 0.003
 QUIET_RMS = 0.002
@@ -54,13 +55,15 @@ def parse_srt(path: Path) -> list[tuple[float, float, str]]:
     return cues
 
 
-def check_sidecar(stem: str):
+def check_sidecar(stem: str, lyrics_dir: Path = LYRICS_DIR):
     problems: list[str] = []
-    json_path = LYRICS_DIR / f"{stem}.words.json"
+    json_path = lyrics_dir / f"{stem}.words.json"
     try:
         data = json.loads(json_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         return [f"cannot read JSON: {exc}"], [], 0, 0, 0
+    if not isinstance(data, dict):
+        return ["JSON root is not an object"], [], 0, 0, 0
 
     lines = data.get("lines")
     if not isinstance(lines, list) or not lines:
@@ -70,14 +73,26 @@ def check_sidecar(stem: str):
     instrumental_count = 0
     word_count = 0
     previous_end = -1.0
+    duration = data.get("duration")
+    duration = float(duration) if isinstance(duration, (int, float)) else 0.0
 
     for index, line in enumerate(lines, 1):
+        if not isinstance(line, dict):
+            problems.append(f"cue {index}: line is not an object")
+            continue
         try:
             start = float(line["start"])
             end = float(line["end"])
         except (KeyError, TypeError, ValueError):
             problems.append(f"cue {index}: missing or invalid start/end")
             continue
+        if not math.isfinite(start) or not math.isfinite(end):
+            problems.append(f"cue {index}: start/end must be finite")
+            continue
+        if start < 0:
+            problems.append(f"cue {index}: negative start")
+        if duration > 0 and end > duration + 0.5:
+            problems.append(f"cue {index}: ends after the recorded duration")
         if start < previous_end - 0.001:
             problems.append(
                 f"cue {index}: overlaps previous cue ({start:.3f} < {previous_end:.3f})"
@@ -89,6 +104,9 @@ def check_sidecar(stem: str):
         text = str(line.get("text", ""))
         instrumental = bool(line.get("instrumental"))
         words = line.get("words") or []
+        if not isinstance(words, list):
+            problems.append(f"cue {index}: words is not an array")
+            words = []
         word_count += len(words)
 
         if instrumental:
@@ -106,11 +124,17 @@ def check_sidecar(stem: str):
 
         previous_word_end = None
         for word in words:
+            if not isinstance(word, dict):
+                problems.append(f"cue {index}: word is not an object")
+                continue
             try:
                 word_start = float(word["start"])
                 word_end = float(word["end"])
             except (KeyError, TypeError, ValueError):
                 problems.append(f"cue {index}: word has invalid start/end")
+                continue
+            if not math.isfinite(word_start) or not math.isfinite(word_end):
+                problems.append(f"cue {index}: word start/end must be finite")
                 continue
             if word_end <= word_start:
                 problems.append(
@@ -136,7 +160,7 @@ def check_sidecar(stem: str):
                 f"cue {index}: text/word mismatch ({text!r} vs {joined!r})"
             )
 
-    srt_path = LYRICS_DIR / f"{stem}.srt"
+    srt_path = lyrics_dir / f"{stem}.srt"
     if not srt_path.exists():
         problems.append("missing matching .srt file")
     else:
@@ -176,20 +200,24 @@ def _rms_windows(audio, start: float, end: float):
     return np.sqrt(np.maximum(energies, 0.0))
 
 
-def check_energy(stem: str, lines: list[dict]) -> list[str]:
+def check_energy(stem: str, lines: list[dict], cache_dir: Path = DEFAULT_CACHE_DIR) -> list[str]:
     try:
         import numpy as np
     except ImportError:
         return ["numpy is not installed; energy check skipped"]
 
-    vocal_path = VOCAL_STEMS / stem / "vocals.wav"
+    vocal_path = cache_dir / "stems" / "htdemucs" / stem / "vocals.wav"
     if not vocal_path.exists():
-        return [f"no cached vocal stem: {vocal_path.relative_to(ROOT)}"]
+        try:
+            display_path = vocal_path.relative_to(ROOT)
+        except ValueError:
+            display_path = vocal_path
+        return [f"no cached vocal stem: {display_path}"]
 
     proc = subprocess.run(
         ["ffmpeg", "-v", "error", "-i", str(vocal_path), "-ac", "1",
          "-ar", str(SAMPLE_RATE), "-f", "f32le", "-"],
-        capture_output=True,
+        capture_output=True, check=False,
     )
     if proc.returncode != 0 or not proc.stdout:
         return ["ffmpeg could not decode the vocal stem"]
@@ -237,20 +265,31 @@ def main(argv: list[str] | None = None) -> int:
                         help="inspect cached vocal stems for quiet/late cues")
     parser.add_argument("--verbose", action="store_true",
                         help="show the first and last three cues")
+    parser.add_argument("--cache-dir", type=Path, default=DEFAULT_CACHE_DIR,
+                        help=f"tool cache directory (default: {DEFAULT_CACHE_DIR})")
     args = parser.parse_args(argv)
 
-    paths = sorted(LYRICS_DIR.glob("*.words.json"))
+    sidecars = {path.name.removesuffix(".words.json")
+                for path in LYRICS_DIR.glob("*.words.json")}
+    srt_stems = {path.name.removesuffix(".srt")
+                 for path in LYRICS_DIR.glob("*.srt")}
+    stems = sorted(sidecars | srt_stems)
     if args.song:
-        paths = [path for path in paths
-                 if any(query.lower() in path.name.lower() for query in args.song)]
-    if not paths:
-        print("no matching lyrics/*.words.json files")
+        stems = [stem for stem in stems
+                 if any(query.lower() in stem.lower() for query in args.song)]
+    if not stems:
+        print("no matching lyrics/*.srt or lyrics/*.words.json files")
         return 1
 
     total_problems = 0
-    for path in paths:
-        stem = path.name.removesuffix(".words.json")
-        problems, lines, lyric_count, instrumental_count, word_count = check_sidecar(stem)
+    for stem in stems:
+        if stem not in sidecars:
+            # SRT-only lyrics are a supported manual mode; there are no word
+            # timings to validate, so report and move on without failing.
+            print(f"{stem}: SRT-only (no .words.json sidecar)")
+            continue
+        problems, lines, lyric_count, instrumental_count, word_count = (
+            check_sidecar(stem, LYRICS_DIR))
         total_problems += len(problems)
         print(
             f"{stem}: {len(lines)} cues "
@@ -263,7 +302,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  ... {len(problems) - 20} more problem(s)")
 
         if args.energy and lines and not problems:
-            warnings = check_energy(stem, lines)
+            warnings = check_energy(stem, lines, args.cache_dir)
             print(f"  energy: {len(warnings)} warning(s)")
             for warning in warnings[:8]:
                 print(f"    {warning}")

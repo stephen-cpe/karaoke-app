@@ -142,14 +142,14 @@
 
       <div class="player-center">
         <div class="player-controls" aria-label="Playback controls">
-          <button class="icon-button" id="restart-button" type="button" onclick="toggleRepeat()" title="Restart song" aria-label="Restart song" disabled>
+          <button class="icon-button" id="restart-button" type="button" title="Restart song" aria-label="Restart song" disabled>
             <svg class="icon" aria-hidden="true"><use href="#icon-replay"></use></svg>
           </button>
-          <button class="icon-button play-button" id="play-pause-button" type="button" onclick="togglePlayPause()" title="Play" aria-label="Play" disabled>
+          <button class="icon-button play-button" id="play-pause-button" type="button" title="Play" aria-label="Play" disabled>
             <svg class="icon icon-play" aria-hidden="true"><use href="#icon-play"></use></svg>
             <svg class="icon icon-pause" aria-hidden="true"><use href="#icon-pause"></use></svg>
           </button>
-          <button class="icon-button" id="skip-button" type="button" onclick="cancelSong()" title="Skip song" aria-label="Skip song" disabled>
+          <button class="icon-button" id="skip-button" type="button" title="Skip song" aria-label="Skip song" disabled>
             <svg class="icon" aria-hidden="true"><use href="#icon-skip"></use></svg>
           </button>
         </div>
@@ -170,9 +170,9 @@
             <svg class="icon" aria-hidden="true"><use href="#icon-key"></use></svg>
             Key
           </span>
-          <button class="key-step" id="key-down" type="button" onclick="changeTranspose(-1)" title="Lower the key" aria-label="Lower the key" disabled>−</button>
+          <button class="key-step" id="key-down" type="button" title="Lower the key" aria-label="Lower the key" disabled>−</button>
           <div id="transpose-indicator-bar" class="key-track" aria-hidden="true"></div>
-          <button class="key-step" id="key-up" type="button" onclick="changeTranspose(1)" title="Raise the key" aria-label="Raise the key" disabled>+</button>
+          <button class="key-step" id="key-up" type="button" title="Raise the key" aria-label="Raise the key" disabled>+</button>
           <span class="key-value" id="transpose-value" aria-live="polite">0</span>
         </div>
       </div>

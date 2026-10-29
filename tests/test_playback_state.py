@@ -278,3 +278,50 @@ def test_sse_frame_encoding():
     assert frame.endswith("\n\n")
     payload = frame.split("data: ", 1)[1].strip()
     assert json.loads(payload) == {"song": "Café", "position": 1}
+
+def test_disconnect_clears_commands_before_a_new_host_registers(state):
+    state.register_host("tv-one")
+    state.add_song(make_song("00001_First"))
+    state.pause()
+    assert state.pending_commands()
+
+    state.disconnect_host("tv-one")
+    snapshot = state.register_host("tv-two")
+
+    assert snapshot["host_connected"] is True
+    assert state.pending_commands() == []
+
+
+def test_position_is_clamped_to_duration(state):
+    state.register_host("tv")
+    state.add_song(make_song("00001_First"))
+    state.report_host("tv", {"status": "paused", "position": 500, "duration": 100})
+
+    assert state.snapshot()["position"] == 100
+
+
+def test_play_clears_a_stale_error(state):
+    state.register_host("tv")
+    state.add_song(make_song("00001_First"))
+    state.host_error("tv", "decoder failed")
+    assert state.snapshot()["error"] == "decoder failed"
+
+    snapshot = state.play()
+    assert snapshot["status"] == "playing"
+    assert snapshot["error"] is None
+
+
+def test_non_finite_queue_indexes_are_rejected(state):
+    for value in (float("inf"), float("nan"), True, 1.5):
+        with pytest.raises(PlaybackError) as error:
+            state.remove_queue(value)
+        assert error.value.status_code == 400
+
+def test_subscribe_with_snapshot_keeps_initial_snapshot_before_new_events(state):
+    subscriber, snapshot = state.subscribe_with_snapshot("remote", "phone")
+    state.add_song(make_song("00001_First"))
+
+    event, data = subscriber.events.get_nowait()
+    assert event == "state"
+    assert data["revision"] > snapshot["revision"]
+    assert data["queue"][0]["filename"] == "00001_First.mp3"

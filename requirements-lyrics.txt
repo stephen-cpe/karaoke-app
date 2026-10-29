@@ -4,5 +4,6 @@
 # you want GPU acceleration; otherwise the pipeline uses the CPU fallback.
 faster-whisper>=1.2.1
 demucs>=4.1.0
-torch>=2.10.0
-ctranslate2>=4.8.2
+torch>=2.15.0
+ctranslate2>=4.8.4
+numpy>=2.5.4

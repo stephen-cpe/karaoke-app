@@ -3,7 +3,7 @@
 This file lists the third-party software and assets used by KARAOKE APP. It is
 informational, not legal advice. The project's own code is MIT-licensed (see
 `LICENSE`, copyright Stephen Paul Jacildo, 2026). The tables below cover
-third-party components and assets; transitive packages (for example `numpy`,
+third-party components and assets; transitive packages (for example
 `huggingface-hub`, `tokenizers`, `onnxruntime`, `av`, and `soundfile`) have
 their own licenses.
 
@@ -19,6 +19,7 @@ their own licenses.
 | Package | Version tested | License |
 |---|---|---|
 | pytest | 9.1.1 | MIT |
+| ruff | 0.17.3 | MIT |
 | pydub | 0.25.1 | MIT |
 | audioop-lts | 0.2.2 | PSF-2.0 |
 
@@ -30,6 +31,7 @@ their own licenses.
 | Demucs | 4.1.0 | MIT |
 | PyTorch (`torch`) | 2.10.0 | BSD-3-Clause |
 | CTranslate2 | 4.8.2 | MIT |
+| NumPy | 2.5.4 | BSD-3-Clause |
 
 The optional NVIDIA CUDA runtime packages (`nvidia-cublas-cu12`,
 `nvidia-cudnn-cu12`, `nvidia-cuda-nvrtc-cu12`) are proprietary NVIDIA
@@ -51,7 +53,8 @@ These files are served locally so the web UI does not need a CDN or Google Fonts
 
 ## External programs and services (not bundled)
 
-- **FFmpeg** is used for pitch shifting. FFmpeg is licensed under the LGPL-2.1-or-later
+- **FFmpeg** is used for pitch shifting, audio normalization, and the
+  lyric-extraction/energy checks. FFmpeg is licensed under the LGPL-2.1-or-later
   by default, but some builds include GPL components and are therefore GPL. Check
   the license of the build you install. This project does not distribute FFmpeg.
 - **Rubber Band** is the preferred FFmpeg pitch-shift filter. Rubber Band is

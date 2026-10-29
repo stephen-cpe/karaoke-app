@@ -47,9 +47,11 @@ drag-and-drop copy of the working tree, because it still contains the media.
 ## Requirements
 
 - **Python 3.13+** (developed on 3.13/3.14)
-- **FFmpeg** on your PATH — only needed for *on-demand* transposition. Most builds work,
-  but the default filter (`rubberband`) requires an FFmpeg compiled with librubberband;
-  see [Pitch shifting](#pitch-shifting) for a fallback filter.
+- **FFmpeg** on your PATH — required for on-demand transposition, audio
+  normalization, batch pre-transposing, and lyric generation. Playback of
+  pre-generated files works without it. Most builds work, but the default
+  filter (`rubberband`) requires an FFmpeg compiled with librubberband; see
+  [Pitch shifting](#pitch-shifting) for a fallback filter.
 - A browser. The host player needs one click somewhere on the page before audio
   starts (browser autoplay policy). Phones only run the controls-only remote.
 
@@ -69,7 +71,10 @@ Optional dependency groups:
 python -m venv venv
 venv\Scripts\activate
 python -m pip install --upgrade pip
-pip install -r requirements.txt
+# Install everything (core + dev/test + media helper + lyric pipeline + optional CUDA):
+pip install -r requirements.txt -r requirements-cuda.txt -r requirements-dev.txt -r requirements-lyrics.txt -r requirements-media.txt
+# Or install just the core runtime:
+# pip install -r requirements.txt
 python app.py
 ```
 
@@ -82,7 +87,7 @@ Requests from `localhost` automatically get the player UI; other LAN addresses g
 the controls-only remote. The explicit `/player` and `/remote` paths override that
 choice. Open the player on the TV first and click once so the browser allows audio.
 
-For development with auto-reload and debug output:
+For development with auto-reload and debug output (binds to localhost only):
 
 ```powershell
 python app.py --dev
@@ -124,8 +129,17 @@ Share → **Add to Home Screen** over HTTPS; the same secure-context rule applie
 
 ```
 karaoke_app/
-├── app.py                    # Flask backend: pages, shared session API, catalog,
-│                             #   transpose, lyrics saving, PWA routes
+├── app.py                    # entry point: create_app(), logging, Waitress/dev server
+├── karaoke/                  # Flask application factory, blueprints, and services
+│   ├── __init__.py           # create_app(), app config, error handlers, request logging
+│   ├── config.py             # shared config values
+│   ├── catalog.py            # filename parsing, scanning, catalog enrichment
+│   ├── lyrics.py             # word-timing validation and atomic lyric saves
+│   ├── transposition.py      # FFmpeg detection, filter building, transposition runner
+│   ├── http.py               # request/client helpers
+│   ├── logging.py            # console + rotating-file logging
+│   └── routes/               # pages, shared session API, library API, browser logs
+├── constants.py              # application-wide constants shared with session state
 ├── playback_state.py         # thread-safe in-memory queue, host lifecycle, commands
 ├── utils.py                  # shared number validation and log sanitizing
 ├── songs/                    # instrumental .mp3 / .wav files + helper scripts
@@ -137,7 +151,9 @@ karaoke_app/
 │   ├── background.js         # procedural WebGL star/nebula/galaxy background
 │   ├── scripts.js            # host-only audio engine + shared-session client
 │   ├── remote.js / remote.css # phone remote (controls only, no audio element)
-│   ├── styles.css            # host player and sync editor styles
+│   ├── sync_editor.js        # sync editor logic (kept out of the HTML template)
+│   ├── styles.css            # host player styles
+│   ├── sync_editor.css       # sync editor styles
 │   ├── vendor/               # local Bootstrap + WaveSurfer builds and licenses
 │   ├── manifest.webmanifest  # PWA metadata
 │   ├── sw.js                 # remote-shell service worker
@@ -145,10 +161,13 @@ karaoke_app/
 ├── templates/                # index.html (host), remote.html (phone), sync_editor.html
 ├── tools/
 │   ├── generate_lyrics.py    # Demucs + Whisper + LRCLIB lyric timing pipeline
+│   ├── check_lyrics.py       # structural and vocal-energy validator
+│   ├── add_lyrics.ps1        # generate + validate wrapper
 │   └── .cache/               # separated vocals, transcripts, LRCLIB responses (ignored)
 ├── tests/                    # pytest suite
 ├── docs/
 │   └── AGENTS.md             # agent handoff and lyric-generation workflow
+├── pyproject.toml            # Ruff configuration
 ├── pytest.ini
 ├── requirements*.txt         # core, dev, media, lyrics, and optional CUDA groups
 ├── THIRD_PARTY_NOTICES.md    # dependency and asset license notes
@@ -362,6 +381,7 @@ Shared-control actions: `add` (`filename`), `remove` (`index`), `clear`, `reorde
 ```powershell
 pip install -r requirements-dev.txt
 venv\Scripts\python -m pytest
+venv\Scripts\ruff check .
 ```
 
 The suite covers filename parsing, the catalog endpoint, media-route extension
@@ -447,7 +467,8 @@ runtime by `static/background.js`; it contains no third-party visual assets.
 - **Lyric timing is automatic, not magic:** dense mixes and repeated choruses are the
   hardest cases. Spot-check each song before a party; the Sync Editor can nudge any
   line. Transcription takes several minutes per song on CPU and is cached.
-- **Single-file backend:** `app.py` is intentionally kept in one file; when it grows,
-  split it into blueprints. There is currently no separate TODO tracker in the repo.
+- **Backend modules:** `app.py` is the entry point; Flask blueprints and shared
+  services live under `karaoke/`. Keep route handlers thin and put reusable
+  behavior in the service modules rather than growing `app.py` again.
 - **CI:** CI is not configured. The project's own code is MIT-licensed (see
   `LICENSE`).

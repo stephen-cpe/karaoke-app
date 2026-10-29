@@ -1,11 +1,11 @@
-"""Tests for server-side logging and the browser-error relay."""
+﻿"""Tests for server-side logging and the browser-error relay."""
 
 import logging
 import subprocess
 
 import pytest
 
-import app as app_module
+import karaoke.transposition as transposition_module
 from app import check_ffmpeg, logger, setup_logging
 
 
@@ -156,15 +156,15 @@ class FakeFFmpegRun:
 
 
 def test_check_ffmpeg_not_found(monkeypatch):
-    monkeypatch.setattr(app_module.shutil, "which", lambda name: None)
+    monkeypatch.setattr(transposition_module.shutil, "which", lambda name: None)
     ok, description = check_ffmpeg()
     assert ok is False
     assert "not found" in description
 
 
 def test_check_ffmpeg_reports_rubberband_available(monkeypatch):
-    monkeypatch.setattr(app_module.shutil, "which", lambda name: r"C:\ffmpeg\ffmpeg.exe")
-    monkeypatch.setattr(app_module.subprocess, "run",
+    monkeypatch.setattr(transposition_module.shutil, "which", lambda name: r"C:\ffmpeg\ffmpeg.exe")
+    monkeypatch.setattr(transposition_module.subprocess, "run",
                         FakeFFmpegRun(b" ..C rubberband    Apply time-stretching and pitch-shifting.\n"))
     ok, description = check_ffmpeg()
     assert ok is True
@@ -173,8 +173,26 @@ def test_check_ffmpeg_reports_rubberband_available(monkeypatch):
 
 
 def test_check_ffmpeg_reports_missing_rubberband(monkeypatch):
-    monkeypatch.setattr(app_module.shutil, "which", lambda name: r"C:\ffmpeg\ffmpeg.exe")
-    monkeypatch.setattr(app_module.subprocess, "run", FakeFFmpegRun(b" T.C atempo    Adjust audio tempo.\n"))
+    monkeypatch.setattr(transposition_module.shutil, "which", lambda name: r"C:\ffmpeg\ffmpeg.exe")
+    monkeypatch.setattr(transposition_module.subprocess, "run", FakeFFmpegRun(b" T.C atempo    Adjust audio tempo.\n"))
     ok, description = check_ffmpeg()
     assert ok is True
     assert "NOT available" in description
+
+def test_request_path_logging_strips_control_characters(client, capture_all):
+    client.get("/%0aPWNED")
+    messages = [r.getMessage() for r in capture_all.records]
+    assert any("PWNED" in message for message in messages)
+    assert all("\n" not in message and "\r" not in message for message in messages)
+
+
+def test_check_ffmpeg_reports_failure_when_it_cannot_run(monkeypatch):
+    monkeypatch.setattr(transposition_module.shutil, "which", lambda name: r"C:\ffmpeg\ffmpeg.exe")
+
+    def broken(*args, **kwargs):
+        raise OSError("permission denied")
+
+    monkeypatch.setattr(transposition_module.subprocess, "run", broken)
+    ok, description = check_ffmpeg()
+    assert ok is False
+    assert "running it failed" in description

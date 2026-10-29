@@ -306,3 +306,25 @@ def test_pwa_icons_exist(client, filename):
     response = client.get("/static/" + filename)
     assert response.status_code == 200
     assert response.data.startswith(b"\x89PNG")
+
+def test_disconnect_clears_pending_commands_for_the_next_host(client, add_song):
+    add_song("00001_First.mp3")
+    register_host(client, "tv-one")
+    control(client, "add", filename="00001_First.mp3")
+    control(client, "pause")
+    assert client.get("/api/host/commands?client_id=tv-one").get_json()["commands"]
+
+    client.post("/api/host/disconnect", json={"client_id": "tv-one"})
+    body = register_host(client, "tv-two")
+
+    assert body["commands"] == []
+
+
+def test_control_rejects_non_finite_integer_fields(client):
+    res = client.post(
+        "/api/control",
+        data='{"action": "remove", "index": 1e999}',
+        content_type="application/json",
+    )
+    assert res.status_code == 400
+    assert res.is_json

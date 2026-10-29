@@ -11,7 +11,7 @@ const CLIENT_ID = (() => {
       `host-${Date.now()}-${Math.random().toString(16).slice(2)}`;
     sessionStorage.setItem("karaoke.host.clientId", created);
     return created;
-  } catch (err) {
+  } catch {
     return `host-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   }
 })();
@@ -19,16 +19,12 @@ const CLIENT_ID = (() => {
 const shared = {
   server_id: null,
   revision: 0,
-  host_connected: false,
   status: "idle",
   position: 0,
-  duration: 0,
   current: null,
   queue: [],
   transpose: 0,
   volume: 1,
-  error: null,
-  last_command_id: 0
 };
 
 let songs = [];
@@ -62,6 +58,10 @@ let autoSkipTimer = null;
 let transposeBusy = false;
 let transposeBusyToken = 0;
 let hostNoticeTimer = null;
+let queueRenderKey = "";
+let transposeRenderKey = "";
+let lyricsRequestToken = 0;
+let lyricsClearTimer = null;
 
 // Command progress is per browser tab (sessionStorage) and survives a page
 // reload. Without this a refreshed player can replay commands it already ran
@@ -79,7 +79,7 @@ function readStoredCommandState() {
       serverId: typeof parsed.serverId === "string" ? parsed.serverId : null,
       lastCommandId: Number.isFinite(storedId) ? Math.max(0, storedId) : 0
     };
-  } catch (err) {
+  } catch {
     return null;
   }
 }
@@ -96,14 +96,13 @@ function rememberCommandState() {
       serverId: serverId || null,
       lastCommandId: Math.max(0, Number(lastCommandId) || 0)
     }));
-  } catch (err) { /* private mode / storage disabled */ }
+  } catch { /* private mode / storage disabled */ }
 }
 
 // Main audio element, managed directly so seeking and transposition stay simple.
 const audioPlayer = new Audio();
 audioPlayer.preload = "auto";
 audioPlayer.volume = hostVolume;
-window.audioPlayer = audioPlayer;
 
 let lyricsTimeline = [];
 let wordTimeline = null; // Optional word-level JSON sidecar for the current song
@@ -199,7 +198,7 @@ function fileStem(filename) {
 async function readJson(response) {
   try {
     return await response.json();
-  } catch (err) {
+  } catch {
     return {};
   }
 }
@@ -299,7 +298,7 @@ async function unlockAudio() {
     audioPlayer.pause();
     audioPlayer.removeAttribute("src");
     audioPlayer.load();
-  } catch (err) {
+  } catch {
     // The click still counts as a user gesture in most browsers; the next
     // play attempt will show the unlock prompt again if needed.
     showAudioUnlock(true);
@@ -402,12 +401,14 @@ function openEvents() {
   events = source;
 
   source.onopen = () => {
+    if (source !== events) return;
     live = true;
     updateHostStatus();
     reportNow();
   };
 
   source.addEventListener("state", event => {
+    if (source !== events) return;
     try {
       applySharedState(JSON.parse(event.data));
       updateHostStatus();
@@ -417,6 +418,7 @@ function openEvents() {
   });
 
   source.addEventListener("command", event => {
+    if (source !== events) return;
     try {
       enqueueCommand(JSON.parse(event.data));
     } catch (err) {
@@ -425,15 +427,17 @@ function openEvents() {
   });
 
   source.addEventListener("host_revoked", event => {
+    if (source !== events) return;
     let reason = "Another browser is controlling the karaoke player.";
     try {
       const data = JSON.parse(event.data);
       if (data && data.reason) reason = data.reason;
-    } catch (err) { /* keep default */ }
+    } catch { /* keep default */ }
     onHostRevoked(reason);
   });
 
   source.onerror = () => {
+    if (source !== events) return;
     live = false;
     updateHostStatus();
     if (revoked) return;
@@ -452,6 +456,7 @@ function onHostRevoked(reason) {
   clearTimeout(autoSkipTimer);
   stopAudio();
   currentSong = null;
+  shared.current = null;
   updateNowPlayingUI();
   if (hostOverlay) {
     hostOverlayTitle.textContent = "Another screen is the player";
@@ -474,6 +479,14 @@ async function syncPlaybackWithSnapshot(snapshot) {
   }
 
   if (currentSong && currentSong.filename === song.filename && audioPlayer.src) {
+    if (Number(currentSong.transpose) !== Number(snapshot.transpose)) {
+      await loadSong(song, {
+        transpose: snapshot.transpose,
+        position: snapshot.position,
+        autoplay: snapshot.status === "playing"
+      });
+      return;
+    }
     if (snapshot.status === "playing" && audioPlayer.paused) {
       safePlay().then(played => { if (played) reportNow(); });
     } else if (snapshot.status !== "playing" && !audioPlayer.paused) {
@@ -482,7 +495,7 @@ async function syncPlaybackWithSnapshot(snapshot) {
     const target = Number(snapshot.position);
     if (Number.isFinite(target) && audioPlayer.readyState >= 1 &&
         Math.abs(audioPlayer.currentTime - target) > 2.5) {
-      try { audioPlayer.currentTime = clamp(target, 0, audioPlayer.duration || target); } catch (err) { /* ignore */ }
+      try { audioPlayer.currentTime = clamp(target, 0, audioPlayer.duration || target); } catch { /* ignore */ }
     }
     if (!lyricsTimeline.length && !wordTimeline) loadLyrics(fileStem(song.filename));
     return;
@@ -495,7 +508,7 @@ async function syncPlaybackWithSnapshot(snapshot) {
       autoplay,
       transpose: Number(snapshot.transpose) || 0
     });
-  } catch (err) {
+  } catch {
     // loadSong already recorded the failure and scheduled a skip.
   }
 }
@@ -601,7 +614,7 @@ async function pollCommands() {
     }
     if (!response.ok) return;
     if (Array.isArray(data.commands)) data.commands.forEach(enqueueCommand);
-  } catch (err) {
+  } catch {
     // The report heartbeat also detects a dead connection.
   }
 }
@@ -633,18 +646,14 @@ function applySharedState(snapshot) {
 
   shared.server_id = incomingServerId || shared.server_id;
   shared.revision = Number.isFinite(incomingRevision) ? incomingRevision : shared.revision;
-  shared.host_connected = !!snapshot.host_connected;
   shared.status = snapshot.status || "idle";
   shared.position = Number(snapshot.position) || 0;
-  shared.duration = Number(snapshot.duration) || 0;
   shared.current = snapshot.current || null;
   shared.queue = Array.isArray(snapshot.queue) ? snapshot.queue : [];
   shared.transpose = Number.isFinite(Number(snapshot.transpose))
     ? Number(snapshot.transpose) : shared.transpose;
   shared.volume = Number.isFinite(Number(snapshot.volume))
     ? Number(snapshot.volume) : shared.volume;
-  shared.error = snapshot.error || null;
-  shared.last_command_id = Number(snapshot.last_command_id) || 0;
 
   queue = shared.queue;
   transposeLevel = clamp(shared.transpose, -4, 4);
@@ -661,7 +670,6 @@ function applySharedState(snapshot) {
 
   updateNowPlayingUI();
   updateQueueDisplay();
-  updateTransposeUI();
   updateConnectionDependentControls();
 }
 
@@ -724,7 +732,7 @@ async function executeCommand(command) {
           autoplay: command.autoplay !== false,
           transpose: Number(command.transpose) || 0
         });
-      } catch (err) {
+      } catch {
         // loadSong has already recorded the error and scheduled a skip.
       }
       break;
@@ -756,7 +764,7 @@ async function executeCommand(command) {
       if (!currentSong) throw new Error("Nothing is loaded to restart.");
       errorActive = false;
       lastPlaybackError = null;
-      try { audioPlayer.currentTime = 0; } catch (err) { /* ignore */ }
+      try { audioPlayer.currentTime = 0; } catch { /* ignore */ }
       updatePlaybackProgress();
       loadLyrics(fileStem(currentSong.filename));
       await safePlay();
@@ -768,7 +776,7 @@ async function executeCommand(command) {
       const duration = Number.isFinite(audioPlayer.duration) ? audioPlayer.duration : 0;
       const target = clamp(Number(command.position) || 0, 0,
         duration > 0 ? duration : Number(command.position) || 0);
-      try { audioPlayer.currentTime = target; } catch (err) { /* ignore */ }
+      try { audioPlayer.currentTime = target; } catch { /* ignore */ }
       updatePlaybackProgress();
       break;
     }
@@ -802,6 +810,9 @@ async function executeCommand(command) {
     case "stop": {
       stopAudio();
       currentSong = null;
+      shared.current = null;
+      shared.queue = [];
+      queue = [];
       loading = false;
       errorActive = false;
       autoplayBlocked = false;
@@ -918,7 +929,7 @@ async function loadSong(song, options = {}) {
     console.warn("Could not clear the previous audio:", err);
   }
 
-  currentSong = { ...song };
+  currentSong = { ...song, transpose };
   transposeLevel = transpose;
   clearLyricTimers();
   resetProgressUI();
@@ -942,7 +953,7 @@ async function loadSong(song, options = {}) {
     if (position > 0 && duration > 0) {
       try {
         audioPlayer.currentTime = Math.min(position, Math.max(0, duration - 0.15));
-      } catch (err) { /* ignore */ }
+      } catch { /* ignore */ }
     }
 
     loadLyrics(fileStem(song.filename));
@@ -1187,9 +1198,15 @@ function updatePlayPauseUI() {
 function updateQueueDisplay() {
   maybeSyncQueueCount();
   if (!queueDisplayEl) return;
-  queueDisplayEl.replaceChildren();
 
   const song = shared.current;
+  const renderKey = JSON.stringify({
+    current: song ? song.filename : null,
+    queue: queue.map(queuedSong => queuedSong.filename)
+  });
+  if (renderKey === queueRenderKey && queueDisplayEl.childElementCount) return;
+  queueRenderKey = renderKey;
+  queueDisplayEl.replaceChildren();
 
   if (!song && !queue.length) {
     renderQueueEmpty();
@@ -1285,6 +1302,11 @@ function updateLyrics(text) {
 
 function updateTransposeUI() {
   if (!transposeIndicatorBar) return;
+
+  const online = registered && !revoked;
+  const renderKey = `${transposeLevel}|${online}|${!!shared.current}|${transposeBusy}`;
+  if (renderKey === transposeRenderKey) return;
+  transposeRenderKey = renderKey;
   transposeIndicatorBar.replaceChildren();
 
   for (let i = -4; i <= 4; i++) {
@@ -1300,7 +1322,6 @@ function updateTransposeUI() {
     transposeValueEl.title = `Transpose ${signedSemitones(transposeLevel)} semitones`;
   }
 
-  const online = registered && !revoked;
   if (keyDownButton) {
     keyDownButton.disabled = !online || !shared.current || transposeBusy || transposeLevel <= -4;
   }
@@ -1333,7 +1354,7 @@ function seekTo(target) {
   if (!currentSong) return;
   const duration = Number.isFinite(audioPlayer.duration) ? audioPlayer.duration : 0;
   if (duration <= 0) return;
-  try { audioPlayer.currentTime = clamp(target, 0, duration); } catch (err) { return; }
+  try { audioPlayer.currentTime = clamp(target, 0, duration); } catch { return; }
   updatePlaybackProgress();
   reportNow();
 }
@@ -1557,6 +1578,9 @@ audioPlayer.addEventListener("timeupdate", () => {
 });
 
 function clearLyricTimers() {
+  lyricsRequestToken += 1;
+  clearTimeout(lyricsClearTimer);
+  lyricsClearTimer = null;
   stopLyricsAnimation();
   lyricsTimeline = [];
   wordTimeline = null;
@@ -1576,6 +1600,9 @@ function parseTime(t) {
 function loadLyrics(filename) {
   // Filename should not have extension here. Absolute paths keep the lookup
   // working on /player and /player/ as well as on /.
+  const token = ++lyricsRequestToken;
+  clearTimeout(lyricsClearTimer);
+  lyricsClearTimer = null;
   const base = `/lyrics/${encodeURIComponent(filename)}`;
   const srtPath = `${base}.srt`;
   const wordsPath = `${base}.words.json`;
@@ -1589,6 +1616,7 @@ function loadLyrics(filename) {
 
   Promise.all([srtPromise, wordsPromise])
     .then(([srt, words]) => {
+      if (token !== lyricsRequestToken) return;
       if (words && parseWordTimings(words)) return;
       if (srt) {
         parseAndSyncLyrics(srt);
@@ -1597,9 +1625,10 @@ function loadLyrics(filename) {
       throw new Error("Lyrics not found");
     })
     .catch(() => {
+      if (token !== lyricsRequestToken) return;
       clearLyricTimers();
       updateLyrics("Lyrics not found for this song.");
-      setTimeout(() => updateLyrics(""), 5000);
+      lyricsClearTimer = setTimeout(() => updateLyrics(""), 5000);
     });
 }
 
@@ -1629,7 +1658,14 @@ async function addToQueue(song) {
 }
 
 async function togglePlayPause() {
-  if (!registered || revoked || !shared.current || loading) return;
+  if (!registered || revoked || loading) return;
+
+  if (!shared.current) {
+    // The server starts the first queued song when asked to play.
+    if (!shared.queue.length) return;
+    try { await sendControl("play"); } catch (err) { showHostNotice(err.message); }
+    return;
+  }
 
   if (currentSong && currentSong.filename === shared.current.filename) {
     if (!audioPlayer.src) {
@@ -1660,7 +1696,7 @@ async function toggleRepeat() {
   if (!currentSong || !registered || loading || !audioPlayer.src) return;
   errorActive = false;
   lastPlaybackError = null;
-  try { audioPlayer.currentTime = 0; } catch (err) { /* ignore */ }
+  try { audioPlayer.currentTime = 0; } catch { /* ignore */ }
   updatePlaybackProgress();
   loadLyrics(fileStem(currentSong.filename));
   const played = await safePlay();
@@ -1713,6 +1749,12 @@ searchInput.addEventListener("input", () => {
   const query = searchInput.value.trim();
   displaySongs(query ? filterSongs(query.toLowerCase()) : songs, query);
 });
+
+restartButton?.addEventListener("click", toggleRepeat);
+playPauseButton?.addEventListener("click", togglePlayPause);
+skipButton?.addEventListener("click", cancelSong);
+keyDownButton?.addEventListener("click", () => changeTranspose(-1));
+keyUpButton?.addEventListener("click", () => changeTranspose(1));
 
 document.addEventListener("keydown", evt => {
   const target = evt.target;
@@ -1784,7 +1826,6 @@ audioPlayer.addEventListener("error", () => {
   if (!audioPlayer.currentSrc || !currentSong || loading) return;
   const message = "Audio playback failed. " + mediaErrorMessage(audioPlayer);
   handlePlaybackFailure(new Error(mediaErrorMessage(audioPlayer)), message);
-  scheduleAutoSkip();
 });
 
 if (queueClearButton) {
@@ -1801,7 +1842,7 @@ if (copyJoinUrlButton) {
     if (!value) return;
     try {
       await navigator.clipboard.writeText(value);
-    } catch (err) {
+    } catch {
       const helper = document.createElement("textarea");
       helper.value = value;
       helper.style.position = "fixed";
@@ -1811,9 +1852,8 @@ if (copyJoinUrlButton) {
       document.execCommand("copy");
       helper.remove();
     }
-    const original = copyJoinUrlButton.textContent;
     copyJoinUrlButton.textContent = "Copied";
-    setTimeout(() => { copyJoinUrlButton.textContent = original; }, 1400);
+    setTimeout(() => { copyJoinUrlButton.textContent = "Copy"; }, 1400);
   });
 }
 

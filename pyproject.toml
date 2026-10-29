@@ -1,0 +1,15 @@
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+exclude = [
+  ".git",
+  ".pytest_cache",
+  "tools/.cache",
+  "venv",
+  "static/vendor",
+]
+
+[tool.ruff.lint]
+# Keep the baseline focused on correctness and imports. Formatting is handled
+# separately so legacy tools do not churn during unrelated changes.
+select = ["E4", "E7", "E9", "F", "I"]
