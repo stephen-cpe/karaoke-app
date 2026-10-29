@@ -12,6 +12,7 @@
   CUDA dependency groups.
 - `THIRD_PARTY_NOTICES.md` — dependency, asset, and license notes.
 - `static/scripts.js` — host-only audio engine and shared-session client.
+- `static/background.js` — host-only procedural WebGL star/nebula/galaxy background.
 - `static/remote.js`, `static/remote.css`, `templates/remote.html` — controls-only
   phone remote. It must not create audio/video elements or play media.
 - `templates/index.html` — host player page, including the sync editor link.
@@ -39,6 +40,7 @@
   ```powershell
   .\venv\Scripts\python -m pip install -r requirements-dev.txt
   .\venv\Scripts\python -m pytest -q
+  node --check static\background.js
   node --check static\scripts.js
   node --check static\remote.js
   node --check static\sw.js
@@ -52,9 +54,9 @@
   media, not project source, and `.gitignore` excludes them.
 - `tools/.cache/`, `karaoke.log*`, `venv/`, and local editor settings are ignored.
   Do not force-add them.
-- The public tree keeps `songs/`, `original_songs/`, `lyrics/`, `transposed/`, and
-  `background/` as `.gitkeep` placeholders. Only the helper scripts in `songs/`
-  and the `.gitkeep` placeholders are tracked.
+- The public tree keeps `songs/`, `original_songs/`, `lyrics/`, and `transposed/`
+  as `.gitkeep` placeholders. Only the helper scripts in `songs/` and the
+  `.gitkeep` placeholders are tracked.
 - The project source is MIT-licensed (see `LICENSE`). Do not change repository
   licensing or asset ownership without explicit user approval.
 - Do not add a public version number, release tag, or versioning scheme. Existing

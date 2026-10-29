@@ -20,8 +20,7 @@ const NETWORK_ONLY_PREFIXES = [
   "/api/",
   "/lyrics/",
   "/songs/",
-  "/transposed/",
-  "/background/"
+  "/transposed/"
 ];
 
 function isRemotePage(pathname) {

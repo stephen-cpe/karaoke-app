@@ -39,8 +39,6 @@ tools/.cache/
 !/lyrics/.gitkeep
 /transposed/*
 !/transposed/.gitkeep
-/background/*
-!/background/.gitkeep
 
 # Also catch stray media anywhere else in the tree.
 *.mp3

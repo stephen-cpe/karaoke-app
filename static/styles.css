@@ -93,14 +93,40 @@ svg.icon {
 
 /* ---------- Background ---------- */
 
-.background-video {
+.background-fallback,
+.background-canvas {
   position: fixed;
   inset: 0;
+  display: block;
   width: 100%;
   height: 100%;
-  object-fit: cover;
-  z-index: -2;
   pointer-events: none;
+}
+
+.background-fallback {
+  z-index: -3;
+  background:
+    radial-gradient(ellipse 70% 60% at 18% -5%, rgba(150, 20, 90, 0.35), transparent 65%),
+    radial-gradient(ellipse 60% 55% at 82% 5%, rgba(20, 120, 150, 0.28), transparent 65%),
+    radial-gradient(ellipse 90% 70% at 50% 105%, rgba(70, 40, 130, 0.3), transparent 70%),
+    radial-gradient(ellipse 60% 50% at 50% 45%, rgba(20, 30, 70, 0.5), transparent 70%),
+    #05070d;
+}
+
+.background-canvas {
+  z-index: -2;
+  opacity: 0;
+  transition: opacity 700ms ease;
+}
+
+.background-canvas.is-ready {
+  opacity: 1;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .background-canvas {
+    transition: none;
+  }
 }
 
 .background-scrim {

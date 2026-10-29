@@ -57,8 +57,6 @@ def test_media_routes_only_serve_expected_file_types(client, app, add_song, add_
     (app.config["SONGS_DIR"] / "helper.py").write_text("print('hi')", encoding="utf-8")
     (app.config["TRANSPOSED_DIR"] / "+1_1_a_b.mp3").write_bytes(b"cached")
     (app.config["TRANSPOSED_DIR"] / "notes.txt").write_text("not audio", encoding="utf-8")
-    (app.config["BACKGROUND_DIR"] / "clip.mp4").write_bytes(b"video")
-    (app.config["BACKGROUND_DIR"] / "notes.txt").write_text("not video", encoding="utf-8")
 
     assert client.get(f"/songs/{song}").status_code == 200
     assert client.get("/songs/helper.py").status_code == 404
@@ -66,8 +64,6 @@ def test_media_routes_only_serve_expected_file_types(client, app, add_song, add_
     assert client.get("/lyrics/notes.txt").status_code == 404
     assert client.get("/transposed/+1_1_a_b.mp3").status_code == 200
     assert client.get("/transposed/notes.txt").status_code == 404
-    assert client.get("/background/clip.mp4").status_code == 200
-    assert client.get("/background/notes.txt").status_code == 404
 
 
 def test_pages_use_local_vendor_assets_only(client):
@@ -90,6 +86,14 @@ def test_pages_use_local_vendor_assets_only(client):
         res = client.get(asset)
         assert res.status_code == 200, asset
         assert res.data, asset
+
+
+def test_host_page_uses_generated_background(client):
+    host = client.get("/").data
+
+    assert b'id="background-canvas"' in host
+    assert b"/static/background.js" in host
+    assert client.get("/static/background.js").status_code == 200
 
 
 # --- /api/save-lyrics -------------------------------------------------------
@@ -138,8 +142,7 @@ def test_save_lyrics_creates_missing_lyrics_directory(tmp_path):
     lyrics = tmp_path / "new" / "lyrics"  # does not exist yet
 
     app = create_app(songs_dir=songs, lyrics_dir=lyrics,
-                     transposed_dir=tmp_path / "transposed",
-                     background_dir=tmp_path / "background")
+                     transposed_dir=tmp_path / "transposed")
     res = app.test_client().post(
         "/api/save-lyrics", json={"song_id": "1_a_b.mp3", "lyrics": SRT})
 

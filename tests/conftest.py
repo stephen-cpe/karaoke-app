@@ -12,7 +12,6 @@ def app(tmp_path):
         "songs_dir": tmp_path / "songs",
         "lyrics_dir": tmp_path / "lyrics",
         "transposed_dir": tmp_path / "transposed",
-        "background_dir": tmp_path / "background",
     }
     for directory in dirs.values():
         directory.mkdir()

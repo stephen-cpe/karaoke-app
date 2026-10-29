@@ -2,9 +2,9 @@
 
 A self-hosted karaoke setup for your home network. The browser on the karaoke
 PC or TV is the **only audio player**; phones and tablets on the same Wi-Fi act as
-synchronized remotes for the queue, transport, key, and volume. Sing over looping
-background videos with big synced lyrics, and pitch-shift the key until it fits
-your voice.
+synchronized remotes for the queue, transport, key, and volume. Sing over
+animated space visuals with big synced lyrics, and pitch-shift the key until it
+fits your voice.
 
 > **Project status:** This is a personal, experimental, educational hobby
 > project, not a product. It is **very early pre-alpha** software: behavior and
@@ -13,9 +13,9 @@ your voice.
 
 ## What is not included
 
-This repository does **not** ship songs, instrumentals, background videos, or
-lyrics. Those files are copyrighted by their respective owners and are excluded
-by `.gitignore`. Add your own legally obtained media before using the app. The
+This repository does **not** ship songs, instrumentals, or lyrics. Those files
+are copyrighted by their respective owners and are excluded by `.gitignore`.
+Add your own legally obtained media before using the app. The
 `lyrics/*.words.json` sidecars contain full lyrics, not just timings, so they are
 excluded as well. `.gitignore` only affects Git: do not publish a ZIP or a
 drag-and-drop copy of the working tree, because it still contains the media.
@@ -30,8 +30,11 @@ drag-and-drop copy of the working tree, because it still contains the media.
   skip, restart, seek, key, and volume, with no audio element on the phone
 - **Song catalog scanned live** from the `songs/` folder — no manual list to maintain
 - Live search, one-click queueing, and an always-visible **Up next** panel
-- **Synced lyrics with word-by-word highlighting**, displayed full-screen over looping
-  background videos; `[Instrumental]` cues cover intros and breaks
+- **Synced lyrics with word-by-word highlighting**, displayed full-screen over a
+  procedurally animated space backdrop of stars, nebulae, and galaxies;
+  `[Instrumental]` cues cover intros and breaks
+- **Built-in procedural background** — WebGL-rendered star fields, nebulae, and a
+  spiral galaxy; no external media assets, and it pauses when the tab is hidden
 - **Automatic lyric timing tool** (`tools/generate_lyrics.py`) using Demucs vocal
   separation, Whisper word timestamps and LRCLIB text
 - **Pitch shifting (±4 semitones)** so singers can find their key, with caching
@@ -130,8 +133,8 @@ karaoke_app/
 ├── original_songs/           # vocal versions used only by the lyric timing tool
 ├── lyrics/                   # .srt files + optional .words.json word-timing sidecars
 ├── transposed/               # pitch-shifted copies (cache; pre-generated or on demand)
-├── background/               # looping .mp4 background videos
 ├── static/
+│   ├── background.js         # procedural WebGL star/nebula/galaxy background
 │   ├── scripts.js            # host-only audio engine + shared-session client
 │   ├── remote.js / remote.css # phone remote (controls only, no audio element)
 │   ├── styles.css            # host player and sync editor styles
@@ -153,9 +156,9 @@ karaoke_app/
 ```
 
 The media folders are kept in the public tree with `.gitkeep` placeholders.
-Everything you add to `songs/`, `original_songs/`, `lyrics/`, `transposed/`, and
-`background/` is ignored by Git; only the two helper scripts in `songs/` and the
-`.gitkeep` placeholders are tracked.
+Everything you add to `songs/`, `original_songs/`, `lyrics/`, and `transposed/`
+is ignored by Git; only the two helper scripts in `songs/` and the `.gitkeep`
+placeholders are tracked.
 
 ## Preparing new songs manually
 
@@ -348,7 +351,7 @@ python app.py
 | POST | `/api/save-lyrics` | `{"song_id": <filename>, "lyrics": <srt text>, "words": <words json? optional>}` → writes `lyrics/<stem>.srt` and writes or removes `lyrics/<stem>.words.json` |
 | POST | `/api/log` | Browser relays client-side errors into the server log (`[browser] …`) |
 | GET | `/manifest.webmanifest`, `/sw.js` | PWA manifest and remote service worker |
-| GET | `/songs/…`, `/lyrics/…`, `/transposed/…`, `/background/…` | Media file serving |
+| GET | `/songs/…`, `/lyrics/…`, `/transposed/…` | Media file serving |
 
 Shared-control actions: `add` (`filename`), `remove` (`index`), `clear`, `reorder`
 (`from`, `to`), `skip`, `play`, `pause`, `restart`, `seek` (`position`), `transpose`
@@ -410,16 +413,16 @@ Third-party components, vendored assets, and their licenses are listed in
 `THIRD_PARTY_NOTICES.md`. FFmpeg and Rubber Band are external programs, not
 bundled; their license terms depend on the build you install.
 
-Songs, instrumentals, background videos, and lyrics are **not included**. Do not
-commit media you do not have rights to. LRCLIB is a third-party service; lyrics
-returned by it remain copyrighted, and using the service does not grant
-redistribution rights.
+Songs, instrumentals, and lyrics are **not included**. Do not commit media you
+do not have rights to. LRCLIB is a third-party service; lyrics returned by it
+remain copyrighted, and using the service does not grant redistribution rights.
 
 The project logo is a generated asset created by the maintainer with an image
 generator; confirm that tool's license terms give you the rights you need. The
-provenance of the PWA icons, the inline SVG icons in the templates, and the
-sample background videos is not documented in this repository. Treat them as
-placeholders and replace them with assets you have rights to before publishing.
+provenance of the PWA icons and the inline SVG icons in the templates is not
+documented in this repository. Treat them as placeholders and replace them with
+assets you have rights to before publishing. The host background is drawn at
+runtime by `static/background.js`; it contains no third-party visual assets.
 
 ## Known limitations & ideas for later
 
@@ -432,6 +435,8 @@ placeholders and replace them with assets you have rights to before publishing.
   simultaneous phones.
 - **PWA installation needs a secure context:** the phone remote works over plain HTTP
   on the LAN, but service-worker caching and installability require localhost or HTTPS.
+- **Background rendering:** the animated backdrop needs WebGL. Without it, the host
+  shows a static CSS nebula fallback. `prefers-reduced-motion` freezes the animation.
 - **No authentication:** anyone on the network can queue, cancel, seek and transpose.
   Only run it on networks you trust.
 - **Large libraries:** the song list renders every row; thousands of songs would want

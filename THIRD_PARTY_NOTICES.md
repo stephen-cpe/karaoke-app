@@ -67,13 +67,14 @@ These files are served locally so the web UI does not need a CDN or Google Fonts
 
 ## Media and visual assets
 
-The repository intentionally excludes songs, instrumentals, background videos,
-`.srt` files, and `.words.json` lyric sidecars. The project logo is a generated asset created by the maintainer with an image
-generator; confirm that tool's license terms. The provenance of the PWA icons,
-the inline SVG icons in `templates/`, and the sample background videos is not
+The repository intentionally excludes songs, instrumentals, `.srt` files, and
+`.words.json` lyric sidecars. The project logo is a generated asset created by
+the maintainer with an image generator; confirm that tool's license terms. The
+provenance of the PWA icons and the inline SVG icons in `templates/` is not
 documented in this repository. Do not assume they are original, cleared, or
 licensed for redistribution; replace them with assets you have rights to before
-publishing.
+publishing. The host page's animated background is generated at runtime by
+`static/background.js` and uses no third-party visual assets.
 
 ## Project license status
 

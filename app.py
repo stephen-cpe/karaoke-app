@@ -24,7 +24,6 @@ from utils import is_finite_number, single_line
 
 AUDIO_EXTENSIONS = (".mp3", ".wav")
 LYRICS_EXTENSIONS = (".srt", ".words.json")
-BACKGROUND_EXTENSIONS = (".mp4", ".webm")
 MAX_SEMITONES = 4  # Matches the +/-4 transpose buttons in the UI
 MAX_LYRICS_BYTES = 1_000_000  # Sanity cap for saved .srt files
 MAX_WORDS_BYTES = 2_000_000  # Sanity cap for saved .words.json files
@@ -293,13 +292,12 @@ def _write_text(path, text):
 
 
 def create_app(songs_dir="songs", lyrics_dir="lyrics",
-               transposed_dir="transposed", background_dir="background"):
+               transposed_dir="transposed"):
     app = Flask(__name__)
     app.config.update(
         SONGS_DIR=songs_dir,
         LYRICS_DIR=lyrics_dir,
         TRANSPOSED_DIR=transposed_dir,
-        BACKGROUND_DIR=background_dir,
     )
     # One shared karaoke session per server process. Tests create separate
     # app objects, so a test can never leak its queue into another test.
@@ -343,8 +341,8 @@ def create_app(songs_dir="songs", lyrics_dir="lyrics",
             level = logging.INFO
         elif status >= 400:
             level = logging.WARNING
-        elif path.startswith(("/static/", "/background/", "/songs/", "/transposed/", "/lyrics/")):
-            # Media/static files can be fetched repeatedly (video loops, audio
+        elif path.startswith(("/static/", "/songs/", "/transposed/", "/lyrics/")):
+            # Static media can be fetched repeatedly (for example, audio
             # seeking); keep the log readable unless something goes wrong.
             level = logging.DEBUG
         else:
@@ -583,10 +581,6 @@ def create_app(songs_dir="songs", lyrics_dir="lyrics",
     @app.route("/transposed/<path:filename>")
     def serve_transposed(filename):
         return _serve_media(app.config["TRANSPOSED_DIR"], filename, AUDIO_EXTENSIONS)
-
-    @app.route("/background/<path:filename>")
-    def serve_background(filename):
-        return _serve_media(app.config["BACKGROUND_DIR"], filename, BACKGROUND_EXTENSIONS)
 
     # --- API: song catalog ------------------------------------------------
     @app.get("/api/songs")
@@ -836,7 +830,7 @@ def main():
     setup_logging(level=getattr(logging, level_name, logging.INFO))
 
     logger.info("Starting KARAOKE APP (dev=%s, log level %s)", args.dev, level_name)
-    for key in ("SONGS_DIR", "LYRICS_DIR", "TRANSPOSED_DIR", "BACKGROUND_DIR"):
+    for key in ("SONGS_DIR", "LYRICS_DIR", "TRANSPOSED_DIR"):
         logger.info("%s: %s", key, os.path.abspath(app.config[key]))
     logger.info("Catalog: %d song(s) found", len(scan_songs(app.config["SONGS_DIR"])))
     ffmpeg_ok, ffmpeg_description = check_ffmpeg()

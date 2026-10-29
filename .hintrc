@@ -12,14 +12,6 @@
           "text-wrap: nowrap"
         ]
       }
-    ],
-    "compat-api/html": [
-      "default",
-      {
-        "ignore": [
-          "video[playsinline]"
-        ]
-      }
     ]
   }
 }

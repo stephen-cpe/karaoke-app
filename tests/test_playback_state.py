@@ -61,7 +61,7 @@ def test_register_host_starts_first_queued_song(state):
     assert snapshot["current"]["filename"] == "00001_First.mp3"
     assert [song["filename"] for song in snapshot["queue"]] == ["00002_Second.mp3"]
     assert snapshot["status"] == "loading"
-    # The host loads the returned snapshot directly; no legacy command replay.
+    # The host loads the returned snapshot directly; no stale command replay.
     assert state.pending_commands() == []
 
 

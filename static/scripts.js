@@ -126,7 +126,6 @@ const queueClearButton = document.getElementById("queue-clear");
 const songListContent = document.getElementById("song-list-content");
 const searchInput = document.getElementById("search-input");
 const songSummaryEl = document.getElementById("song-summary");
-const bgVideo = document.getElementById("background-video");
 const transposeIndicatorBar = document.getElementById("transpose-indicator-bar");
 const transposeValueEl = document.getElementById("transpose-value");
 const playPauseButton = document.getElementById("play-pause-button");
@@ -149,14 +148,6 @@ const hostTakeoverButton = document.getElementById("host-takeover-button");
 const hostReloadButton = document.getElementById("host-reload-button");
 const audioUnlock = document.getElementById("audio-unlock");
 const audioUnlockButton = document.getElementById("audio-unlock-button");
-
-const backgroundVideos = [
-  "/background/sample_background_1.mp4",
-  "/background/sample_background_2.mp4",
-  "/background/sample_background_3.mp4",
-  "/background/sample_background_4.mp4"
-];
-let currentBgIndex = 0;
 
 // --- SMALL DOM HELPERS ---
 const SVG_NS = "http://www.w3.org/2000/svg";
@@ -1751,12 +1742,6 @@ document.addEventListener("keydown", evt => {
     evt.preventDefault();
     togglePlayPause();
   }
-});
-
-bgVideo.addEventListener("ended", () => {
-  currentBgIndex = (currentBgIndex + 1) % backgroundVideos.length;
-  bgVideo.src = backgroundVideos[currentBgIndex];
-  bgVideo.play().catch(() => {});
 });
 
 audioPlayer.addEventListener("ended", () => {
