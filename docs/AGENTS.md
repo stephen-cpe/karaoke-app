@@ -2,12 +2,16 @@
 
 ## Project layout
 
-- `app.py` — entry point: `create_app()`, logging, and Waitress/dev-server startup.
+- `app.py` — entry point: imports/re-exports `create_app()`, configures logging, and
+  starts Waitress or the Flask dev server.
 - `karaoke/` — Flask application package:
   - `__init__.py` — app factory, config, error handlers, request logging.
   - `catalog.py`, `lyrics.py`, `transposition.py` — shared services.
-  - `http.py`, `logging.py`, `config.py` — request, logging, and config helpers.
-  - `routes/` — pages, shared-session API, library API, and browser-log blueprints.
+  - `http.py`, `logging.py`, `config.py` — request, logging, and config helpers
+    (`config.py` re-exports the application constants).
+  - `errors.py` — `ApiError` exception type.
+  - `routes/` — pages and media, shared-session API, library API, and browser-log
+    blueprints.
 - `constants.py` — constants shared by the Flask package and session state.
 - `playback_state.py` — thread-safe in-memory session: queue, host lifecycle,
   presence timeout, ordered host commands, and command acknowledgement.
@@ -23,11 +27,16 @@
 - `templates/index.html` — host player page, including the sync editor link.
 - `static/sync_editor.js`, `static/sync_editor.css`, `templates/sync_editor.html` —
   lyric sync editor (logic kept out of the template).
-- `static/manifest.webmanifest`, `static/sw.js`, `static/icon-*.png` — phone PWA.
-- `tests/` — Flask app, API, shared-state, and PWA tests.
+- `static/confirm-dialog.js`, `static/confirm-dialog.css` — shared modal confirmation
+  dialog used by all pages.
+- `static/manifest.webmanifest`, `static/sw.js`, `static/icon-*.png`,
+  `static/apple-touch-icon.png` — phone PWA.
+- `tests/` — pytest suite (API, shared state, logging, tools, and PWA), including the
+  `tests/browser/` Playwright tests.
 - `original_songs/` — source tracks (full mix with vocals).
 - `songs/` — instrumentals derived from the matching original; same filename
-  stem and performance.
+  stem and performance. `normalize_audio.py` and `transpose.py` are the tracked
+  helper scripts.
 - `lyrics/` — generated `.srt` files plus `.words.json` word-timing sidecars.
 - `tools/generate_lyrics.py` — Demucs + Whisper + LRCLIB timing pipeline.
 - `tools/check_lyrics.py` — structural and vocal-energy validator.
@@ -35,7 +44,10 @@
 ## Shared player / phone remote
 
 - Localhost gets the player at `/`; LAN clients get the remote. `/player` and
-  `/remote` force either role. Only the player page may output audio.
+  `/remote` force either role. Only the host player page may output audio for the
+  shared session; the Sync Editor can preview audio for timing work.
+- `/sync_editor.html` is linked only from the host page, but the route is not
+  access-controlled; any LAN client that knows the URL can open it and save lyrics.
 - The server owns the queue and playback state. Phones call `/api/control`;
   state reaches browsers through `/api/events` (SSE) with polling fallback.
 - Only one host is active. A second player takes over and the old host receives
@@ -52,6 +64,7 @@
   node --check static\scripts.js
   node --check static\remote.js
   node --check static\sync_editor.js
+  node --check static\confirm-dialog.js
   node --check static\sw.js
   ```
 
@@ -73,8 +86,8 @@
   licensing or asset ownership without explicit user approval.
 - Do not add a public version number, release tag, or versioning scheme. Existing
   cache names and the lyric tool's User-Agent are tooling details, not releases.
-- The sync editor loads Bootstrap and WaveSurfer from `static/vendor/`; do not
-  reintroduce CDN or Google Fonts links.
+- The Sync Editor loads Bootstrap and WaveSurfer from `static/vendor/`; the host
+  and remote use custom CSS. Do not reintroduce CDN or Google Fonts links.
 
 ## Adding lyrics for new songs
 
@@ -163,11 +176,13 @@ song for manual lyric review. Do not invent text or hand-retime it.
 
 ## Tooling notes
 
-- Audio tooling uses the global Python 3.14.9 install, not `.venv` (the venv has
-  the web app and test dependencies but not Demucs/faster-whisper/torch).
-- Whisper tries CUDA `float16` first and falls back to CPU `int8`. CUDA requires
-  the optional CUDA 12 runtime packages listed in `requirements-cuda.txt`; keep
-  the fallback.
+- `tools/generate_lyrics.py` needs the lyric dependencies plus `ffmpeg`/`ffprobe`.
+  `tools/add_lyrics.ps1` uses `python` from PATH by default; pass `-Python`
+  (for example `.\venv\Scripts\python.exe`) to select an interpreter that has
+  Demucs/faster-whisper/torch installed.
+- Whisper tries CUDA `float16` first and falls back to CPU `int8` if CUDA setup or
+  transcription fails. CUDA requires the optional CUDA 12 runtime packages listed
+  in `requirements-cuda.txt`; keep the fallback.
 - Demucs stems, Whisper transcripts, and non-empty LRCLIB responses are cached
   under `tools/.cache/`. Reusing them is intentional. Empty LRCLIB responses are
   not cached, so a later run retries them.

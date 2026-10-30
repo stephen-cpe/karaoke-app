@@ -18,7 +18,7 @@ their own licenses.
 
 | Package | Version tested | License |
 |---|---|---|
-| pytest | 9.1.1 | MIT |
+| pytest | 9.2.0 | MIT |
 | Playwright | 1.64.1 | Apache-2.0 |
 | ruff | 0.17.3 | MIT |
 | pydub | 0.25.1 | MIT |
@@ -30,8 +30,8 @@ their own licenses.
 |---|---|---|
 | faster-whisper | 1.2.1 | MIT |
 | Demucs | 4.1.0 | MIT |
-| PyTorch (`torch`) | 2.10.0 | BSD-3-Clause |
-| CTranslate2 | 4.8.2 | MIT |
+| PyTorch (`torch`) | 2.15.0 | BSD-3-Clause |
+| CTranslate2 | 4.8.4 | MIT |
 | NumPy | 2.5.4 | BSD-3-Clause |
 
 The optional NVIDIA CUDA runtime packages (`nvidia-cublas-cu12`,
