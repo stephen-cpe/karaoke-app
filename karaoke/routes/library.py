@@ -148,7 +148,7 @@ def transpose_audio():
 @library.get("/api/editor/lyrics")
 def api_editor_lyrics():
     if not editor_access_allowed():
-        return jsonify({"error": "Sync Editor is unavailable."}), 404
+        return jsonify({"error": "Lyrics Editor is unavailable."}), 404
 
     song_id = request.args.get("song_id")
     if not isinstance(song_id, str) or not song_id:
@@ -172,16 +172,16 @@ def _words_object(raw: str | None) -> tuple[dict | None, str | None]:
     try:
         data = json.loads(raw)
     except (TypeError, json.JSONDecodeError):
-        return None, "The active word-timing file is not valid JSON."
+        return None, "Stored word-by-word timing could not be read."
     if not isinstance(data, dict):
-        return None, "The active word-timing file must contain a JSON object."
+        return None, "Stored word-by-word timing could not be read."
     return data, None
 
 
 @library.get("/api/editor/draft")
 def api_editor_draft():
     if not editor_access_allowed():
-        return jsonify({"error": "Sync Editor is unavailable."}), 404
+        return jsonify({"error": "Lyrics Editor is unavailable."}), 404
 
     song_id = request.args.get("song_id")
     if not isinstance(song_id, str) or not song_id:
@@ -202,6 +202,7 @@ def api_editor_draft():
             "song_id": song_id,
             "srt": draft["srt"],
             "words": draft["words"],
+            "review": draft.get("review", []),
             "source": "draft",
             "draft_revision": draft["revision"],
             "base_active_revision": draft["base_active_revision"],
@@ -218,6 +219,7 @@ def api_editor_draft():
         "song_id": song_id,
         "srt": active["srt"],
         "words": active_words,
+        "review": [],
         "source": source,
         "draft_revision": None,
         "base_active_revision": active["revision"],
@@ -229,12 +231,13 @@ def api_editor_draft():
 @library.post("/api/editor/draft")
 def api_editor_draft_save():
     if not editor_access_allowed():
-        return jsonify({"error": "Sync Editor is unavailable."}), 404
+        return jsonify({"error": "Lyrics Editor is unavailable."}), 404
 
     data = json_body()
     song_id = data.get("song_id")
     srt_text = data.get("srt")
     words = data.get("words", None)
+    review = data.get("review", None)
     base_draft_revision = data.get("base_draft_revision")
     base_active_revision = data.get("base_active_revision")
 
@@ -251,7 +254,7 @@ def api_editor_draft_save():
     try:
         result = save_draft(
             current_app.config["LYRICS_DIR"], song_id, srt_text, words,
-            base_draft_revision, base_active_revision)
+            base_draft_revision, base_active_revision, review)
     except DraftConflictError as exc:
         logger.warning("Draft conflict for %s; current revision %s",
                        song_id, exc.revision)
@@ -273,7 +276,7 @@ def api_editor_draft_save():
 @library.post("/api/editor/approve")
 def api_editor_approve():
     if not editor_access_allowed():
-        return jsonify({"error": "Sync Editor is unavailable."}), 404
+        return jsonify({"error": "Lyrics Editor is unavailable."}), 404
 
     data = json_body()
     song_id = data.get("song_id")
@@ -319,7 +322,7 @@ def api_editor_approve():
 @library.post("/api/save-lyrics")
 def api_save_lyrics():
     if not editor_access_allowed():
-        return jsonify({"error": "Sync Editor is unavailable."}), 404
+        return jsonify({"error": "Lyrics Editor is unavailable."}), 404
 
     data = json_body()
     song_id = data.get("song_id")

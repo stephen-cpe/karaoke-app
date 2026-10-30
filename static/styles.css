@@ -594,6 +594,40 @@ body.has-song .app-main {
   white-space: nowrap;
 }
 
+.song-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.edit-lyrics-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  height: 32px;
+  padding: 0 12px 0 9px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 500;
+  white-space: nowrap;
+  transition: background-color 140ms var(--ease), border-color 140ms var(--ease), color 140ms var(--ease);
+}
+
+.edit-lyrics-button .icon {
+  width: 15px;
+  height: 15px;
+}
+
+.edit-lyrics-button:hover {
+  border-color: var(--text-secondary);
+  background: rgba(255, 255, 255, 0.07);
+  color: #fff;
+}
+
 .add-button {
   display: inline-flex;
   align-items: center;
@@ -1723,17 +1757,20 @@ body:not(.has-song) .key-control {
     display: none;
   }
 
-  .add-button {
+  .add-button,
+  .edit-lyrics-button {
     width: 32px;
     padding: 0;
     border-radius: 50%;
   }
 
-  .add-button span {
+  .add-button span,
+  .edit-lyrics-button span {
     display: none;
   }
 
-  .add-button .icon {
+  .add-button .icon,
+  .edit-lyrics-button .icon {
     width: 18px;
     height: 18px;
   }

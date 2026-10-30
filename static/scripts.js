@@ -1117,6 +1117,16 @@ function displaySongs(list, query = "") {
     artist.title = song.artist || "Unknown artist";
     main.append(titleLine, artist);
 
+    const actions = makeElement("div", "song-actions");
+    if (document.body.dataset.editorAvailable === "1") {
+      const editLink = makeElement("a", "edit-lyrics-button");
+      editLink.href = `/sync_editor.html?song=${encodeURIComponent(song.filename)}`;
+      editLink.title = `Edit lyrics for ${song.title}`;
+      editLink.setAttribute("aria-label", `Edit lyrics for ${song.title}`);
+      editLink.append(makeIcon("tune"), makeElement("span", "", "Edit lyrics"));
+      actions.appendChild(editLink);
+    }
+
     const addButton = makeElement("button", "add-button");
     addButton.type = "button";
     addButton.title = `Add ${song.title} to the queue`;
@@ -1127,8 +1137,9 @@ function displaySongs(list, query = "") {
         .then(() => flashAddedButton(addButton))
         .catch(() => {});
     });
+    actions.appendChild(addButton);
 
-    row.append(id, main, addButton);
+    row.append(id, main, actions);
     songListContent.appendChild(row);
   });
 }

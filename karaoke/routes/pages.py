@@ -33,6 +33,7 @@ def remote_page():
 
 
 @pages.get("/sync_editor.html")
+@pages.get("/lyrics-editor")
 def sync_editor():
     if not editor_access_allowed():
         abort(404)

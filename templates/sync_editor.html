@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="theme-color" content="#0f0f0f">
-  <title>Lyric Sync Editor — KARAOKE APP</title>
+  <title>Lyrics Editor — KARAOKE APP</title>
   <link rel="icon" href="/static/favicon.ico">
   <link rel="stylesheet" href="/static/vendor/bootstrap.min.css">
   <script src="/static/vendor/wavesurfer.min.js"></script>
@@ -21,142 +21,247 @@
       </a>
       <span class="topbar-divider" aria-hidden="true"></span>
       <div class="title-block">
-        <h1>Lyric sync editor</h1>
-        <p>Fine-tune each line, save a draft, then approve when it is ready.</p>
+        <h1>Lyrics Editor</h1>
+        <p id="songContext">Choose a song to begin</p>
       </div>
     </div>
     <div class="topbar-actions">
-      <span id="loadBadge" class="badge badge-soft">No lyrics loaded</span>
+      <span id="statusChip" class="status-chip">No song open</span>
       <button id="undoBtn" class="btn btn-sm btn-outline-secondary" disabled>Undo</button>
       <button id="redoBtn" class="btn btn-sm btn-outline-secondary" disabled>Redo</button>
-      <button id="toggleWordModeBtn" class="btn btn-sm btn-outline-warning d-none">Drop all word timings</button>
       <button id="saveBtn" class="btn btn-sm btn-outline-secondary" disabled>Save draft</button>
-      <button id="approveBtn" class="btn btn-sm btn-success" disabled>Approve / publish</button>
+      <button id="publishBtn" class="btn btn-sm btn-success" disabled>Publish</button>
+      <details id="moreMenu" class="more-menu">
+        <summary class="btn btn-sm btn-outline-secondary">More</summary>
+        <div class="more-panel">
+          <section class="more-section">
+            <h2>Song</h2>
+            <button id="changeSongBtn" class="menu-button" type="button">Change song</button>
+            <button id="reloadSongsBtn" class="menu-button" type="button">Refresh song list</button>
+            <button id="loadAudioOnlyBtn" class="menu-button" type="button">Load audio without lyrics</button>
+          </section>
+          <section class="more-section">
+            <h2>Import</h2>
+            <button id="importSrtBtn" class="menu-button" type="button">Import lyrics (.srt)…</button>
+            <button id="importWordsBtn" class="menu-button" type="button">Import word timing (.json)…</button>
+            <button id="importAudioBtn" class="menu-button" type="button">Load audio file…</button>
+            <input type="file" id="srtFile" class="d-none" accept=".srt,text/plain">
+            <input type="file" id="wordsFile" class="d-none" accept=".json,application/json">
+            <input type="file" id="audioFile" class="d-none" accept="audio/*">
+          </section>
+          <section class="more-section">
+            <h2>Advanced</h2>
+            <label class="menu-check">
+              <input id="rippleToggle" type="checkbox">
+              <span>Keep later lines in sync</span>
+            </label>
+            <label class="menu-check">
+              <input id="exactTimesToggle" type="checkbox">
+              <span>Show exact times</span>
+            </label>
+            <button id="addInstrumentalBtn" class="menu-button" type="button">Add instrumental break</button>
+            <button id="previewSrtBtn" class="menu-button" type="button">Preview SRT</button>
+            <button id="downloadSrtBtn" class="menu-button" type="button" disabled>Export SRT</button>
+            <button id="downloadWordsBtn" class="menu-button" type="button" disabled>Export word timing</button>
+            <pre id="srtOutput" class="srt-preview d-none"></pre>
+          </section>
+          <section class="more-section more-danger">
+            <button id="clearCuesBtn" class="menu-button danger" type="button">Clear all lyrics…</button>
+          </section>
+        </div>
+      </details>
     </div>
   </header>
 
   <main class="editor-shell">
-  <section class="load-bar">
-    <div class="load-group">
-      <label for="songSelect">Song (load / save destination)</label>
-      <div class="row">
-        <select id="songSelect" class="form-select form-select-sm song-select">
-          <option disabled selected value="">Loading song list…</option>
-        </select>
-        <button id="loadSongBtn" class="btn btn-sm btn-success">Load song</button>
-        <button id="loadAudioBtn" class="btn btn-sm btn-outline-secondary">Audio only</button>
-        <button id="reloadSongsBtn" class="btn btn-sm btn-outline-secondary">Refresh list</button>
-      </div>
-      <div id="audioStatus" class="audio-status">No audio loaded.</div>
-      <p class="draft-note">Drafts are local. The player keeps the active lyrics until you approve.</p>
-    </div>
-    <div class="load-group">
-      <label>Import local files (overrides the editor contents)</label>
-      <div class="row">
-        <input type="file" id="srtFile" class="form-control form-control-sm" accept=".srt,text/plain" title="Import .srt">
-        <input type="file" id="wordsFile" class="form-control form-control-sm" accept=".json,application/json" title="Import .words.json">
-        <input type="file" id="audioFile" class="form-control form-control-sm" accept="audio/*" title="Import audio">
-      </div>
-      <div id="saveStatus" class="mt-1"></div>
-    </div>
-  </section>
-
-  <div class="editor-grid">
-    <section class="panel" aria-labelledby="cues-heading">
-      <div class="panel-head">
-        <h2 id="cues-heading">Cues <span id="cueCount" class="badge badge-soft"></span> <span id="wordCount" class="badge badge-soft"></span></h2>
-        <div class="toolbar">
-          <label class="form-check form-switch">
-            <input class="form-check-input" type="checkbox" id="rippleToggle">
-            <span class="form-check-label small">Ripple later cues</span>
-          </label>
-          <button id="addCueBtn" class="btn btn-sm btn-outline-light">+ Cue</button>
-          <button id="addInstrumentalBtn" class="btn btn-sm btn-outline-info">+ [Instrumental]</button>
-          <button id="clearCuesBtn" class="btn btn-sm btn-outline-danger">Clear</button>
+    <section id="emptyState" class="empty-state" aria-labelledby="empty-heading">
+      <div class="empty-card">
+        <p class="eyebrow">Lyrics Editor</p>
+        <h2 id="empty-heading">Choose a song to edit</h2>
+        <p class="empty-copy">Your work is saved as a local draft. The player keeps the published lyrics until you choose Publish.</p>
+        <div class="song-picker">
+          <label for="songSelect">Song</label>
+          <select id="songSelect" class="form-select song-select">
+            <option disabled selected value="">Loading song list…</option>
+          </select>
+          <button id="loadSongBtn" class="btn btn-success" type="button">Open</button>
         </div>
+        <p class="empty-hint">Tip: in the song library, choose “Edit lyrics” on a song to open it here.</p>
+        <div class="empty-note">
+          <strong>No lyrics yet?</strong>
+          Open a song and type the first line. You do not need to know any file format.
+        </div>
+        <p id="emptyStatus" class="save-status" aria-live="polite"></p>
       </div>
-
-      <div id="validation" class="validation muted">Loading…</div>
-
-      <div id="cues" class="cue-list"></div>
-
-      <div id="wordInspector" class="word-inspector muted-note" aria-live="polite">
-        Select a word chip to edit its timing.
-      </div>
-
-      <div class="d-flex gap-2 mt-3 flex-wrap">
-        <button id="previewSrtBtn" class="btn btn-sm btn-outline-secondary">Preview SRT</button>
-        <button id="downloadSrtBtn" class="btn btn-sm btn-outline-secondary" disabled>Download .srt</button>
-        <button id="downloadWordsBtn" class="btn btn-sm btn-outline-secondary" disabled>Download .words.json</button>
-      </div>
-      <pre id="srtOutput" class="srt-preview d-none"></pre>
     </section>
 
-    <aside class="panel" aria-labelledby="player-heading">
-      <div class="player-head">
-        <h2 id="player-heading">Player</h2>
-      </div>
-      <div class="waveform-wrap">
-        <div id="waveform"></div>
-        <div id="cueOverlay" class="cue-overlay"></div>
-      </div>
-      <div class="transport">
-        <button id="playPauseBtn" class="btn btn-sm btn-primary">Play</button>
-        <button id="stopBtn" class="btn btn-sm btn-outline-secondary">Stop</button>
-        <span id="timeDisplay">00:00:00,000 / 00:00:00,000</span>
-      </div>
-      <div class="timing-tools">
-        <div class="timing-group">
-          <span class="timing-label">Zoom</span>
-          <button id="zoomOutBtn" class="btn btn-sm btn-outline-secondary" type="button" title="Zoom out">−</button>
-          <button id="zoomFitBtn" class="btn btn-sm btn-outline-secondary" type="button" title="Fit waveform">Fit</button>
-          <button id="zoomInBtn" class="btn btn-sm btn-outline-secondary" type="button" title="Zoom in">+</button>
+    <section id="workspace" class="workspace d-none">
+      <div class="mode-bar">
+        <div class="mode-tabs" role="tablist" aria-label="Editing mode">
+          <button id="modeLyricsBtn" class="mode-tab is-active" type="button"
+                  role="tab" aria-selected="true" data-mode="lyrics">Edit lyrics</button>
+          <button id="modeTimingBtn" class="mode-tab" type="button"
+                  role="tab" aria-selected="false" data-mode="timing">Fix line timing</button>
+          <button id="modeWordsBtn" class="mode-tab" type="button"
+                  role="tab" aria-selected="false" data-mode="words">Fine-tune words
+            <span class="advanced-badge">Advanced</span>
+          </button>
         </div>
-        <div class="timing-group">
-          <button id="loopCueBtn" class="btn btn-sm btn-outline-secondary" type="button" title="Loop the selected cue">Loop cue</button>
-        </div>
-        <div class="timing-group">
-          <label for="rateSelect">Speed</label>
-          <select id="rateSelect" class="form-select form-select-sm rate-select">
-            <option value="0.5">0.5×</option>
-            <option value="0.75">0.75×</option>
-            <option value="1" selected>1×</option>
-            <option value="1.25">1.25×</option>
-            <option value="1.5">1.5×</option>
-          </select>
-        </div>
-      </div>
-      <div class="offset-bar">
-        <label>Shift all</label>
-        <button data-shift="-0.5" class="btn btn-sm btn-outline-secondary">-0.5</button>
-        <button data-shift="-0.1" class="btn btn-sm btn-outline-secondary">-0.1</button>
-        <button data-shift="0.1" class="btn btn-sm btn-outline-secondary">+0.1</button>
-        <button data-shift="0.5" class="btn btn-sm btn-outline-secondary">+0.5</button>
-        <input id="offsetInput" type="number" step="0.01" value="0.10" class="form-control form-control-sm">
-        <button id="applyOffsetBtn" class="btn btn-sm btn-dark">Apply</button>
+        <p id="modeHint" class="mode-hint">Correct the words. Timing is kept safe automatically.</p>
       </div>
 
-      <div class="panel-head">
-        <h2>Live preview</h2>
-        <label class="form-check form-switch small follow-toggle">
-          <input class="form-check-input" type="checkbox" id="followToggle" checked>
-          <span class="form-check-label">Follow</span>
-        </label>
+      <div id="editorMain" class="editor-main">
+        <section id="lyricsPanel" class="panel lyrics-panel" aria-labelledby="lyrics-heading">
+          <div class="panel-head">
+            <div>
+              <h2 id="lyrics-heading">Lyrics <span id="cueCount" class="count-badge"></span></h2>
+              <p class="panel-subtitle">Click a line to edit it. Changes stay in a draft until you publish.</p>
+            </div>
+            <button id="addCueBtn" class="btn btn-sm btn-outline-light" type="button">+ Add lyric line</button>
+          </div>
+          <div id="validation" class="validation" role="alert" hidden></div>
+          <div id="cues" class="lyric-list"></div>
+          <div class="add-line-footer">
+            <button id="addCueFooterBtn" class="add-line-button" type="button">+ Add lyric line</button>
+          </div>
+        </section>
+
+        <section id="wordPanel" class="panel word-panel d-none" aria-labelledby="word-heading">
+          <div class="word-panel-head">
+            <div>
+              <p class="eyebrow">Advanced</p>
+              <h2 id="word-heading">Fine-tune words</h2>
+              <p id="wordLineLabel" class="panel-subtitle">Line 1 of 1</p>
+            </div>
+            <div class="word-nav">
+              <button id="prevLineBtn" class="btn btn-sm btn-outline-secondary" type="button">Previous</button>
+              <button id="nextLineBtn" class="btn btn-sm btn-outline-secondary" type="button">Next</button>
+              <button id="backToLyricsBtn" class="btn btn-sm btn-outline-secondary" type="button">Back to lyrics</button>
+            </div>
+          </div>
+          <div id="wordFocusText" class="word-focus-text"></div>
+          <div id="wordChips" class="word-chips"></div>
+          <div id="wordInspector" class="word-inspector" aria-live="polite"></div>
+          <div class="word-panel-footer">
+            <p class="muted-note">Word-by-word timing applies only to this line. Other lines are unchanged.</p>
+            <details id="wordMoreMenu" class="more-menu">
+              <summary class="btn btn-sm btn-outline-secondary">Line options</summary>
+              <div class="more-panel line-options-panel">
+                <button id="createWordTimingBtn" class="menu-button" type="button">Add word-by-word timing to this line</button>
+                <button id="stopWordTimingBtn" class="menu-button danger" type="button">Stop word-by-word highlighting on this line…</button>
+              </div>
+            </details>
+          </div>
+        </section>
+
+        <aside id="timingPanel" class="panel timing-panel d-none" aria-labelledby="audio-heading">
+          <div class="panel-head compact">
+            <h2 id="audio-heading">Audio</h2>
+            <span id="audioStatus" class="audio-status">No audio loaded.</span>
+          </div>
+          <div class="waveform-wrap">
+            <div id="waveform"></div>
+            <div id="cueOverlay" class="cue-overlay"></div>
+          </div>
+          <div class="transport">
+            <button id="playPauseBtn" class="btn btn-sm btn-primary" type="button">Play</button>
+            <button id="stopBtn" class="btn btn-sm btn-outline-secondary" type="button">Stop</button>
+            <span id="timeDisplay">0:00 / 0:00</span>
+          </div>
+          <div class="timing-tools">
+            <div class="timing-group">
+              <span class="timing-label">Zoom</span>
+              <button id="zoomOutBtn" class="btn btn-sm btn-outline-secondary" type="button" title="Zoom out">−</button>
+              <button id="zoomFitBtn" class="btn btn-sm btn-outline-secondary" type="button" title="Fit waveform">Fit</button>
+              <button id="zoomInBtn" class="btn btn-sm btn-outline-secondary" type="button" title="Zoom in">+</button>
+            </div>
+            <div class="timing-group">
+              <button id="loopCueBtn" class="btn btn-sm btn-outline-secondary" type="button">Loop line</button>
+            </div>
+            <div class="timing-group">
+              <label for="rateSelect">Speed</label>
+              <select id="rateSelect" class="form-select form-select-sm rate-select">
+                <option value="0.5">0.5×</option>
+                <option value="0.75">0.75×</option>
+                <option value="1" selected>1×</option>
+                <option value="1.25">1.25×</option>
+                <option value="1.5">1.5×</option>
+              </select>
+            </div>
+          </div>
+          <section class="timing-section">
+            <h3>Whole song timing</h3>
+            <p class="timing-copy">Shift every line and word by the same amount.</p>
+            <div class="offset-bar">
+              <button data-shift="-0.5" class="btn btn-sm btn-outline-secondary" type="button">Earlier 0.5s</button>
+              <button data-shift="-0.1" class="btn btn-sm btn-outline-secondary" type="button">Earlier 0.1s</button>
+              <button data-shift="0.1" class="btn btn-sm btn-outline-secondary" type="button">Later 0.1s</button>
+              <button data-shift="0.5" class="btn btn-sm btn-outline-secondary" type="button">Later 0.5s</button>
+              <input id="offsetInput" type="number" step="0.01" value="0.10"
+                     class="form-control form-control-sm" aria-label="Shift amount in seconds">
+              <button id="applyOffsetBtn" class="btn btn-sm btn-dark" type="button">Apply</button>
+            </div>
+          </section>
+          <section id="exactTimesPanel" class="timing-section d-none">
+            <h3>Exact times for the selected line</h3>
+            <div class="exact-time-row">
+              <label>Start <input id="exactStartInput" class="form-control form-control-sm" type="text"></label>
+              <label>End <input id="exactEndInput" class="form-control form-control-sm" type="text"></label>
+              <button id="applyExactTimesBtn" class="btn btn-sm btn-outline-secondary" type="button">Apply</button>
+            </div>
+          </section>
+          <details class="preview-details">
+            <summary>Player preview</summary>
+            <label class="menu-check compact-check">
+              <input id="followToggle" type="checkbox" checked>
+              <span>Follow playback</span>
+            </label>
+            <div id="subtitlePreview" class="subtitle-preview">
+              <div class="muted-note">No lyrics loaded.</div>
+            </div>
+          </details>
+        </aside>
       </div>
-      <div id="subtitlePreview" class="subtitle-preview">
-        <div class="muted-note">No cues loaded.</div>
-      </div>
-      <div class="audio-status mt-2">
-        Space plays or pauses. Use [ and ] to seek ±1s, or S and E to set the
-        selected cue’s start and end at the playhead. Select a word chip to set
-        word boundaries or nudge it. Ctrl+Z / Ctrl+Shift+Z undo and redo.
-        Drafts autosave locally; Approve / publish makes them live.
-      </div>
-    </aside>
-  </div>
+
+      <footer class="bottom-bar">
+        <div class="bottom-transport">
+          <button id="playPauseBtnBottom" class="btn btn-sm btn-primary" type="button">Play</button>
+          <span id="timeDisplayBottom">0:00 / 0:00</span>
+        </div>
+        <p id="draftNote" class="draft-note">Draft is not live. The player keeps the published lyrics.</p>
+        <div id="saveStatus" class="save-status" aria-live="polite"></div>
+      </footer>
+    </section>
   </main>
 
+  <dialog id="reconcileDialog" class="reconcile-dialog" aria-labelledby="reconcile-title">
+    <form method="dialog" class="reconcile-content">
+      <h2 id="reconcile-title">We can’t fit the new words without overlapping.</h2>
+      <p id="reconcileMessage" class="reconcile-copy">Choose how to handle this line. Other lines are not affected.</p>
+      <label class="reconcile-choice">
+        <input type="radio" name="reconcileChoice" value="spread" checked>
+        <span>
+          <strong>Spread the timing across this line</strong>
+          <small>Word-by-word highlighting stays on. Times change for this line only.</small>
+        </span>
+      </label>
+      <label class="reconcile-choice">
+        <input type="radio" name="reconcileChoice" value="line">
+        <span>
+          <strong>Use line highlighting for this line</strong>
+          <small>Word-by-word highlighting turns off for this line only.</small>
+        </span>
+      </label>
+      <p class="reconcile-note">We never remove word timing unless you choose it.</p>
+      <div class="reconcile-actions">
+        <button id="reconcileCancelBtn" class="btn btn-outline-secondary" type="button">Cancel</button>
+        <button id="reconcileApplyBtn" class="btn btn-dark" type="button">Apply to this line</button>
+      </div>
+    </form>
+  </dialog>
+
   <script defer src="/static/confirm-dialog.js"></script>
+  <script defer src="/static/lyric_reconcile.js"></script>
   <script defer src="/static/sync_editor.js"></script>
 </body>
 </html>

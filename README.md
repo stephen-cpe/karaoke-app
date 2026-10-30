@@ -38,11 +38,12 @@ drag-and-drop copy of the working tree, because it still contains the media.
 - **Automatic lyric timing tool** (`tools/generate_lyrics.py`) using Demucs vocal
   separation, Whisper word timestamps and LRCLIB text
 - **Pitch shifting (±4 semitones)** so singers can find their key, with caching
-- **Sync Editor** (waveform + cascading timing) with local drafts, explicit approve/publish,
-  word-level and line-level cue editing, zoom/loop/rate controls, undo/redo, and
-  autosave; experimental, local-only, and disabled by default. It is linked from the
-  localhost host player only when enabled with `--enable-editor` (or
-  `KARAOKE_EDITOR=1`)
+- **Lyrics Editor** — a novice-first, local-only editor with three modes:
+  **Edit lyrics** (text-first), **Fix line timing**, and **Fine-tune words**
+  (advanced). It reconciles text edits with existing word timing, supports
+  line-level and word-level lines in one song, keeps drafts isolated, and publishes
+  only on an explicit action. Disabled by default; enabled with `--enable-editor`
+  (or `KARAOKE_EDITOR=1`) and linked from the localhost host player and song list
 - **Logging built in**: terminal + rotating `karaoke.log` when started with
   `python app.py`, with host-side playback and library errors relayed to the server
 - Helper scripts for loudness normalization and batch pre-transposing songs
@@ -83,7 +84,7 @@ pip install -r requirements.txt -r requirements-dev.txt -r requirements-lyrics.t
 # Or install just the core runtime:
 # pip install -r requirements.txt
 python app.py
-# Optional local-only Sync Editor:
+# Optional local-only Lyrics Editor:
 # python app.py --enable-editor
 ```
 
@@ -107,12 +108,12 @@ python app.py --dev
 > **Note:** the normal server binds to all network interfaces (`0.0.0.0`) by default
 > and has **no authentication**. That is on purpose — it is what lets guests queue
 > songs from their phones — but anyone on the LAN can also control playback or take
-> over the player. The Sync Editor is disabled by default and accepts only localhost
-> requests when explicitly enabled; it is not exposed to LAN clients. Only run the
-> server on networks you trust. Windows Firewall will ask the first time; allow it on
-> private networks.
+> over the player. The Lyrics Editor is disabled by default and accepts only
+> localhost requests when explicitly enabled; it is not exposed to LAN clients. Only
+> run the server on networks you trust. Windows Firewall will ask the first time;
+> allow it on private networks.
 
-The host and remote use custom CSS; the Sync Editor loads Bootstrap and WaveSurfer
+The host and remote use custom CSS; the Lyrics Editor loads Bootstrap and WaveSurfer
 from `static/vendor/`. All pages use system fonts and make no third-party runtime
 requests. `app.py` probes FFmpeg at startup for diagnostics; pitch shifting,
 normalization, and lyric tooling only invoke it when you use those features.
@@ -124,9 +125,9 @@ LRCLIB is used only by the lyric pipeline.
   `playback_state.py`; restarting the server starts a fresh session.
 - The host page owns the only shared-session audio output, registers as the active
   player, and reports its true position every second. The phone remote page never
-  creates or plays media; the Sync Editor is a separate, local-only editing surface
-  when enabled. It saves drafts under `lyrics/drafts/`; only an explicit approval
-  replaces the active lyrics the player serves.
+  creates or plays media; the Lyrics Editor is a separate, local-only editing
+  surface when enabled. It saves drafts under `lyrics/drafts/`; only an explicit
+  **Publish** replaces the active lyrics the player serves.
 - Phones send REST controls. The server broadcasts the new snapshot over
   `/api/events` (SSE) and queues ordered commands for the host, which acknowledges
   them with `last_command_id`.
@@ -172,10 +173,11 @@ karaoke_app/
 │   ├── background.js         # procedural WebGL star/nebula/galaxy background
 │   ├── scripts.js            # host-only audio engine + shared-session client
 │   ├── remote.js / remote.css # phone remote (controls only, no audio element)
-│   ├── sync_editor.js        # sync editor logic (kept out of the HTML template)
+│   ├── sync_editor.js        # Lyrics Editor UI and draft/publish workflow
+│   ├── lyric_reconcile.js    # pure text/word-timing reconciliation rules
 │   ├── confirm-dialog.js / .css # shared confirmation dialog used by all pages
 │   ├── styles.css            # host player styles
-│   ├── sync_editor.css       # sync editor styles
+│   ├── sync_editor.css       # Lyrics Editor styles
 │   ├── favicon.ico, logo.webp # browser/brand assets
 │   ├── vendor/               # local Bootstrap + WaveSurfer builds and licenses
 │   ├── manifest.webmanifest  # PWA metadata
@@ -188,7 +190,8 @@ karaoke_app/
 │   ├── add_lyrics.ps1        # generate + validate wrapper
 │   └── .cache/               # separated vocals, transcripts, LRCLIB responses (ignored)
 ├── tests/                    # pytest suite
-│   └── browser/              # Playwright host, remote, and editor UI tests
+│   ├── browser/              # Playwright host, remote, and Lyrics Editor UI tests
+│   └── js/                   # Node unit tests for text/timing reconciliation
 ├── docs/
 │   └── AGENTS.md             # agent handoff and lyric-generation workflow
 ├── pyproject.toml            # Ruff configuration
@@ -259,56 +262,68 @@ Only `.mp3` and `.wav` files are picked up; other files (`*.jpg`, `*.py`, …) a
 
 ## Adding synced lyrics
 
-1. Enable the experimental editor for this run with `python app.py --enable-editor`
-   (or `KARAOKE_EDITOR=1`; PowerShell: `$env:KARAOKE_EDITOR = "1"`), then open the
-   **Sync editor** from the host player header (or
-   <http://localhost:8080/sync_editor.html>). It is disabled by default and only
-   accepts localhost requests; `--dev` alone does not enable it.
-2. Load a song from the catalog. If a saved draft exists it is loaded and marked
-   **draft**; otherwise the active lyrics are the starting content. You can also
-   import local `.srt` / `.words.json` files.
-3. Edit timings:
-   - Nudge a cue with `−0.1` / `+0.1`, ripple later cues, or use the Shift all
-     controls. The **Start** / **End** buttons set cue boundaries at the playhead
-     (S/E also work).
-   - Select a word chip to edit one word independently. The word inspector can set
-     its start or end at the playhead and nudge it by 0.05s or 0.1s.
-   - Line-level and word-timed cues can coexist. **+ Cue** always adds a line-level
-     cue; **Unlock** converts only the selected cue to line-level and keeps every
-     other cue's word timings.
-   - **Split** works on word-timed cues at a word boundary and on instrumental cues;
-     **Merge** requires two cues in the same mode. Unsupported operations explain
-     why in the status line.
-   - Use zoom, **Loop cue**, and the speed selector for timing. Undo/redo and a
-     periodic local autosave are built in. The live preview shows the same
-     line-level and word-highlighting states as the host player. Invalid timing is
-     reported in the validation panel and blocks saving or publishing.
-4. Click **Save draft**. Drafts are stored under `lyrics/drafts/`, ignored by the
+1. Enable the editor for this run with `python app.py --enable-editor` (or
+   `KARAOKE_EDITOR=1`; PowerShell: `$env:KARAOKE_EDITOR = "1"`). Open the
+   **Lyrics Editor** from the host player header, or use **Edit lyrics** on a song
+   in the library. The song action and `?song=<filename>` deep link open the song
+   already loaded. The editor is disabled by default and accepts only localhost
+   requests; `--dev` alone does not enable it.
+2. The default **Edit lyrics** mode is text-first. Click any lyric line and type.
+   There is no “Unlock” step, even when the line has word-by-word timing. If a
+   saved draft exists it is loaded and marked **Draft**; otherwise the published
+   lyrics are the starting content.
+3. Text edits reconcile with word timing:
+   - Punctuation, capitalization, and one-to-one word replacements keep the
+     existing timing.
+   - Inserted or deleted words preserve the surrounding matched words; new timing
+     is fitted only inside a safe span.
+   - A line whose timing was inferred gets a **Check timing** chip. Reviewing or
+     adjusting the timing clears it.
+   - If the new words cannot fit safely, the editor asks whether to spread the
+     timing across that line, use whole-line highlighting for that line only, or
+     cancel. Word timing is never removed silently.
+4. Use **Fix line timing** to play or loop one line, set its start/end at the
+   playhead, move it earlier/later by 0.1s or 0.5s, or shift the whole song.
+   If a move would overlap the next line, the editor explains the conflict and
+   offers to move the following lines too. The lyric list stays in playback order.
+5. Use **Fine-tune words** (marked **Advanced**) to adjust one word at a time.
+   Word chips, start/end at the playhead, 0.05s/0.1s nudges, looping, and a
+   validation message appear only in this mode. Word changes affect only the
+   selected line. **Line options** can add word timing to a line that uses
+   whole-line highlighting, or stop word-by-word highlighting for that line only.
+6. Add, remove, split, and merge lyric lines from the selected line’s contextual
+   actions. **Split line** uses the text caret and, when available, the playhead;
+   it also works on ordinary line-level text with no word timing. **Merge with
+   next** preserves word timing when both lines share it; if the lines are mixed,
+   the editor asks before creating or dropping word timing.
+7. Click **Save draft**. Drafts are stored under `lyrics/drafts/`, ignored by the
    player and by the normal `/lyrics/` media route. Saving or autosaving a draft
-   never changes active lyrics. When word timings are present, `.words.json` is the
-   source of truth and the draft's SRT is generated from it; line-level drafts are
+   never changes active lyrics. When word timing is present, `.words.json` is the
+   source of truth and the draft’s SRT is generated from it; line-level drafts are
    stored as SRT-only. The server validates draft content before writing it.
-5. Click **Approve / publish** and confirm. The editor first saves the current
-   content to the draft, then the server validates it, checks that active lyrics have
-   not changed since the draft was based on them, writes the active pair, and removes
-   the draft. A published SRT-only/line-level version removes any stale active
-   `.words.json`. If anything fails, the active pair is left unchanged and the draft
-   remains available.
+8. Click **Publish** and confirm. The confirmation lists the song, line count, and
+   any lines with a **Check timing** flag. The editor saves the current content to
+   the draft, the server validates it, checks that active lyrics have not changed
+   since the draft was based on them, writes the active pair, and removes the draft.
+   A published SRT-only/line-level version removes any stale active `.words.json`.
+   If anything fails, the active pair is left unchanged and the draft remains.
 
-The song dropdown marks existing active lyric files as `SRT`, `words`, or
-`SRT+words`. You can also drop a `.srt` into `lyrics/` manually, as long as its
-filename matches the audio filename (only the extension differs).
+Technical import/export, SRT preview, exact timestamps, “keep later lines in sync,”
+and clear-all controls live under **More** so the default view stays text-first.
+The editor still loads Bootstrap and WaveSurfer from `static/vendor/` and makes no
+third-party runtime requests.
 
-The host player, phone remote, Sync Editor, and lyric checker accept normal SRT cue
+The host player, phone remote, Lyrics Editor, and lyric checker accept normal SRT
 blocks; cue numbers are optional and both comma and dot decimal separators work.
-Line-level lyric cues without word timings are valid; the checker only flags them
+Line-level lyric lines without word timings are valid; the checker only flags them
 as structural problems when run with `--strict`.
 
-Draft saves and approvals carry content revisions. A stale draft save is rejected,
-and approval is rejected if active lyrics changed since the draft's base revision;
+Draft saves and publishes carry content revisions. A stale draft save is rejected,
+and publishing is rejected if active lyrics changed since the draft’s base revision;
 the draft is kept in both cases. Reloading a song recovers its saved draft; drafts
-never become live until approval succeeds. Drafts do not appear in the player,
-`/api/songs` flags, or the `/lyrics/` media route.
+never become live until publishing succeeds. Drafts do not appear in the player,
+`/api/songs` flags, or the `/lyrics/` media route. Review flags are stored only in
+the draft envelope and are never written to active `.words.json`.
 
 ### Automatic timing with `tools/generate_lyrics.py`
 
@@ -394,11 +409,12 @@ Long instrumental gaps (longer than three seconds) become `[Instrumental]` cues;
 shorter gaps with audible vocal energy are left alone. A lyric cue ends at the
 first sung phrase: held notes stay with their line, while later backing vocals or
 ad-libs that are not in the lyric reference are left to the surrounding
-`[Instrumental]` cue. In the Sync Editor, `.words.json` is the source of truth for
-word-timed drafts and the SRT is regenerated from it. Approved SRT-only/line-level
+`[Instrumental]` cue. In the Lyrics Editor, `.words.json` is the source of truth for
+word-timed drafts and the SRT is regenerated from it. Published SRT-only/line-level
 drafts remove the stale active `.words.json` so the player cannot show stale word
-timings. Word-by-word highlighting is preserved when an approved draft has word
-timings.
+timings. Word-by-word highlighting is preserved when a published draft has word
+timings, and editor-only review flags are stripped before the active files are
+written.
 
 ## Pitch shifting
 
@@ -425,10 +441,10 @@ python app.py
 | Method | Path | Description |
 |---|---|---|
 | GET | `/`, `/player`, `/remote` | Role-aware root (localhost = player, LAN = remote); explicit overrides |
-| GET | `/sync_editor.html` | Lyric Sync Editor (disabled by default; localhost + editor flag required) |
+| GET | `/sync_editor.html`, `/lyrics-editor` | Lyrics Editor (disabled by default; localhost + editor flag required; both URLs use the same gate) |
 | GET | `/api/editor/lyrics?song_id=<filename>` | Active SRT/words text plus a revision hash (editor only) |
-| GET | `/api/editor/draft?song_id=<filename>` | Draft content if present, otherwise active content, plus draft/active revisions (editor only) |
-| POST | `/api/editor/draft` | Save or update an isolated draft: `song_id`, `srt` or `words`, `base_draft_revision`, `base_active_revision` (editor only) |
+| GET | `/api/editor/draft?song_id=<filename>` | Draft content if present, otherwise active content, plus draft/active revisions and draft-only review flags (editor only) |
+| POST | `/api/editor/draft` | Save or update an isolated draft: `song_id`, `srt` or `words`, optional `review`, `base_draft_revision`, `base_active_revision` (editor only) |
 | POST | `/api/editor/approve` | Publish a validated draft: `song_id`, `draft_revision`, `base_active_revision`; stale draft/active revisions return `409` (editor only) |
 | GET | `/api/info` | Role, `server_id`, join/remote/player URLs, host connectivity, LAN IP and port |
 | GET | `/api/state` | Full shared snapshot: `server_id`, `revision`, `host_connected`, `host_last_seen_seconds`, status, position, duration, current song, queue, transpose, volume, error, and `last_command_id` |
@@ -446,7 +462,7 @@ python app.py
 | GET | `/songs/…`, `/lyrics/…`, `/transposed/…` | Media file serving (only `.mp3`/`.wav`, `.srt`/`.words.json` as appropriate) |
 
 `/api/editor/lyrics`, `/api/editor/draft`, `/api/editor/approve`, and
-`/api/save-lyrics` return 404 unless the Sync Editor is enabled and the request
+`/api/save-lyrics` return 404 unless the Lyrics Editor is enabled and the request
 comes from localhost. Drafts live under `lyrics/drafts/` and are not served by the
 `/lyrics/...` media route.
 
@@ -460,25 +476,31 @@ Shared-control actions: `add` (`filename`), `remove` (`index`), `clear`, `reorde
 pip install -r requirements-dev.txt
 venv\Scripts\python -m pytest
 venv\Scripts\ruff check .
+node --check static\lyric_reconcile.js
+node --check static\sync_editor.js
+node --test tests\js\reconcile.test.js
 ```
 
 The suite covers filename parsing, the catalog endpoint, media-route extension
 filtering, lyrics saving (including traversal, non-string/NUL filenames, oversize
 rejection, and stale word-timing cleanup), server-side SRT validation, SRT generation
 from word timings, editor access gating, draft/active isolation, draft and active
-revision conflicts, failed-publish rollback, mixed line/word drafts, transposition
-behavior and failure cleanup, the shared-state model (host takeover, command
-acknowledgement, timeout freezing, queue ordering, stale ended events), the role-aware
-pages, the control/state/host APIs, SSE framing, logging sanitization, and the PWA
-routes. FFmpeg is mocked, so the tests run anywhere without it. The exact test count
-is whatever `pytest` reports for your checkout; it is intentionally not duplicated
-here.
+revision conflicts, failed-publish rollback, mixed line/word drafts, draft-only review
+metadata, text/timing reconciliation unit tests, transposition behavior and failure
+cleanup, the shared-state model (host takeover, command acknowledgement, timeout
+freezing, queue ordering, stale ended events), the role-aware pages, the
+control/state/host APIs, SSE framing, logging sanitization, and the PWA routes.
+FFmpeg is mocked, so the tests run anywhere without it. The exact test count is
+whatever `pytest` reports for your checkout; it is intentionally not duplicated
+here. The Python suite invokes the Node reconciliation tests when Node is installed.
 
 Browser tests use Playwright against a temporary local Flask server. They cover
 host player library/queue interactions, host lyric parser tolerance, the phone
-remote, shared confirmation dialogs, keyboard focus, reduced motion, Sync Editor
-prompts, draft autosave/isolation and approval, per-word editing, mixed cues, undo/redo,
-timing controls, and an editor save/reload round trip:
+remote, shared confirmation dialogs, keyboard focus, reduced motion, the text-first
+Lyrics Editor default, song-row entry and deep links, typo edits on word-timed lines,
+insertion/deletion reconciliation, unsafe-edit choices, line-level and word-timed
+splits, add/remove/merge, line and whole-song timing changes, fine-tuning one word,
+per-line word-highlighting removal, draft reload, and publish/review confirmation:
 
 ```powershell
 venv\Scripts\python -m playwright install chromium  # once, unless Edge or Chrome is installed
@@ -501,7 +523,7 @@ host, call `setup_logging()` yourself.
 - each transposition: cache hit or FFmpeg generation, plus full FFmpeg output on failure
 - **host-side playback and library errors are relayed to the server**, so host
   "could not load audio" problems appear as `[browser] …` lines in the log. The phone
-  remote and Sync Editor do not install a global error relay.
+  remote and Lyrics Editor do not install a global error relay.
 - startup diagnostics from `app.py`: resolved folders, catalog size, FFmpeg
   availability, and whether your build has the `rubberband` filter
 
@@ -560,21 +582,27 @@ runtime by `static/background.js`; it contains no third-party visual assets.
   shows a static CSS nebula fallback. `prefers-reduced-motion` freezes the animation.
 - **No guest authentication:** anyone on the network can queue songs, control
   playback, change key or volume, and take over the player. That is intentional for
-  the party flow. The Sync Editor is disabled by default and localhost-only when
+  the party flow. The Lyrics Editor is disabled by default and localhost-only when
   enabled, so it is not part of the unauthenticated LAN surface. Only run the server
   on networks you trust.
-- **Sync Editor drafts:** drafts are stored under `lyrics/drafts/`, ignored by the
-  player, and autosaved locally; they are not version history. Approval is rejected
+- **Lyrics Editor drafts:** drafts are stored under `lyrics/drafts/`, ignored by the
+  player, and autosaved locally; they are not version history. Publishing is rejected
   if active lyrics changed since the draft's base revision, and there is no automatic
-  merge/rebase—the draft remains on disk. Line-level split and mixed-mode merge are
-  intentionally unsupported.
+  merge/rebase—the draft remains on disk. Review flags are draft-only and never reach
+  active `.words.json`. Word timing can be removed only by an explicit per-line
+  choice or confirmation.
+- **Lyrics Editor preview and publish:** the preview follows the host player’s
+  line-level and word-highlighting behavior closely, but it is not a shared renderer.
+  A two-file active publish is staged and rolled back in-process, but it is not a
+  crash-atomic filesystem transaction. There is no persistent history browser and no
+  remote editing.
 - **Large libraries:** the song and queue lists render every row; thousands of songs
   would want pagination or virtual scrolling.
 - **Transposition concurrency:** two simultaneous requests for the same uncached song
   can run FFmpeg twice; each writes a unique temporary file and the last successful
   result wins, so the cache cannot be left half-written.
 - **Lyric timing is automatic, not magic:** dense mixes and repeated choruses are the
-  hardest cases. Spot-check each song before a party; the Sync Editor can nudge any
+  hardest cases. Spot-check each song before a party; the Lyrics Editor can adjust any
   line. Transcription takes several minutes per song on CPU and is cached.
 - **Backend modules:** `app.py` is the entry point; Flask blueprints and shared
   services live under `karaoke/`. Keep route handlers thin and put reusable

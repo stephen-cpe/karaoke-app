@@ -24,10 +24,13 @@
 - `static/background.js` — host-only procedural WebGL star/nebula/galaxy background.
 - `static/remote.js`, `static/remote.css`, `templates/remote.html` — controls-only
   phone remote. It must not create audio/video elements or play media.
-- `templates/index.html` — host player page, including the Sync Editor link when
-  the editor is enabled for localhost.
+- `templates/index.html` — host player page, including the Lyrics Editor link and
+  song-row **Edit lyrics** action when the editor is enabled for localhost.
 - `static/sync_editor.js`, `static/sync_editor.css`, `templates/sync_editor.html` —
-  experimental local-only lyric sync editor (logic kept out of the template).
+  novice-first, local-only Lyrics Editor with **Edit lyrics**, **Fix line timing**,
+  and **Fine-tune words** modes (logic kept out of the template).
+- `static/lyric_reconcile.js` — pure text/word-timing reconciliation rules, also
+  loaded by Node unit tests in `tests/js/`.
 - `static/confirm-dialog.js`, `static/confirm-dialog.css` — shared modal confirmation
   dialog used by all pages.
 - `static/manifest.webmanifest`, `static/sw.js`, `static/icon-*.png`,
@@ -47,18 +50,31 @@
 
 - Localhost gets the player at `/`; LAN clients get the remote. `/player` and
   `/remote` force either role. Only the host player page may output audio for the
-  shared session; the Sync Editor can preview audio for timing work when enabled.
-- The Sync Editor is experimental and disabled by default. Enable it with
-  `--enable-editor` or `KARAOKE_EDITOR=1`; the page, draft/approve APIs, and active
-  lyric APIs return 404 for LAN clients or when disabled, and the host-page link is
-  hidden. Do not use `--dev` as the editor gate.
-- Editor drafts live under `lyrics/drafts/<stem>.draft.json`, are ignored by the
-  player and media route, and autosave locally. Only an explicit approval publishes
-  the validated draft to the active `lyrics/<stem>.srt` and `.words.json` files; the
+  shared session; the Lyrics Editor can preview audio for timing work when enabled.
+- The Lyrics Editor is disabled by default. Enable it with `--enable-editor` or
+  `KARAOKE_EDITOR=1`; `/sync_editor.html`, the `/lyrics-editor` alias, the
+  draft/approve APIs, and active lyric APIs return 404 for LAN clients or when
+  disabled, and the host-page link and song action are hidden. Do not use `--dev`
+  as the editor gate.
+- The default **Edit lyrics** view must stay text-first: no raw timestamps, word
+  chips, ripple controls, or file-format terminology. Technical import/export,
+  exact times, SRT preview, and clear-all controls belong under **More**.
+- Lyric text is always editable. Text changes must go through
+  `static/lyric_reconcile.js` before validation/save/publish. Punctuation,
+  capitalization, and one-to-one replacements keep timing; insert/delete preserves
+  anchors where safe. If reconciliation is unsafe, the UI must offer spread timing,
+  line highlighting for that line only, or cancel. Never silently discard word
+  timing, and never reintroduce a global “drop all word timings” action.
+- Drafts live under `lyrics/drafts/<stem>.draft.json`, are ignored by the player and
+  media route, and autosave locally. Only an explicit **Publish** promotes the
+  validated draft to the active `lyrics/<stem>.srt` and `.words.json` files; the
   draft is removed after a successful publish. Draft and active revisions are checked
   separately, and failed publishes restore the previous active bytes. If active lyrics
-  changed after the draft base, approval is rejected and the draft remains; there is
+  changed after the draft base, publishing is rejected and the draft remains; there is
   no automatic rebase.
+- Draft-only review flags (`review` in the draft envelope) mark lines whose timing was
+  inferred. They are not written to active `.words.json` and must not block publishing;
+  structural timing errors still do. The publish confirmation lists flagged lines.
 - The server owns the queue and playback state. Phones call `/api/control`;
   state reaches browsers through `/api/events` (SSE) with polling fallback.
 - Only one host is active. A second player takes over and the old host receives
@@ -74,9 +90,11 @@
   node --check static\background.js
   node --check static\scripts.js
   node --check static\remote.js
+  node --check static\lyric_reconcile.js
   node --check static\sync_editor.js
   node --check static\confirm-dialog.js
   node --check static\sw.js
+  node --test tests\js\reconcile.test.js
   ```
 
 - Browser/UI tests use Playwright and skip when no Chromium-based browser is
@@ -98,7 +116,7 @@
   licensing or asset ownership without explicit user approval.
 - Do not add a public version number, release tag, or versioning scheme. Existing
   cache names and the lyric tool's User-Agent are tooling details, not releases.
-- The Sync Editor loads Bootstrap and WaveSurfer from `static/vendor/`; the host
+- The Lyrics Editor loads Bootstrap and WaveSurfer from `static/vendor/`; the host
   and remote use custom CSS. Do not reintroduce CDN or Google Fonts links.
 
 ## Adding lyrics for new songs

@@ -12,7 +12,7 @@
   <script defer src="/static/background.js"></script>
   <script defer src="/static/scripts.js"></script>
 </head>
-<body>
+<body{% if editor_available %} data-editor-available="1"{% endif %}>
   <!-- Inline icon set: no icon-font dependency, works offline once cached. -->
   <svg class="icon-sprite" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
     <symbol id="icon-play" viewBox="0 0 24 24"><path d="M8 5.14v13.72c0 .8.88 1.29 1.56.87l10.5-6.86a1.03 1.03 0 0 0 0-1.74L9.56 4.27A1.03 1.03 0 0 0 8 5.14Z"/></symbol>
@@ -57,7 +57,7 @@
         {% if editor_available %}
         <a class="header-action sync-editor-link" href="/sync_editor.html">
           <svg class="icon" aria-hidden="true"><use href="#icon-tune"></use></svg>
-          <span class="header-action-label">Sync editor</span>
+          <span class="header-action-label">Lyrics Editor</span>
         </a>
         {% endif %}
       </nav>

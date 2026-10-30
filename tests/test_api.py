@@ -38,11 +38,15 @@ def test_index_page_renders(client):
     res = client.get("/")
     assert res.status_code == 200
     assert b"KARAOKE" in res.data
+    assert b'data-editor-available="1"' in res.data
 
 
 def test_sync_editor_page_renders(client):
     res = client.get("/sync_editor.html")
     assert res.status_code == 200
+    assert client.get("/lyrics-editor").status_code == 200
+    assert b"Lyrics Editor" in res.data
+    assert b"Drop all word timings" not in res.data
 
 
 def test_songs_endpoint_returns_scanned_catalog(client, add_song):
@@ -342,6 +346,7 @@ def test_pages_avoid_inline_javascript(client):
     remote = client.get("/remote").data
 
     assert b"onclick=" not in host
+    assert b"<script defer src=\"/static/lyric_reconcile.js\"></script>" in editor
     assert b"<script defer src=\"/static/sync_editor.js\"></script>" in editor
     assert b"<script>" not in editor
     assert b"onclick=" not in remote
@@ -381,8 +386,10 @@ def test_editor_requires_localhost_and_enable_flag(client, add_song):
     song = add_song("1_a_b.mp3")
 
     assert client.get("/sync_editor.html", environ_base=LAN).status_code == 404
-    assert b"sync_editor.html" not in client.get(
-        "/player", environ_base=LAN).data
+    assert client.get("/lyrics-editor", environ_base=LAN).status_code == 404
+    lan_page = client.get("/player", environ_base=LAN).data
+    assert b"sync_editor.html" not in lan_page
+    assert b"data-editor-available" not in lan_page
     assert client.get(
         "/api/editor/lyrics",
         query_string={"song_id": song},
@@ -402,7 +409,11 @@ def test_editor_is_disabled_by_default(tmp_path, monkeypatch):
 
     assert app.config["ENABLE_EDITOR"] is False
     assert editor_client.get("/sync_editor.html").status_code == 404
+    assert editor_client.get("/lyrics-editor").status_code == 404
     assert editor_client.post("/api/save-lyrics", json={}).status_code == 404
+    disabled_page = editor_client.get("/").data
+    assert b"sync_editor.html" not in disabled_page
+    assert b"data-editor-available" not in disabled_page
     assert editor_client.get(
         "/api/editor/lyrics", query_string={"song_id": "nope.mp3"}
     ).status_code == 404
@@ -602,6 +613,42 @@ def test_mixed_line_and_word_cues_publish(client, app, add_song):
         encoding="utf-8")
     assert "Somewhere in between" in srt_text
     assert "Line only" in srt_text
+
+
+def test_draft_review_metadata_round_trips_and_stays_out_of_active_words(
+        client, app, add_song):
+    song = add_song("1_a_b.mp3")
+    stem = song.rsplit(".", 1)[0]
+    info = editor_draft_info(client, song)
+    review = [{"line": 1, "reason": "words-added"}]
+
+    draft_res = save_editor_draft(
+        client, song, info, words=WORDS, review=review)
+    assert draft_res.status_code == 200, draft_res.get_json()
+    loaded = editor_draft_info(client, song)
+    assert loaded["review"] == review
+
+    draft = editor_draft_info(client, song)
+    approved = approve_editor_draft(client, song, draft)
+    assert approved.status_code == 200, approved.get_json()
+    published = json.loads(
+        (app.config["LYRICS_DIR"] / f"{stem}.words.json").read_text(
+            encoding="utf-8"))
+    assert "review" not in published
+    assert all("review" not in line for line in published["lines"])
+
+
+def test_invalid_draft_review_metadata_is_rejected(client, app, add_song):
+    song = add_song("1_a_b.mp3")
+    info = editor_draft_info(client, song)
+
+    res = save_editor_draft(
+        client, song, info, srt=SRT,
+        review=[{"line": "one", "reason": "words-added"}])
+
+    assert res.status_code == 400
+    assert "review" in res.get_json()["error"].lower()
+    assert editor_draft_info(client, song)["draft_revision"] is None
 
 
 def test_srt_only_publish_removes_stale_active_words(

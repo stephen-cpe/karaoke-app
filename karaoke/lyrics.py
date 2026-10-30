@@ -295,6 +295,32 @@ def _draft_path(lyrics_dir: os.PathLike[str] | str, song_id: str) -> str:
         os.fspath(lyrics_dir), _DRAFT_DIR, song_stem(song_id) + ".draft.json")
 
 
+def _normalize_review(review: Any) -> list[dict[str, Any]]:
+    """Validate editor-only review flags for a draft envelope.
+
+    Review metadata never reaches the active lyric files. It exists only so a
+    draft can remember which lines had timing inferred during a text edit.
+    """
+    if review is None:
+        return []
+    if not isinstance(review, list):
+        raise ValueError("Draft review must be an array")
+    if len(review) > 500:
+        raise ValueError("Draft has too many review entries")
+    normalized: list[dict[str, Any]] = []
+    for item in review:
+        if not isinstance(item, dict):
+            raise ValueError("Each draft review entry must be an object")
+        line = item.get("line")
+        reason = item.get("reason")
+        if (not isinstance(line, int) or isinstance(line, bool) or line < 1):
+            raise ValueError("Draft review line must be a positive integer")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("Draft review reason must be non-empty text")
+        normalized.append({"line": line, "reason": reason.strip()[:120]})
+    return normalized
+
+
 def _draft_revision_unlocked(lyrics_dir: os.PathLike[str] | str,
                              song_id: str) -> str | None:
     data = _read_optional_bytes(_draft_path(lyrics_dir, song_id))
@@ -328,6 +354,7 @@ def _read_draft_unlocked(lyrics_dir: os.PathLike[str] | str,
         raise ValueError("Draft words must be an object or null")
     if not isinstance(base_active, str) or not base_active:
         raise ValueError("Draft has no base_active_revision")
+    _normalize_review(payload.get("review"))
     return payload, hashlib.sha256(data).hexdigest()
 
 
@@ -342,6 +369,7 @@ def read_draft(lyrics_dir: os.PathLike[str] | str,
     return {
         "srt": payload.get("srt"),
         "words": payload.get("words"),
+        "review": _normalize_review(payload.get("review")),
         "base_active_revision": payload["base_active_revision"],
         "revision": revision,
     }
@@ -350,7 +378,9 @@ def read_draft(lyrics_dir: os.PathLike[str] | str,
 def save_draft(lyrics_dir: os.PathLike[str] | str, song_id: str,
                srt_text: str | None, words: dict[str, Any] | None,
                base_draft_revision: str | None,
-               base_active_revision: str) -> dict[str, str | None]:
+               base_active_revision: str,
+               review: list[dict[str, Any]] | None = None
+               ) -> dict[str, str | None]:
     """Save an isolated draft without changing the active lyric pair."""
     if not isinstance(base_active_revision, str) or not base_active_revision:
         raise ValueError("base_active_revision is required")
@@ -375,6 +405,7 @@ def save_draft(lyrics_dir: os.PathLike[str] | str, song_id: str,
         "base_active_revision": base_active_revision,
         "srt": srt_text,
         "words": words_payload,
+        "review": _normalize_review(review),
     }
     try:
         draft_json = json.dumps(

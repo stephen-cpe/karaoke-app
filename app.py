@@ -42,7 +42,7 @@ def main() -> None:
         help="Use the Flask dev server with auto-reload instead of waitress")
     parser.add_argument(
         "--enable-editor", action="store_true",
-        help="Enable the local-only Sync Editor (also KARAOKE_EDITOR=1)")
+        help="Enable the local-only Lyrics Editor (also KARAOKE_EDITOR=1)")
     parser.add_argument(
         "--threads", type=int, default=16,
         help="Waitress worker threads (default: 16; each remote SSE "
@@ -57,7 +57,7 @@ def main() -> None:
 
     logger.info("Starting KARAOKE APP (dev=%s, log level %s)", args.dev, level_name)
     if app.config.get("ENABLE_EDITOR"):
-        logger.info("Sync Editor enabled for localhost only")
+        logger.info("Lyrics Editor enabled for localhost only")
     for key in ("SONGS_DIR", "LYRICS_DIR", "TRANSPOSED_DIR"):
         logger.info("%s: %s", key, os.path.abspath(app.config[key]))
     logger.info("Catalog: %d song(s) found", len(scan_songs(app.config["SONGS_DIR"])))
@@ -76,8 +76,8 @@ def main() -> None:
         print(f"Phone remotes: {lan_url}/remote")
         print(f"From other devices on your network: {lan_url}")
         if app.config.get("ENABLE_EDITOR"):
-            print("Sync Editor (local only): "
-                  f"http://localhost:{args.port}/sync_editor.html")
+            print("Lyrics Editor (local only): "
+                  f"http://localhost:{args.port}/lyrics-editor")
         print(f"Logs are written to {os.path.abspath('karaoke.log')} - "
               "check there if something fails.")
         # SSE streams keep one Waitress thread open per connected browser.
