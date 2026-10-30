@@ -2,12 +2,14 @@
 // Caches the remote shell only. Session state, songs, lyrics, and transcoded
 // audio always come from the network so stale data can never control the TV.
 
-const CACHE_VERSION = "karaoke-remote-v2";
+const CACHE_VERSION = "karaoke-remote-v3";
 const CORE_ASSETS = [
   "/remote",
   "/manifest.webmanifest",
   "/static/remote.css",
   "/static/remote.js",
+  "/static/confirm-dialog.css",
+  "/static/confirm-dialog.js",
   "/static/logo.webp",
   "/static/favicon.ico",
   "/static/icon-192.png",
@@ -84,7 +86,10 @@ self.addEventListener("fetch", event => {
   }
 
   // Scripts/styles: network first so a deploy is picked up immediately.
-  if (url.pathname === "/static/remote.js" || url.pathname === "/static/remote.css") {
+  if (url.pathname === "/static/remote.js" ||
+      url.pathname === "/static/remote.css" ||
+      url.pathname === "/static/confirm-dialog.js" ||
+      url.pathname === "/static/confirm-dialog.css") {
     event.respondWith(
       fetch(request)
         .then(response => {

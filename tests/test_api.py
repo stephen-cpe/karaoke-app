@@ -88,6 +88,18 @@ def test_pages_use_local_vendor_assets_only(client):
         assert res.data, asset
 
 
+def test_all_pages_ship_the_shared_confirmation_dialog(client):
+    for page in ("/", "/remote", "/sync_editor.html"):
+        data = client.get(page).data
+        assert b"/static/confirm-dialog.css" in data, page
+        assert b"/static/confirm-dialog.js" in data, page
+
+    for asset in ("/static/confirm-dialog.css", "/static/confirm-dialog.js"):
+        response = client.get(asset)
+        assert response.status_code == 200, asset
+        assert response.data, asset
+
+
 def test_host_page_uses_generated_background(client):
     host = client.get("/").data
 

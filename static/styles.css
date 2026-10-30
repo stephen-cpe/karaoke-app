@@ -358,27 +358,6 @@ body.has-song .app-main {
   font-size: 13px;
 }
 
-.heading-note {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  max-width: 350px;
-  margin: 0 2px 3px 0;
-  padding: 8px 12px;
-  border: 1px solid var(--border);
-  border-radius: 999px;
-  background: rgba(255, 255, 255, 0.03);
-  color: var(--text-secondary);
-  font-size: 12px;
-  line-height: 1.4;
-}
-
-.heading-note .icon {
-  width: 16px;
-  height: 16px;
-  color: #c7c7c7;
-}
-
 .heading-side {
   display: flex;
   flex-direction: column;
@@ -1625,10 +1604,6 @@ body:not(.has-song) .key-control {
 
   .page-heading h1 {
     font-size: 32px;
-  }
-
-  .heading-note {
-    display: none;
   }
 
   .player-inner {

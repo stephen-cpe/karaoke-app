@@ -1129,15 +1129,31 @@
     runQueueAction("reorder", { from: index, to: target }, "Could not reorder the queue.");
   }
 
-  function clearQueue() {
+  async function clearQueue() {
+    if (queueBusy) return;
     const count = shared ? shared.queue.length : 0;
     if (!count) return;
-    if (!confirm(`Remove all ${count} queued ${pluralize(count, "song")}?`)) return;
+    const confirmed = await karaokeConfirm({
+      title: "Clear the queue?",
+      message: `Remove ${count} queued ${pluralize(count, "song")}. The current song keeps playing.`,
+      confirmLabel: "Clear queue",
+      tone: "danger",
+      focus: "cancel"
+    });
+    if (!confirmed) return;
     runQueueAction("clear", {}, "Could not clear the queue.");
   }
 
-  function stopAndClear() {
-    if (!confirm("Stop the music and clear the current song and queue?")) return;
+  async function stopAndClear() {
+    if (queueBusy) return;
+    const confirmed = await karaokeConfirm({
+      title: "Stop and clear?",
+      message: "Stop the current song and remove every queued song. Playback stays stopped until you choose something else.",
+      confirmLabel: "Stop & clear",
+      tone: "danger",
+      focus: "cancel"
+    });
+    if (!confirmed) return;
     runQueueAction("stop", {}, "Could not stop the player.");
   }
 

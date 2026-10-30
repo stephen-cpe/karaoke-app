@@ -60,7 +60,7 @@ Optional dependency groups:
 | File | Use |
 |---|---|
 | `requirements.txt` | Core Flask + Waitress runtime |
-| `requirements-dev.txt` | Core runtime plus pytest |
+| `requirements-dev.txt` | Core runtime plus pytest and Playwright |
 | `requirements-media.txt` | `pydub` for `songs/normalize_audio.py` |
 | `requirements-lyrics.txt` | Demucs + faster-whisper + PyTorch pipeline |
 | `requirements-cuda.txt` | Optional NVIDIA CUDA 12 runtime DLLs for GPU inference |
@@ -165,6 +165,7 @@ karaoke_app/
 │   ├── add_lyrics.ps1        # generate + validate wrapper
 │   └── .cache/               # separated vocals, transcripts, LRCLIB responses (ignored)
 ├── tests/                    # pytest suite
+│   └── browser/              # Playwright host, remote, and editor UI tests
 ├── docs/
 │   └── AGENTS.md             # agent handoff and lyric-generation workflow
 ├── pyproject.toml            # Ruff configuration
@@ -393,6 +394,19 @@ control/state/host APIs, SSE framing, logging sanitization, and the PWA routes.
 FFmpeg is mocked, so the tests run anywhere without it. The exact test count is
 whatever `pytest` reports for your checkout; it is intentionally not duplicated
 here.
+
+Browser tests use Playwright against a temporary local Flask server. They cover
+the host player, phone remote, shared confirmation dialogs, keyboard focus,
+reduced motion, and Sync Editor prompts:
+
+```powershell
+python -m playwright install chromium  # once, unless Edge or Chrome is installed
+venv\Scripts\python -m pytest tests\browser
+venv\Scripts\python -m pytest -m "not browser"
+```
+
+Playwright uses an installed Edge, Chrome, or bundled Chromium; if none is
+available, the browser tests skip instead of failing the suite.
 
 ## Logging & troubleshooting
 

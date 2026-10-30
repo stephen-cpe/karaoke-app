@@ -19,6 +19,7 @@ their own licenses.
 | Package | Version tested | License |
 |---|---|---|
 | pytest | 9.1.1 | MIT |
+| Playwright | 1.64.1 | Apache-2.0 |
 | ruff | 0.17.3 | MIT |
 | pydub | 0.25.1 | MIT |
 | audioop-lts | 0.2.2 | PSF-2.0 |

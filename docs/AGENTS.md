@@ -55,6 +55,9 @@
   node --check static\sw.js
   ```
 
+- Browser/UI tests use Playwright and skip when no Chromium-based browser is
+  available. Install one with `.\venv\Scripts\python -m playwright install chromium`
+  if Edge or Chrome is not present.
 - Do not modify the lyric timing pipeline during app/UI work.
 
 ## Repository hygiene

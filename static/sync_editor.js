@@ -256,9 +256,15 @@ function undo() {
 /* ---------- marking ---------- */
 function markDirty() { state.dirty = true; updateHeader(); }
 
-function confirmDiscard() {
+async function confirmDiscard() {
   if (!state.dirty) return true;
-  return window.confirm('Discard unsaved changes?');
+  return karaokeConfirm({
+    title: 'Discard unsaved changes?',
+    message: 'Your edits since the last save will be lost.',
+    confirmLabel: 'Discard changes',
+    tone: 'danger',
+    focus: 'cancel'
+  });
 }
 
 function deepClone(obj) { return JSON.parse(JSON.stringify(obj)); }
@@ -482,8 +488,15 @@ function renderCueList() {
       makeButton('Lead-in', 'Play from 1s before this cue to hear the hand-off', () => { seekTo(Math.max(0, cue.start - 1), true); }, ''),
     );
     if (state.wordsLoaded && cue.words.length) {
-      actions.append(makeButton('Unlock', 'Remove word timings from this cue so its text can be edited. The cue becomes line-level only.', () => {
-        if (!window.confirm('Remove word timings from this cue? It will display line-level only after saving.')) return;
+      actions.append(makeButton('Unlock', 'Remove word timings from this cue so its text can be edited. The cue becomes line-level only.', async () => {
+        const confirmed = await karaokeConfirm({
+          title: 'Remove word timings?',
+          message: 'This cue will display line-level only after you save.',
+          confirmLabel: 'Remove timings',
+          tone: 'danger',
+          focus: 'cancel'
+        });
+        if (!confirmed) return;
         pushHistory();
         state.cues[index].words = [];
         markDirty();
@@ -530,9 +543,16 @@ function renderCueList() {
   });
 }
 
-function deleteCue(index) {
+async function deleteCue(index) {
   if (index < 0 || index >= state.cues.length) return;
-  if (!window.confirm(`Delete cue ${index + 1}? You can undo.`)) return;
+  const confirmed = await karaokeConfirm({
+    title: `Delete cue ${index + 1}?`,
+    message: 'You can undo this change.',
+    confirmLabel: 'Delete cue',
+    tone: 'danger',
+    focus: 'cancel'
+  });
+  if (!confirmed) return;
   pushHistory();
   state.cues.splice(index, 1);
   state.selectedIndex = -1;
@@ -566,9 +586,16 @@ function addCue(instrumental) {
   setStatus(`Added cue ${insertAt + 1}.`, 'ok');
 }
 
-function clearCues() {
+async function clearCues() {
   if (!state.cues.length) return;
-  if (!window.confirm('Clear all cues? You can undo.')) return;
+  const confirmed = await karaokeConfirm({
+    title: 'Clear all cues?',
+    message: 'Every cue will be removed. You can undo this change.',
+    confirmLabel: 'Clear cues',
+    tone: 'danger',
+    focus: 'cancel'
+  });
+  if (!confirmed) return;
   pushHistory();
   state.cues = [];
   state.selectedIndex = -1;
@@ -577,9 +604,16 @@ function clearCues() {
   setStatus('Cleared all cues.', 'muted');
 }
 
-function dropWordTimings() {
+async function dropWordTimings() {
   if (!state.wordsLoaded) return;
-  if (!window.confirm('Drop all word timings? The SRT will remain and the player will fall back to line-level display after you save.')) return;
+  const confirmed = await karaokeConfirm({
+    title: 'Drop all word timings?',
+    message: 'The SRT stays, but the player will fall back to line-level display after you save.',
+    confirmLabel: 'Drop timings',
+    tone: 'danger',
+    focus: 'cancel'
+  });
+  if (!confirmed) return;
   pushHistory();
   for (const cue of state.cues) cue.words = [];
   state.wordsLoaded = false;
@@ -944,7 +978,7 @@ async function loadSongOptions(selectedFilename) {
   }
 }
 async function loadSong(song) {
-  if (!song || !confirmDiscard()) return;
+  if (!song || !(await confirmDiscard())) return;
   const token = ++state.loadToken;
   state.song = song;
   state.loadedStem = null;
@@ -1016,9 +1050,10 @@ function matchSongByStem(stem) {
   return state.songs.find(song => fileStem(song.filename) === stem) || null;
 }
 
-function importSrtFile(file) {
-  if (!confirmDiscard()) return;
-  file.text().then(text => {
+async function importSrtFile(file) {
+  if (!(await confirmDiscard())) return;
+  try {
+    const text = await file.text();
     const cues = parseSRT(text);
     if (!cues.length) { setStatus('No cues found in that .srt file.', 'error'); return; }
     state.cues = cues.map(cloneCue);
@@ -1041,12 +1076,15 @@ function importSrtFile(file) {
       updateHeader();
       setStatus(`Imported ${cues.length} cues. No catalog song matched that filename; pick a destination before saving.`, 'warn');
     }
-  }).catch(err => setStatus(`Could not read ${file.name}: ${err.message || err}`, 'error'));
+  } catch (err) {
+    setStatus(`Could not read ${file.name}: ${err.message || err}`, 'error');
+  }
 }
 
-function importWordsFile(file) {
-  if (!confirmDiscard()) return;
-  file.text().then(text => {
+async function importWordsFile(file) {
+  if (!(await confirmDiscard())) return;
+  try {
+    const text = await file.text();
     let parsedJson;
     try { parsedJson = JSON.parse(text); } catch (e) { setStatus(`That file is not valid JSON: ${e.message}`, 'error'); return; }
     const result = parseWordsData(parsedJson);
@@ -1073,7 +1111,9 @@ function importWordsFile(file) {
       updateHeader();
       setStatus(`Imported ${result.cues.length} cues with word timings. No catalog song matched; pick a destination before saving.`, 'warn');
     }
-  }).catch(err => setStatus(`Could not read ${file.name}: ${err.message || err}`, 'error'));
+  } catch (err) {
+    setStatus(`Could not read ${file.name}: ${err.message || err}`, 'error');
+  }
 }
 
 /* ---------- save ---------- */
@@ -1085,10 +1125,24 @@ async function saveLyrics() {
 
   const selectedStem = fileStem(state.song.filename);
   if (state.loadedStem && selectedStem !== state.loadedStem) {
-    if (!window.confirm(`These lyrics were loaded for "${state.loadedStem}", but you are about to save them to "${selectedStem}". Continue?`)) return;
+    const confirmed = await karaokeConfirm({
+      title: 'Save to a different song?',
+      message: `These lyrics were loaded for "${state.loadedStem}", but you are about to save them to "${selectedStem}".`,
+      confirmLabel: 'Save here',
+      tone: 'danger',
+      focus: 'cancel'
+    });
+    if (!confirmed) return;
   }
   if (!state.wordsLoaded && state.song.words) {
-    if (!window.confirm('This song currently has word timings, but none are loaded in the editor. Saving will remove those word timings. Continue?')) return;
+    const confirmed = await karaokeConfirm({
+      title: 'Remove word timings?',
+      message: 'This song currently has word timings, but none are loaded in the editor. Saving will remove them.',
+      confirmLabel: 'Save without words',
+      tone: 'danger',
+      focus: 'cancel'
+    });
+    if (!confirmed) return;
   }
 
   const savedSnapshot = JSON.stringify({ cues: state.cues, wordsLoaded: state.wordsLoaded });

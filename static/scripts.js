@@ -1829,10 +1829,26 @@ audioPlayer.addEventListener("error", () => {
 });
 
 if (queueClearButton) {
-  queueClearButton.addEventListener("click", () => {
-    if (!queue.length) return;
-    if (!confirm(`Remove all ${queue.length} queued songs?`)) return;
-    sendControl("clear").catch(err => showHostNotice(err.message));
+  queueClearButton.addEventListener("click", async () => {
+    if (!queue.length || queueClearButton.disabled) return;
+    const count = queue.length;
+    const confirmed = await karaokeConfirm({
+      title: "Clear the queue?",
+      message: `Remove ${count} queued ${pluralize(count, "song")} from Up next. The current song will keep playing.`,
+      confirmLabel: "Clear queue",
+      tone: "danger",
+      focus: "cancel"
+    });
+    if (!confirmed) return;
+
+    queueClearButton.disabled = true;
+    try {
+      await sendControl("clear");
+    } catch (err) {
+      showHostNotice(err.message);
+    } finally {
+      updateConnectionDependentControls();
+    }
   });
 }
 
