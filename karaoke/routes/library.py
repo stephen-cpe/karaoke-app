@@ -1,6 +1,7 @@
 """Catalog, lyric-saving, and transposition API routes."""
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import tempfile
@@ -11,8 +12,14 @@ from karaoke.catalog import enrich_song, find_song, scan_songs
 from karaoke.http import editor_access_allowed, json_body
 from karaoke.logging import logger
 from karaoke.lyrics import (
+    ActiveLyricsConflictError,
+    DraftConflictError,
+    DraftNotFoundError,
     LyricsConflictError,
+    publish_draft,
+    read_draft,
     read_lyrics_bundle,
+    save_draft,
     save_lyrics,
     serialize_word_timings,
     validate_word_timings,
@@ -157,6 +164,156 @@ def api_editor_lyrics():
         return jsonify({"error": "Could not read lyrics."}), 500
 
     return jsonify({"song_id": song_id, **bundle})
+
+
+def _words_object(raw: str | None) -> tuple[dict | None, str | None]:
+    if raw is None:
+        return None, None
+    try:
+        data = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return None, "The active word-timing file is not valid JSON."
+    if not isinstance(data, dict):
+        return None, "The active word-timing file must contain a JSON object."
+    return data, None
+
+
+@library.get("/api/editor/draft")
+def api_editor_draft():
+    if not editor_access_allowed():
+        return jsonify({"error": "Sync Editor is unavailable."}), 404
+
+    song_id = request.args.get("song_id")
+    if not isinstance(song_id, str) or not song_id:
+        return jsonify({"error": "song_id is required"}), 400
+    if find_song(current_app.config["SONGS_DIR"], song_id) is None:
+        return jsonify({"error": "Song not found"}), 404
+
+    try:
+        active = read_lyrics_bundle(
+            current_app.config["LYRICS_DIR"], song_id)
+        draft = read_draft(current_app.config["LYRICS_DIR"], song_id)
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
+        logger.error("Could not read lyrics draft for %s: %s", song_id, exc)
+        return jsonify({"error": "Could not read lyrics."}), 500
+
+    if draft is not None:
+        return jsonify({
+            "song_id": song_id,
+            "srt": draft["srt"],
+            "words": draft["words"],
+            "source": "draft",
+            "draft_revision": draft["revision"],
+            "base_active_revision": draft["base_active_revision"],
+            "active_revision": active["revision"],
+            "words_error": None,
+        })
+
+    active_words, words_error = _words_object(active["words"])
+    if active_words is not None or active["srt"] is not None:
+        source = "active"
+    else:
+        source = "none"
+    return jsonify({
+        "song_id": song_id,
+        "srt": active["srt"],
+        "words": active_words,
+        "source": source,
+        "draft_revision": None,
+        "base_active_revision": active["revision"],
+        "active_revision": active["revision"],
+        "words_error": words_error,
+    })
+
+
+@library.post("/api/editor/draft")
+def api_editor_draft_save():
+    if not editor_access_allowed():
+        return jsonify({"error": "Sync Editor is unavailable."}), 404
+
+    data = json_body()
+    song_id = data.get("song_id")
+    srt_text = data.get("srt")
+    words = data.get("words", None)
+    base_draft_revision = data.get("base_draft_revision")
+    base_active_revision = data.get("base_active_revision")
+
+    if not isinstance(song_id, str) or not song_id:
+        return jsonify({"error": "song_id is required"}), 400
+    if base_draft_revision is not None and not isinstance(
+            base_draft_revision, str):
+        return jsonify({"error": "base_draft_revision must be a string"}), 400
+    if not isinstance(base_active_revision, str) or not base_active_revision:
+        return jsonify({"error": "base_active_revision is required"}), 400
+    if find_song(current_app.config["SONGS_DIR"], song_id) is None:
+        return jsonify({"error": "Song not found"}), 404
+
+    try:
+        result = save_draft(
+            current_app.config["LYRICS_DIR"], song_id, srt_text, words,
+            base_draft_revision, base_active_revision)
+    except DraftConflictError as exc:
+        logger.warning("Draft conflict for %s; current revision %s",
+                       song_id, exc.revision)
+        return jsonify({
+            "error": "The saved draft changed. Reload it before saving.",
+            "draft_revision": exc.revision,
+        }), 409
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except (OSError, UnicodeEncodeError) as exc:
+        logger.error("Could not save draft for %s: %s", song_id, exc)
+        return jsonify({"error": "Could not save the draft."}), 500
+
+    logger.info("Saved draft for %s (%s)", song_id,
+                result["draft_revision"])
+    return jsonify(result)
+
+
+@library.post("/api/editor/approve")
+def api_editor_approve():
+    if not editor_access_allowed():
+        return jsonify({"error": "Sync Editor is unavailable."}), 404
+
+    data = json_body()
+    song_id = data.get("song_id")
+    draft_revision = data.get("draft_revision")
+    base_active_revision = data.get("base_active_revision")
+
+    if not isinstance(song_id, str) or not song_id:
+        return jsonify({"error": "song_id is required"}), 400
+    if not isinstance(draft_revision, str) or not draft_revision:
+        return jsonify({"error": "draft_revision is required"}), 400
+    if not isinstance(base_active_revision, str) or not base_active_revision:
+        return jsonify({"error": "base_active_revision is required"}), 400
+    if find_song(current_app.config["SONGS_DIR"], song_id) is None:
+        return jsonify({"error": "Song not found"}), 404
+
+    try:
+        result = publish_draft(
+            current_app.config["LYRICS_DIR"], song_id, draft_revision,
+            base_active_revision)
+    except DraftNotFoundError:
+        return jsonify({"error": "No saved draft to approve."}), 404
+    except DraftConflictError as exc:
+        return jsonify({
+            "error": "The saved draft changed. Reload it before approving.",
+            "draft_revision": exc.revision,
+        }), 409
+    except ActiveLyricsConflictError as exc:
+        return jsonify({
+            "error": ("Active lyrics changed since this draft was based on "
+                      "them. Reload before approving."),
+            "active_revision": exc.revision,
+        }), 409
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except (OSError, UnicodeEncodeError) as exc:
+        logger.error("Could not publish draft for %s: %s", song_id, exc)
+        return jsonify({"error": "Could not publish the draft."}), 500
+
+    logger.info("Published lyrics for %s -> %s", song_id, result["saved"])
+    return jsonify(result)
 
 
 @library.post("/api/save-lyrics")

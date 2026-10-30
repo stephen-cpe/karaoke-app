@@ -69,6 +69,10 @@ def serve_song(filename: str):
 
 @pages.get("/lyrics/<path:filename>")
 def serve_lyrics(filename: str):
+    # Active lyrics live directly under lyrics/. Drafts and other nested
+    # files must never be reachable through the player-facing media route.
+    if "/" in filename or "\\" in filename:
+        abort(404)
     return _serve_media(current_app.config["LYRICS_DIR"], filename, LYRICS_EXTENSIONS)
 
 

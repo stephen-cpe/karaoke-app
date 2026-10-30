@@ -38,7 +38,8 @@
 - `songs/` — instrumentals derived from the matching original; same filename
   stem and performance. `normalize_audio.py` and `transpose.py` are the tracked
   helper scripts.
-- `lyrics/` — generated `.srt` files plus `.words.json` word-timing sidecars.
+- `lyrics/` — generated active `.srt` files plus `.words.json` word-timing sidecars.
+  `lyrics/drafts/` holds ignored editor drafts and is never served to the player.
 - `tools/generate_lyrics.py` — Demucs + Whisper + LRCLIB timing pipeline.
 - `tools/check_lyrics.py` — structural and vocal-energy validator.
 
@@ -48,9 +49,16 @@
   `/remote` force either role. Only the host player page may output audio for the
   shared session; the Sync Editor can preview audio for timing work when enabled.
 - The Sync Editor is experimental and disabled by default. Enable it with
-  `--enable-editor` or `KARAOKE_EDITOR=1`; the page, save API, and editor load API
-  return 404 for LAN clients or when disabled, and the host-page link is hidden.
-  Do not use `--dev` as the editor gate.
+  `--enable-editor` or `KARAOKE_EDITOR=1`; the page, draft/approve APIs, and active
+  lyric APIs return 404 for LAN clients or when disabled, and the host-page link is
+  hidden. Do not use `--dev` as the editor gate.
+- Editor drafts live under `lyrics/drafts/<stem>.draft.json`, are ignored by the
+  player and media route, and autosave locally. Only an explicit approval publishes
+  the validated draft to the active `lyrics/<stem>.srt` and `.words.json` files; the
+  draft is removed after a successful publish. Draft and active revisions are checked
+  separately, and failed publishes restore the previous active bytes. If active lyrics
+  changed after the draft base, approval is rejected and the draft remains; there is
+  no automatic rebase.
 - The server owns the queue and playback state. Phones call `/api/control`;
   state reaches browsers through `/api/events` (SSE) with polling fallback.
 - Only one host is active. A second player takes over and the old host receives
@@ -81,7 +89,8 @@
 - Never commit audio, video, `.srt`, or `.words.json` files. They are copyrighted
   media, not project source, and `.gitignore` excludes them.
 - `tools/.cache/`, `karaoke.log*`, `venv/`, and local editor settings are ignored.
-  Do not force-add them.
+  Do not force-add them. Editor drafts under `lyrics/drafts/` are ignored too and
+  must never be served as active lyrics.
 - The public tree keeps `songs/`, `original_songs/`, `lyrics/`, and `transposed/`
   as `.gitkeep` placeholders. Only the helper scripts in `songs/` and the
   `.gitkeep` placeholders are tracked.

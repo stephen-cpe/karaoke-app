@@ -4,14 +4,19 @@ const state = {
   songs: [],
   song: null,          // selected save destination
   loadedStem: null,    // stem the cues came from (for mismatch warnings)
-  baseRevision: null,  // server revision the cues were loaded from
-  baseRevisionSong: null,
+  source: "none",      // "none", "active", "draft", or "import"
+  draftRevision: null, // saved draft revision (null when no draft)
+  baseActiveRevision: null, // active revision the draft was based on
+  activeRevision: null,     // current active revision from the last load/save
+  revisionSong: null,
   duration: 0,
   wordsLoaded: false,
   wordsMeta: null,
   dirty: false,
   selectedIndex: -1,
+  selectedWordIndex: -1,
   history: [],
+  redo: [],
   audioReady: false,
   audioToken: 0,
   loadToken: 0,
@@ -24,9 +29,15 @@ const state = {
   previewEls: [],
   rowEls: [],
   saving: false,
+  loopActive: false,
+  loopStart: 0,
+  loopEnd: 0,
+  zoomPx: 0,
 };
 
 let wavesurfer = null;
+const AUTOSAVE_MS = 30000;
+let autosaveTimer = null;
 
 /* ---------- dom helpers ---------- */
 const $ = id => document.getElementById(id);
@@ -35,9 +46,11 @@ const cueCount = $('cueCount');
 const wordCount = $('wordCount');
 const songSelect = $('songSelect');
 const saveBtn = $('saveBtn');
+const approveBtn = $('approveBtn');
 const saveStatus = $('saveStatus');
 const validationEl = $('validation');
 const cuesEl = $('cues');
+const wordInspector = $('wordInspector');
 const subtitlePreview = $('subtitlePreview');
 const cueOverlay = $('cueOverlay');
 const playPauseBtn = $('playPauseBtn');
@@ -46,6 +59,12 @@ const audioStatus = $('audioStatus');
 const srtOutput = $('srtOutput');
 const toggleWordModeBtn = $('toggleWordModeBtn');
 const undoBtn = $('undoBtn');
+const redoBtn = $('redoBtn');
+const zoomOutBtn = $('zoomOutBtn');
+const zoomFitBtn = $('zoomFitBtn');
+const zoomInBtn = $('zoomInBtn');
+const loopCueBtn = $('loopCueBtn');
+const rateSelect = $('rateSelect');
 
 /* ---------- utilities ---------- */
 function pad2(value) { return String(value).padStart(2, '0'); }
@@ -53,6 +72,7 @@ function pad3(value) { return String(value).padStart(3, '0'); }
 function fileStem(filename) { return String(filename).replace(/\.[^.]+$/, ''); }
 function lyricsStem(filename) { return String(filename).replace(/\.words\.json$/i, '').replace(/\.[^.]+$/, ''); }
 function roundTime(value) { return Math.round(Number(value) * 1000) / 1000; }
+function clamp(value, min, max) { return Math.max(min, Math.min(max, value)); }
 function normalizeText(text) { return String(text ?? '').replace(/\s+/g, ' ').trim(); }
 function cloneCue(cue) { return { start: cue.start, end: cue.end, text: cue.text, instrumental: cue.instrumental, words: cue.words.map(w => ({ text: w.text, start: w.start, end: w.end })) }; }
 
@@ -208,7 +228,7 @@ function validateCues() {
       if (cue.words.length) errors.push(`${label}: instrumental cue has word timings`);
     } else {
       if (!normalizeText(cue.text)) errors.push(`${label}: text is empty`);
-      if (state.wordsLoaded && !cue.words.length) warnings.push(`${label}: no word timings; will display line-level only`);
+      if ((state.wordsLoaded || hasWordCues()) && !cue.words.length) warnings.push(`${label}: no word timings; will display line-level only`);
       if (cue.words.length) {
         const joined = normalizeText(cue.words.map(w => w.text).join(' '));
         if (joined !== normalizeText(cue.text)) errors.push(`${label}: text does not match its word timings`);
@@ -235,9 +255,17 @@ function validateCues() {
 
 
 /* ---------- history ---------- */
+function historySnapshot() {
+  return JSON.stringify({
+    cues: state.cues,
+    wordsLoaded: state.wordsLoaded,
+    wordsMeta: state.wordsMeta,
+  });
+}
 function pushHistory() {
-  state.history.push(JSON.stringify({ cues: state.cues, wordsLoaded: state.wordsLoaded, wordsMeta: state.wordsMeta }));
+  state.history.push(historySnapshot());
   if (state.history.length > 50) state.history.shift();
+  state.redo = [];
   updateUndoButton();
 }
 function restoreHistorySnapshot(snapshotText) {
@@ -248,15 +276,46 @@ function restoreHistorySnapshot(snapshotText) {
 }
 function undo() {
   if (!state.history.length) return;
+  state.redo.push(historySnapshot());
   restoreHistorySnapshot(state.history.pop());
   state.dirty = true;
+  state.selectedWordIndex = -1;
   state.selectedIndex = Math.min(state.selectedIndex, state.cues.length - 1);
   renderAll();
+  scheduleAutosave();
   setStatus('Undid the last change.', 'muted');
 }
+function redo() {
+  if (!state.redo.length) return;
+  state.history.push(historySnapshot());
+  restoreHistorySnapshot(state.redo.pop());
+  state.dirty = true;
+  state.selectedWordIndex = -1;
+  state.selectedIndex = Math.min(state.selectedIndex, state.cues.length - 1);
+  renderAll();
+  scheduleAutosave();
+  setStatus('Redid the last change.', 'muted');
+}
 
-/* ---------- marking ---------- */
-function markDirty() { state.dirty = true; updateHeader(); }
+/* ---------- marking / autosave ---------- */
+function cancelAutosave() {
+  clearTimeout(autosaveTimer);
+  autosaveTimer = null;
+}
+function scheduleAutosave() {
+  cancelAutosave();
+  if (!state.dirty || state.saving || !state.song || !state.cues.length) return;
+  if (state.revisionSong !== state.song.filename) return;
+  autosaveTimer = setTimeout(() => {
+    autosaveTimer = null;
+    if (state.dirty && !state.saving) saveDraft({ autosave: true });
+  }, AUTOSAVE_MS);
+}
+function markDirty() {
+  state.dirty = true;
+  updateHeader();
+  scheduleAutosave();
+}
 
 async function confirmDiscard() {
   if (!state.dirty) return true;
@@ -357,12 +416,157 @@ function applyShift(delta) {
   setStatus(`Shifted every cue by ${formatDelta(applied)}.`, 'ok');
 }
 
+/* ---------- words ---------- */
+function hasWordCues() {
+  return state.cues.some(cue => cue.words.length > 0);
+}
+function selectedWordEntry() {
+  const cue = state.cues[state.selectedIndex];
+  if (!cue || cue.instrumental || !cue.words.length) return null;
+  const index = state.selectedWordIndex;
+  if (index < 0 || index >= cue.words.length) return null;
+  return { cue, index, word: cue.words[index] };
+}
+function updateWordInspector() {
+  if (!wordInspector) return;
+  wordInspector.replaceChildren();
+  const entry = selectedWordEntry();
+  if (!entry) {
+    const note = document.createElement('span');
+    note.className = 'muted-note';
+    const cue = state.cues[state.selectedIndex];
+    if (cue && !cue.instrumental && !cue.words.length) {
+      note.textContent = 'This cue is line-level; other cues keep their word timings.';
+    } else {
+      note.textContent = 'Select a word chip to edit its timing.';
+    }
+    wordInspector.appendChild(note);
+    return;
+  }
+  const title = document.createElement('strong');
+  title.textContent = `Word “${entry.word.text}”`;
+  const times = document.createElement('span');
+  times.className = 'word-inspector-times';
+  times.textContent = `${formatClock(entry.word.start)} → ${formatClock(entry.word.end)}`;
+  const buttons = document.createElement('span');
+  buttons.className = 'word-inspector-actions';
+  function addButton(label, titleText, handler) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'btn btn-sm btn-outline-secondary';
+    button.textContent = label;
+    button.title = titleText;
+    button.addEventListener('click', handler);
+    buttons.appendChild(button);
+  }
+  addButton('\u22120.1', 'Nudge this word earlier by 0.1s',
+    () => nudgeSelectedWord(-0.1));
+  addButton('+0.1', 'Nudge this word later by 0.1s',
+    () => nudgeSelectedWord(0.1));
+  addButton('\u22120.05', 'Nudge this word earlier by 0.05s',
+    () => nudgeSelectedWord(-0.05));
+  addButton('+0.05', 'Nudge this word later by 0.05s',
+    () => nudgeSelectedWord(0.05));
+  addButton('Start', 'Set this word start at the playhead',
+    () => setSelectedWordBoundary('start'));
+  addButton('End', 'Set this word end at the playhead',
+    () => setSelectedWordBoundary('end'));
+  wordInspector.append(title, times, buttons);
+}
+function selectWord(cueIndex, wordIndex) {
+  const cue = state.cues[cueIndex];
+  if (!cue || !cue.words[wordIndex]) return;
+  state.selectedIndex = cueIndex;
+  state.selectedWordIndex = wordIndex;
+  state.rowEls.forEach((row, index) => {
+    row.row.classList.toggle('selected', index === cueIndex);
+    row.wordsEl.querySelectorAll('.word-chip').forEach((chip, chipIndex) => {
+      chip.classList.toggle(
+        'selected', index === cueIndex && chipIndex === wordIndex);
+    });
+  });
+  state.previewEls.forEach((entry, index) => {
+    entry.line.classList.toggle('selected', index === cueIndex);
+  });
+  if (state.loopActive) {
+    state.loopStart = cue.start;
+    state.loopEnd = cue.end;
+  }
+  renderMarkersActive();
+  updateWordInspector();
+}
+function nudgeSelectedWord(delta) {
+  const entry = selectedWordEntry();
+  if (!entry) return;
+  const { cue, index, word } = entry;
+  const previousEnd = index > 0 ? cue.words[index - 1].end : cue.start;
+  const nextStart = index < cue.words.length - 1
+    ? cue.words[index + 1].start : cue.end;
+  const applied = clamp(
+    delta, previousEnd - word.start, nextStart - word.end);
+  if (Math.abs(applied) < 0.0005) {
+    setStatus('No room to nudge that word in this direction.', 'warn');
+    return;
+  }
+  pushHistory();
+  word.start = roundTime(word.start + applied);
+  word.end = roundTime(word.end + applied);
+  markDirty();
+  refreshTiming();
+  setStatus(`Word “${word.text}” nudged ${formatDelta(applied)}.`, 'muted');
+}
+function setSelectedWordBoundary(kind) {
+  if (!requireAudio('Load audio first to set a word boundary.')) return;
+  const entry = selectedWordEntry();
+  if (!entry) return;
+  const { cue, index, word } = entry;
+  const target = roundTime(wavesurfer.getCurrentTime());
+  const previousEnd = index > 0 ? cue.words[index - 1].end : cue.start;
+  const nextStart = index < cue.words.length - 1
+    ? cue.words[index + 1].start : cue.end;
+  if (kind === 'start') {
+    if (target < previousEnd - 0.001 || target >= word.end - 0.12) {
+      setStatus(`Word start must be between ${formatClock(previousEnd)} and ${formatClock(word.end - 0.12)}.`, 'error');
+      return;
+    }
+    pushHistory();
+    word.start = target;
+  } else {
+    if (target <= word.start + 0.12 || target > nextStart + 0.001) {
+      setStatus(`Word end must be between ${formatClock(word.start + 0.12)} and ${formatClock(nextStart)}.`, 'error');
+      return;
+    }
+    pushHistory();
+    word.end = target;
+  }
+  markDirty();
+  refreshTiming();
+  setStatus(`Word “${word.text}” ${kind} set to ${formatClock(target)}.`, 'muted');
+}
+
 /* ---------- rows ---------- */
 function selectCue(index) {
   state.selectedIndex = (index >= 0 && index < state.cues.length) ? index : -1;
-  state.rowEls.forEach((row, i) => row.row.classList.toggle('selected', i === state.selectedIndex));
+  state.selectedWordIndex = -1;
+  state.rowEls.forEach((row, i) => {
+    row.row.classList.toggle('selected', i === state.selectedIndex);
+    row.wordsEl.querySelectorAll('.word-chip.selected').forEach(chip => {
+      chip.classList.remove('selected');
+    });
+  });
   state.previewEls.forEach((entry, i) => entry.line.classList.toggle('selected', i === state.selectedIndex));
   renderMarkersActive();
+  if (state.loopActive) {
+    const cue = state.cues[state.selectedIndex];
+    if (cue) {
+      state.loopStart = cue.start;
+      state.loopEnd = cue.end;
+    } else {
+      state.loopActive = false;
+      updateLoopButton();
+    }
+  }
+  updateWordInspector();
 }
 
 function renderWordChips(container, cue, cueIndex) {
@@ -377,7 +581,8 @@ function renderWordChips(container, cue, cueIndex) {
   if (!cue.words.length) {
     const span = document.createElement('span');
     span.className = 'muted-note';
-    span.textContent = state.wordsLoaded ? 'Line-level only' : 'No word timings loaded';
+    span.textContent = (state.wordsLoaded || hasWordCues())
+      ? 'Line-level only' : 'No word timings loaded';
     container.appendChild(span);
     return;
   }
@@ -388,12 +593,14 @@ function renderWordChips(container, cue, cueIndex) {
   cue.words.forEach((word, wordIndex) => {
     const chip = document.createElement('button');
     chip.type = 'button';
-    chip.className = 'word-chip' + (valid ? '' : ' bad');
+    chip.className = 'word-chip' + (valid ? '' : ' bad')
+      + (state.selectedIndex === cueIndex
+        && state.selectedWordIndex === wordIndex ? ' selected' : '');
     chip.textContent = word.text || '?';
-    chip.title = `${word.text} · ${formatClock(word.start)} → ${formatClock(word.end)} (click to seek)`;
+    chip.title = `${word.text} · ${formatClock(word.start)} → ${formatClock(word.end)} (click to select and seek)`;
     chip.addEventListener('click', evt => {
       evt.stopPropagation();
-      selectCue(cueIndex);
+      selectWord(cueIndex, wordIndex);
       seekTo(word.start, false);
     });
     container.appendChild(chip);
@@ -449,11 +656,11 @@ function renderCueList() {
     textInput.type = 'text';
     textInput.className = 'cue-text';
     textInput.value = cue.instrumental ? '[Instrumental]' : cue.text;
-    textInput.disabled = cue.instrumental || (state.wordsLoaded && cue.words.length > 0);
+    textInput.disabled = cue.instrumental || cue.words.length > 0;
     if (textInput.disabled) {
       textInput.title = cue.instrumental
         ? 'Instrumental cue text cannot be edited'
-        : 'Text is locked while this cue has word timings. Click "Unlock text" to edit and switch the cue to line-level mode.';
+        : 'Text is locked while this cue has word timings. Use Unlock to convert only this cue to line-level.';
     }
 
     const durationEl = document.createElement('span');
@@ -488,22 +695,27 @@ function renderCueList() {
       makeButton('Start', 'Set this cue start to the current playhead position', () => { if (!state.audioReady || !wavesurfer) { setStatus('Load audio first to set a cue to the playhead.', 'warn'); return; } setCueStart(index, wavesurfer.getCurrentTime()); }, ''),
       makeButton('End', 'Set this cue end to the current playhead position', () => { if (!state.audioReady || !wavesurfer) { setStatus('Load audio first to set a cue to the playhead.', 'warn'); return; } setCueEnd(index, wavesurfer.getCurrentTime()); }, ''),
       makeButton('Lead-in', 'Play from 1s before this cue to hear the hand-off', () => { seekTo(Math.max(0, cue.start - 1), true); }, ''),
+      makeButton('Split', 'Split this cue at the playhead (word-timed cues split at a word boundary)', () => splitCue(index), ''),
     );
-    if (state.wordsLoaded && cue.words.length) {
-      actions.append(makeButton('Unlock', 'Remove word timings from this cue so its text can be edited. The cue becomes line-level only.', async () => {
+    if (index < state.cues.length - 1) {
+      actions.append(makeButton('Merge', 'Merge this cue with the next cue when their timing modes match', () => mergeCue(index), ''));
+    }
+    if (cue.words.length) {
+      actions.append(makeButton('Unlock', 'Remove word timings from only this cue so its text can be edited. Other cues keep their timings.', async () => {
         const confirmed = await karaokeConfirm({
-          title: 'Remove word timings?',
-          message: 'This cue will display line-level only after you save.',
-          confirmLabel: 'Remove timings',
+          title: 'Convert this cue to line-level?',
+          message: 'Only this cue will lose word timings. Other cues keep their word timings until saved.',
+          confirmLabel: 'Remove cue timings',
           tone: 'danger',
           focus: 'cancel'
         });
         if (!confirmed) return;
         pushHistory();
         state.cues[index].words = [];
+        state.selectedWordIndex = -1;
         markDirty();
         renderAll();
-        setStatus(`Cue ${index + 1}: word timings removed; text unlocked.`, 'warn');
+        setStatus(`Cue ${index + 1}: word timings removed; only this cue is line-level.`, 'warn');
       }, ''));
     }
     actions.append(makeButton('Delete', 'Delete this cue', () => deleteCue(index), 'danger'));
@@ -529,7 +741,13 @@ function renderCueList() {
     });
     endInput.addEventListener('blur', () => { if (state.cues[index]) endInput.value = formatTime(state.cues[index].end); });
     textInput.addEventListener('input', () => {
-      if (state.cues[index]) { state.cues[index].text = textInput.value; markDirty(); renderPreviewOnlyText(); }
+      if (state.cues[index]) {
+        state.cues[index].text = textInput.value;
+        markDirty();
+        renderPreviewOnlyText();
+        updateValidationView();
+        updateSaveButton();
+      }
     });
     textInput.addEventListener('change', () => {
       if (state.cues[index]) {
@@ -545,6 +763,121 @@ function renderCueList() {
   });
 }
 
+function splitCue(index) {
+  const cue = state.cues[index];
+  if (!cue) return;
+  if (!requireAudio('Load audio first to split a cue.')) return;
+  const at = roundTime(wavesurfer.getCurrentTime());
+  if (at <= cue.start + 0.12 || at >= cue.end - 0.12) {
+    setStatus('Move the playhead inside the cue before splitting.', 'warn');
+    return;
+  }
+  if (cue.instrumental) {
+    pushHistory();
+    state.cues.splice(index, 1,
+      makeCue({ start: cue.start, end: at, text: '[Instrumental]', instrumental: true, words: [] }),
+      makeCue({ start: at, end: cue.end, text: '[Instrumental]', instrumental: true, words: [] }));
+    state.selectedIndex = index;
+    state.selectedWordIndex = -1;
+    markDirty();
+    renderAll();
+    setStatus(`Split instrumental cue ${index + 1}.`, 'ok');
+    return;
+  }
+  if (!cue.words.length) {
+    setStatus('Split is available for word-timed or instrumental cues. Convert this cue to word timings first so its text can be divided safely.', 'warn');
+    return;
+  }
+  if (cue.words.length < 2) {
+    setStatus('A cue needs at least two timed words before it can be split safely.', 'warn');
+    return;
+  }
+  let splitIndex = 1;
+  let nearest = Infinity;
+  for (let i = 1; i < cue.words.length; i++) {
+    const distance = Math.abs(cue.words[i].start - at);
+    if (distance < nearest) {
+      nearest = distance;
+      splitIndex = i;
+    }
+  }
+  const boundary = roundTime(cue.words[splitIndex].start);
+  if (boundary <= cue.start + 0.12 || boundary >= cue.end - 0.12) {
+    setStatus('Could not find a safe word boundary for the split.', 'warn');
+    return;
+  }
+  const firstWords = cue.words.slice(0, splitIndex);
+  const secondWords = cue.words.slice(splitIndex);
+  const first = makeCue({
+    start: cue.start,
+    end: boundary,
+    text: firstWords.map(word => word.text).join(' '),
+    instrumental: false,
+    words: firstWords,
+  });
+  const second = makeCue({
+    start: boundary,
+    end: cue.end,
+    text: secondWords.map(word => word.text).join(' '),
+    instrumental: false,
+    words: secondWords,
+  });
+  pushHistory();
+  state.cues.splice(index, 1, first, second);
+  state.selectedIndex = index;
+  state.selectedWordIndex = -1;
+  markDirty();
+  renderAll();
+  setStatus(`Split cue ${index + 1} at a word boundary.`, 'ok');
+}
+
+function mergeCue(index) {
+  const cue = state.cues[index];
+  const next = state.cues[index + 1];
+  if (!cue || !next) {
+    setStatus('There is no following cue to merge.', 'warn');
+    return;
+  }
+  if (cue.instrumental || next.instrumental) {
+    if (!cue.instrumental || !next.instrumental) {
+      setStatus('Merge requires both cues to be instrumental or both to be lyric cues.', 'warn');
+      return;
+    }
+    pushHistory();
+    state.cues.splice(index, 2, makeCue({
+      start: cue.start, end: next.end, text: '[Instrumental]',
+      instrumental: true, words: [],
+    }));
+    state.selectedIndex = index;
+    state.selectedWordIndex = -1;
+    markDirty();
+    renderAll();
+    setStatus(`Merged instrumental cues ${index + 1} and ${index + 2}.`, 'ok');
+    return;
+  }
+  if (!!cue.words.length !== !!next.words.length) {
+    setStatus('Merge requires both cues to be line-level or both to have word timings.', 'warn');
+    return;
+  }
+  const words = cue.words.concat(next.words);
+  const text = cue.words.length
+    ? words.map(word => word.text).join(' ')
+    : `${cue.text} ${next.text}`.trim();
+  pushHistory();
+  state.cues.splice(index, 2, makeCue({
+    start: cue.start,
+    end: next.end,
+    text,
+    instrumental: false,
+    words,
+  }));
+  state.selectedIndex = index;
+  state.selectedWordIndex = -1;
+  markDirty();
+  renderAll();
+  setStatus(`Merged cues ${index + 1} and ${index + 2}.`, 'ok');
+}
+
 async function deleteCue(index) {
   if (index < 0 || index >= state.cues.length) return;
   const confirmed = await karaokeConfirm({
@@ -558,16 +891,13 @@ async function deleteCue(index) {
   pushHistory();
   state.cues.splice(index, 1);
   state.selectedIndex = -1;
+  state.selectedWordIndex = -1;
   markDirty();
   renderAll();
   setStatus(`Deleted cue ${index + 1}.`, 'muted');
 }
 
 function addCue(instrumental) {
-  if (state.wordsLoaded && !instrumental) {
-    setStatus('Drop the word timings first (button above) to add or edit lyric cues.', 'warn');
-    return;
-  }
   const start = state.audioReady && wavesurfer ? wavesurfer.getCurrentTime() : (state.cues.length ? state.cues[state.cues.length - 1].end + 0.5 : 0);
   let text = instrumental ? '[Instrumental]' : '';
   let hintEnd = start + 2;
@@ -581,11 +911,14 @@ function addCue(instrumental) {
   pushHistory();
   state.cues.splice(insertAt, 0, cue);
   state.selectedIndex = insertAt;
+  state.selectedWordIndex = -1;
   markDirty();
   renderAll();
   const row = state.rowEls[insertAt];
   if (row && !instrumental) row.textInput.focus();
-  setStatus(`Added cue ${insertAt + 1}.`, 'ok');
+  setStatus(instrumental
+    ? `Added instrumental cue ${insertAt + 1}.`
+    : `Added line-level cue ${insertAt + 1}; other word timings are preserved.`, 'ok');
 }
 
 async function clearCues() {
@@ -601,17 +934,18 @@ async function clearCues() {
   pushHistory();
   state.cues = [];
   state.selectedIndex = -1;
+  state.selectedWordIndex = -1;
   markDirty();
   renderAll();
   setStatus('Cleared all cues.', 'muted');
 }
 
 async function dropWordTimings() {
-  if (!state.wordsLoaded) return;
+  if (!state.wordsLoaded && !hasWordCues()) return;
   const confirmed = await karaokeConfirm({
     title: 'Drop all word timings?',
-    message: 'The SRT stays, but the player will fall back to line-level display after you save.',
-    confirmLabel: 'Drop timings',
+    message: 'The SRT stays, but the player will fall back to line-level display after you save. This affects every cue.',
+    confirmLabel: 'Drop all timings',
     tone: 'danger',
     focus: 'cancel'
   });
@@ -620,9 +954,10 @@ async function dropWordTimings() {
   for (const cue of state.cues) cue.words = [];
   state.wordsLoaded = false;
   state.wordsMeta = null;
+  state.selectedWordIndex = -1;
   markDirty();
   renderAll();
-  setStatus('Word timings dropped. Text is now editable.', 'warn');
+  setStatus('All word timings dropped. Text is now editable.', 'warn');
 }
 
 /* ---------- preview ---------- */
@@ -756,7 +1091,7 @@ function updateRowContents() {
     row.row.classList.toggle('instrumental', cue.instrumental);
     row.row.classList.toggle('selected', index === state.selectedIndex);
     row.row.classList.toggle('active', index === state.activeCueIndex);
-    row.textInput.disabled = cue.instrumental || (state.wordsLoaded && cue.words.length > 0);
+    row.textInput.disabled = cue.instrumental || cue.words.length > 0;
     if (cue.instrumental) row.textInput.value = '[Instrumental]';
     renderWordChips(row.wordsEl, cue, index);
   });
@@ -768,6 +1103,7 @@ function refreshTiming() {
   updateHighlight(currentTime());
   updateValidationView();
   updateCounts();
+  updateWordInspector();
   updateSaveButton();
 }
 function updateValidationView() {
@@ -783,7 +1119,9 @@ function updateValidationView() {
   if (!state.cues.length) {
     addLine('No cues loaded yet. Add a cue, import an .srt, or load a song.', 'muted');
   } else if (!errors.length) {
-    addLine(state.wordsLoaded ? 'Structure OK. Word timings will be saved.' : 'Structure OK. SRT-only mode.', 'ok');
+    addLine((state.wordsLoaded || hasWordCues())
+      ? 'Structure OK. Word timings will be saved.'
+      : 'Structure OK. SRT-only mode.', 'ok');
   } else {
     errors.slice(0, 5).forEach(err => addLine(err, 'error'));
     if (errors.length > 5) addLine(`… ${errors.length - 5} more errors`, 'error');
@@ -801,7 +1139,7 @@ function updateCounts() {
   const dlSrt = document.getElementById('downloadSrtBtn');
   const dlWords = document.getElementById('downloadWordsBtn');
   if (dlSrt) dlSrt.disabled = !state.cues.length;
-  if (dlWords) dlWords.disabled = !state.cues.length || !state.wordsLoaded;
+  if (dlWords) dlWords.disabled = !state.cues.length || !(state.wordsLoaded || hasWordCues());
 }
 function renderAll() {
   renderCueList();
@@ -812,6 +1150,7 @@ function renderAll() {
   updateHeader();
   updateSaveButton();
   updateUndoButton();
+  updateWordInspector();
   updateHighlight(currentTime());
 }
 
@@ -822,6 +1161,10 @@ function destroyWaveSurfer() {
     wavesurfer = null;
   }
   state.audioReady = false;
+  state.loopActive = false;
+  state.loopStart = 0;
+  state.loopEnd = 0;
+  updateLoopButton();
   if (state.localAudioUrl) {
     URL.revokeObjectURL(state.localAudioUrl);
     state.localAudioUrl = null;
@@ -853,6 +1196,12 @@ function loadAudio(url, label) {
     if (token !== state.audioToken) return;
     state.audioReady = true;
     state.duration = wavesurfer.getDuration();
+    if (rateSelect) {
+      try { wavesurfer.setPlaybackRate(Number(rateSelect.value) || 1); } catch {}
+    }
+    if (state.zoomPx) {
+      try { wavesurfer.zoom(state.zoomPx); } catch {}
+    }
     audioStatus.textContent = `Loaded ${label} (${formatClock(state.duration)})`;
     audioStatus.className = 'audio-status';
     timeEl.textContent = `00:00:00,000 / ${formatClock(state.duration)}`;
@@ -860,9 +1209,17 @@ function loadAudio(url, label) {
     updateHighlight(currentTime());
     updateValidationView();
     updateCounts();
+    updateLoopButton();
   });
   wavesurfer.on('timeupdate', time => {
     if (token !== state.audioToken) return;
+    if (state.loopActive && state.loopEnd > state.loopStart
+        && time >= state.loopEnd - 0.03) {
+      try { wavesurfer.setTime(state.loopStart); } catch { /* ignore */ }
+      const promise = wavesurfer.play();
+      if (promise && typeof promise.catch === 'function') promise.catch(() => {});
+      return;
+    }
     timeEl.textContent = `${formatClock(time)} / ${formatClock(state.duration || 0)}`;
     updateHighlight(time);
   });
@@ -873,7 +1230,14 @@ function loadAudio(url, label) {
   });
   wavesurfer.on('play', () => { playPauseBtn.textContent = 'Pause'; });
   wavesurfer.on('pause', () => { playPauseBtn.textContent = 'Play'; });
-  wavesurfer.on('finish', () => { playPauseBtn.textContent = 'Play'; });
+  wavesurfer.on('finish', () => {
+    playPauseBtn.textContent = 'Play';
+    if (state.loopActive && state.loopEnd > state.loopStart) {
+      try { wavesurfer.setTime(state.loopStart); } catch { /* ignore */ }
+      const promise = wavesurfer.play();
+      if (promise && typeof promise.catch === 'function') promise.catch(() => {});
+    }
+  });
   wavesurfer.load(url).catch(err => {
     if (token !== state.audioToken) return;
     state.audioReady = false;
@@ -903,6 +1267,53 @@ function seekTo(seconds, play = false) {
   }
 }
 
+function updateLoopButton() {
+  if (!loopCueBtn) return;
+  loopCueBtn.textContent = state.loopActive ? 'Stop loop' : 'Loop cue';
+  loopCueBtn.classList.toggle('is-active', state.loopActive);
+}
+function toggleCueLoop() {
+  if (state.loopActive) {
+    state.loopActive = false;
+    state.loopStart = 0;
+    state.loopEnd = 0;
+    updateLoopButton();
+    setStatus('Cue loop stopped.', 'muted');
+    return;
+  }
+  if (!requireAudio('Load audio first to loop a cue.')) return;
+  const cue = state.cues[state.selectedIndex];
+  if (!cue) {
+    setStatus('Select a cue to loop.', 'warn');
+    return;
+  }
+  if (cue.end <= cue.start + 0.05) {
+    setStatus('That cue has no usable duration to loop.', 'warn');
+    return;
+  }
+  state.loopStart = cue.start;
+  state.loopEnd = cue.end;
+  state.loopActive = true;
+  updateLoopButton();
+  seekTo(cue.start, true);
+  setStatus(`Looping cue ${state.selectedIndex + 1}.`, 'muted');
+}
+function changeZoom(direction) {
+  if (!requireAudio('Load audio first to zoom the waveform.')) return;
+  if (direction === 0) {
+    state.zoomPx = 0;
+  } else {
+    const current = state.zoomPx || 40;
+    state.zoomPx = Math.round(clamp(
+      direction > 0 ? current * 1.4 : current / 1.4, 10, 500));
+  }
+  try { wavesurfer.zoom(state.zoomPx); } catch { /* ignore */ }
+}
+function applyPlaybackRate() {
+  if (!rateSelect || !wavesurfer || !state.audioReady) return;
+  try { wavesurfer.setPlaybackRate(Number(rateSelect.value) || 1); } catch { /* ignore */ }
+}
+
 /* ---------- status ---------- */
 function setStatus(message, type = 'muted') {
   saveStatus.textContent = message;
@@ -913,29 +1324,49 @@ function updateHeader() {
   if (state.song) {
     badge = `${state.song.id ? state.song.id + ' — ' : ''}${state.song.title}`;
     if (state.song.artist) badge += ` (${state.song.artist})`;
-    if (state.cues.length) badge += state.wordsLoaded ? ' · words' : ' · SRT only';
+    if (state.cues.length) {
+      badge += (state.wordsLoaded || hasWordCues()) ? ' · words' : ' · SRT only';
+      if (state.source === 'draft') badge += ' · draft';
+      else if (state.source === 'active') badge += ' · active';
+      else if (state.source === 'import') badge += ' · imported';
+    }
   } else if (state.cues.length) {
     badge = `Imported cues${state.wordsLoaded ? ' (words)' : ' (SRT)'}`;
   }
   if (state.dirty) badge += ' · unsaved';
   loadBadge.textContent = badge;
-  loadBadge.className = state.dirty ? 'badge bg-warning text-dark' : 'badge badge-soft';
-  toggleWordModeBtn.classList.toggle('d-none', !state.wordsLoaded);
+  loadBadge.className = state.dirty
+    ? 'badge bg-warning text-dark'
+    : (state.source === 'draft' ? 'badge bg-info text-dark' : 'badge badge-soft');
+  toggleWordModeBtn.classList.toggle(
+    'd-none', !(state.wordsLoaded || hasWordCues()));
   updateSaveButton();
 }
 function updateSaveButton() {
-  saveBtn.disabled = state.saving || !state.song || !state.cues.length || state.validationErrors.length > 0;
+  const unavailable = state.saving || !state.song || !state.cues.length
+    || state.validationErrors.length > 0;
+  saveBtn.disabled = unavailable;
+  approveBtn.disabled = unavailable;
   if (state.validationErrors.length > 0) {
-    saveBtn.title = 'Fix the validation errors before saving.';
+    saveBtn.title = 'Fix the validation errors before saving or approving.';
+    approveBtn.title = 'Fix the validation errors before publishing.';
   } else if (!state.song) {
     saveBtn.title = 'Pick a song first.';
+    approveBtn.title = 'Pick a song first.';
   } else if (!state.cues.length) {
     saveBtn.title = 'Add at least one cue.';
+    approveBtn.title = 'Add at least one cue.';
   } else {
-    saveBtn.title = '';
+    saveBtn.title = 'Save a local draft. Active lyrics are unchanged.';
+    approveBtn.title = 'Publish the current draft to the active lyrics used by the player.';
   }
+  saveBtn.textContent = state.saving ? 'Saving…' : 'Save draft';
+  approveBtn.textContent = state.saving ? 'Working…' : 'Approve / publish';
 }
-function updateUndoButton() { undoBtn.disabled = !state.history.length; }
+function updateUndoButton() {
+  undoBtn.disabled = !state.history.length;
+  redoBtn.disabled = !state.redo.length;
+}
 
 /* ---------- song loading ---------- */
 async function loadSongOptions(selectedFilename) {
@@ -979,9 +1410,9 @@ async function loadSongOptions(selectedFilename) {
     setStatus(`Failed to load songs: ${err.message || err}`, 'error');
   }
 }
-async function fetchEditorLyrics(filename) {
+async function fetchEditorDraft(filename) {
   const response = await fetch(
-    `/api/editor/lyrics?song_id=${encodeURIComponent(filename)}`,
+    `/api/editor/draft?song_id=${encodeURIComponent(filename)}`,
     { cache: 'no-store' });
   const data = await response.json().catch(() => ({}));
   return { response, data };
@@ -990,15 +1421,22 @@ async function fetchEditorLyrics(filename) {
 async function loadSong(song) {
   if (!song || !(await confirmDiscard())) return;
   const token = ++state.loadToken;
+  cancelAutosave();
+  destroyWaveSurfer();
   state.song = song;
   state.loadedStem = null;
-  state.baseRevision = null;
-  state.baseRevisionSong = null;
+  state.source = 'none';
+  state.draftRevision = null;
+  state.baseActiveRevision = null;
+  state.activeRevision = null;
+  state.revisionSong = null;
   state.cues = [];
   state.wordsLoaded = false;
   state.wordsMeta = null;
   state.selectedIndex = -1;
+  state.selectedWordIndex = -1;
   state.history = [];
+  state.redo = [];
   state.dirty = false;
   state.duration = 0;
   state.activeCueIndex = -1;
@@ -1010,7 +1448,7 @@ async function loadSong(song) {
   const stem = fileStem(song.filename);
   let bundle;
   try {
-    bundle = await fetchEditorLyrics(song.filename);
+    bundle = await fetchEditorDraft(song.filename);
   } catch (err) {
     if (token !== state.loadToken) return;
     setStatus(`Could not load lyrics: ${err.message || err}`, 'error');
@@ -1025,21 +1463,32 @@ async function loadSong(song) {
   }
 
   const srtText = typeof bundle.data.srt === 'string' ? bundle.data.srt : null;
-  const hasWordsFile = typeof bundle.data.words === 'string' && bundle.data.words.length > 0;
-  let wordsJson = null;
-  if (hasWordsFile) {
-    try {
-      wordsJson = JSON.parse(bundle.data.words);
-    } catch {
-      wordsJson = null;
-    }
-  }
-  state.baseRevision = typeof bundle.data.revision === 'string'
-    ? bundle.data.revision : null;
-  state.baseRevisionSong = song.filename;
+  const wordsJson = (bundle.data.words && typeof bundle.data.words === 'object')
+    ? bundle.data.words : null;
+  const wordsError = typeof bundle.data.words_error === 'string'
+    ? bundle.data.words_error : null;
+  state.source = ['draft', 'active'].includes(bundle.data.source)
+    ? bundle.data.source : 'none';
+  state.draftRevision = typeof bundle.data.draft_revision === 'string'
+    ? bundle.data.draft_revision : null;
+  state.activeRevision = typeof bundle.data.active_revision === 'string'
+    ? bundle.data.active_revision : null;
+  state.baseActiveRevision = typeof bundle.data.base_active_revision === 'string'
+    ? bundle.data.base_active_revision : state.activeRevision;
+  state.revisionSong = song.filename;
 
   const srtCues = srtText ? parseSRT(srtText) : [];
   const parsedWords = wordsJson ? parseWordsData(wordsJson) : null;
+  let statusText = '';
+  if (state.source === 'draft') {
+    statusText = 'Loaded saved draft (not live until approved). ';
+    if (state.baseActiveRevision && state.activeRevision
+        && state.baseActiveRevision !== state.activeRevision) {
+      statusText = 'Loaded saved draft based on older active lyrics; approval will be blocked. ';
+    }
+  } else if (state.source === 'active') {
+    statusText = 'Loaded active lyrics. ';
+  }
 
   if (parsedWords && parsedWords.cues && parsedWords.cues.length) {
     state.cues = parsedWords.cues.map(cloneCue);
@@ -1047,28 +1496,28 @@ async function loadSong(song) {
     state.wordsLoaded = true;
     state.loadedStem = stem;
     if (parsedWords.warnings && parsedWords.warnings.length) {
-      setStatus(`Loaded word timings with ${parsedWords.warnings.length} warning(s): ${parsedWords.warnings[0]}`, 'warn');
+      setStatus(`${statusText}Word timings loaded with ${parsedWords.warnings.length} warning(s): ${parsedWords.warnings[0]}`, 'warn');
     } else if (srtCues.length && !cuesMatch(srtCues, state.cues)) {
-      setStatus('Loaded word timings. The .srt on disk differs, so saving will regenerate it from these cues.', 'warn');
+      setStatus(`${statusText}Word timings loaded. The .srt on disk differs and will be regenerated on save.`, 'warn');
     } else if (srtCues.length) {
-      setStatus('Loaded .srt + word timings.', 'ok');
+      setStatus(`${statusText}SRT + word timings.`, 'ok');
     } else {
-      setStatus('Loaded word timings; no matching .srt on disk.', 'ok');
+      setStatus(`${statusText}Word timings loaded; no matching .srt on disk.`, 'ok');
     }
   } else if (srtCues.length) {
     state.cues = srtCues.map(cloneCue);
     state.wordsLoaded = false;
     state.wordsMeta = null;
     state.loadedStem = stem;
-    if (hasWordsFile) {
-      setStatus('Loaded .srt only. The word timing file could not be used and will be replaced on save.', 'warn');
+    if (wordsError) {
+      setStatus(`${statusText}${wordsError} Using the SRT; saving will replace the invalid sidecar.`, 'warn');
     } else {
-      setStatus('Loaded .srt only (no word timings).', 'warn');
+      setStatus(`${statusText}SRT-only lyrics.`, 'ok');
     }
-  } else if (hasWordsFile) {
-    setStatus('The word timing file is invalid, so nothing was loaded.', 'error');
+  } else if (wordsError) {
+    setStatus(wordsError, 'error');
   } else {
-    setStatus('No lyrics found for this song yet. Add cues or import a file, then save.', 'warn');
+    setStatus(`${statusText || ''}No lyrics found for this song yet. Add cues or import a file, then save a draft.`, 'warn');
   }
   state.selectedIndex = state.cues.length ? 0 : -1;
   renderAll();
@@ -1082,6 +1531,7 @@ function matchSongByStem(stem) {
 
 async function importSrtFile(file) {
   if (!(await confirmDiscard())) return;
+  cancelAutosave();
   try {
     const text = await file.text();
     const cues = parseSRT(text);
@@ -1090,18 +1540,24 @@ async function importSrtFile(file) {
     state.wordsLoaded = false;
     state.wordsMeta = null;
     state.loadedStem = lyricsStem(file.name);
+    state.source = 'import';
+    state.draftRevision = null;
+    state.baseActiveRevision = null;
+    state.activeRevision = null;
+    state.revisionSong = null;
     state.selectedIndex = 0;
+    state.selectedWordIndex = -1;
     state.history = [];
-    state.baseRevision = null;
-    state.baseRevisionSong = null;
+    state.redo = [];
     state.dirty = true;
     renderAll();
+    scheduleAutosave();
     const song = matchSongByStem(lyricsStem(file.name));
     if (song) {
       songSelect.value = song.filename;
       state.song = song;
       updateHeader();
-      setStatus(`Imported ${cues.length} cues and matched them to ${song.title}. Pick "Audio only" if you want to hear this song.`, 'ok');
+      setStatus(`Imported ${cues.length} cues and matched them to ${song.title}. Save draft to keep them locally.`, 'ok');
     } else {
       state.song = null;
       songSelect.value = '';
@@ -1115,6 +1571,7 @@ async function importSrtFile(file) {
 
 async function importWordsFile(file) {
   if (!(await confirmDiscard())) return;
+  cancelAutosave();
   try {
     const text = await file.text();
     let parsedJson;
@@ -1126,14 +1583,20 @@ async function importWordsFile(file) {
     state.wordsMeta = result.meta ? deepClone(result.meta) : null;
     if (!state.wordsMeta) state.wordsMeta = { version: 1, song: '', duration: 0, generated_by: 'Imported Sync Editor' };
     state.loadedStem = lyricsStem(file.name);
+    state.source = 'import';
+    state.draftRevision = null;
+    state.baseActiveRevision = null;
+    state.activeRevision = null;
+    state.revisionSong = null;
     state.selectedIndex = 0;
+    state.selectedWordIndex = -1;
     state.history = [];
-    state.baseRevision = null;
-    state.baseRevisionSong = null;
+    state.redo = [];
     state.dirty = true;
     renderAll();
+    scheduleAutosave();
     if (result.warnings && result.warnings.length) setStatus(`Imported ${result.cues.length} cues with warnings: ${result.warnings[0]}`, 'warn');
-    else setStatus(`Imported ${result.cues.length} cues with word timings.`, 'ok');
+    else setStatus(`Imported ${result.cues.length} cues with word timings. Save draft to keep them locally.`, 'ok');
     const song = matchSongByStem(lyricsStem(file.name));
     if (song) {
       songSelect.value = song.filename;
@@ -1150,107 +1613,223 @@ async function importWordsFile(file) {
   }
 }
 
-/* ---------- save ---------- */
-async function saveLyrics() {
-  if (!state.song) { setStatus('Pick a destination song first.', 'error'); return; }
+async function ensureDraftRevisions({ autosave = false } = {}) {
+  if (!state.song) return false;
+  if (state.revisionSong === state.song.filename && state.baseActiveRevision) {
+    return true;
+  }
+  let info;
+  try {
+    info = await fetchEditorDraft(state.song.filename);
+  } catch (err) {
+    if (!autosave) setStatus(`Could not check the saved draft: ${err.message || err}`, 'error');
+    return false;
+  }
+  if (!info.response.ok) {
+    if (!autosave) setStatus(
+      info.data.error || `Could not check the saved draft (${info.response.status}).`,
+      'error');
+    return false;
+  }
+  const existingRevision = typeof info.data.draft_revision === 'string'
+    ? info.data.draft_revision : null;
+  const loadedRevision = state.revisionSong === state.song.filename
+    && state.draftRevision === existingRevision;
+  if (existingRevision && !loadedRevision) {
+    if (autosave) {
+      setStatus('Autosave skipped: a saved draft exists. Load the song to recover it.', 'warn');
+      return false;
+    }
+    const confirmed = await karaokeConfirm({
+      title: 'Replace saved draft?',
+      message: 'A saved draft already exists for this song. Continuing will replace it with the editor contents.',
+      confirmLabel: 'Replace draft',
+      tone: 'danger',
+      focus: 'cancel'
+    });
+    if (!confirmed) return false;
+  }
+  state.draftRevision = existingRevision;
+  state.baseActiveRevision = typeof info.data.base_active_revision === 'string'
+    ? info.data.base_active_revision : info.data.active_revision;
+  state.activeRevision = typeof info.data.active_revision === 'string'
+    ? info.data.active_revision : state.baseActiveRevision;
+  state.revisionSong = state.song.filename;
+  return !!state.baseActiveRevision;
+}
+
+/* ---------- draft save / approval ---------- */
+async function saveDraft({ autosave = false } = {}) {
+  if (!state.song) {
+    if (!autosave) setStatus('Pick a destination song first.', 'error');
+    return false;
+  }
+  if (!state.cues.length) {
+    if (!autosave) setStatus('Nothing to save yet.', 'error');
+    return false;
+  }
   const { errors } = validateCues();
-  if (errors.length) { setStatus(`Fix ${errors.length} validation error(s) before saving.`, 'error'); updateValidationView(); return; }
-  if (!state.cues.length) { setStatus('Nothing to save yet.', 'error'); return; }
-
-  const selectedStem = fileStem(state.song.filename);
-  if (state.loadedStem && selectedStem !== state.loadedStem) {
-    const confirmed = await karaokeConfirm({
-      title: 'Save to a different song?',
-      message: `These lyrics were loaded for "${state.loadedStem}", but you are about to save them to "${selectedStem}".`,
-      confirmLabel: 'Save here',
-      tone: 'danger',
-      focus: 'cancel'
-    });
-    if (!confirmed) return;
+  if (errors.length) {
+    if (!autosave) {
+      setStatus(`Fix ${errors.length} validation error(s) before saving.`, 'error');
+      updateValidationView();
+    }
+    return false;
   }
-  if (!state.wordsLoaded && state.song.words) {
-    const confirmed = await karaokeConfirm({
-      title: 'Remove word timings?',
-      message: 'This song currently has word timings, but none are loaded in the editor. Saving will remove them.',
-      confirmLabel: 'Save without words',
-      tone: 'danger',
-      focus: 'cancel'
-    });
-    if (!confirmed) return;
+  if (state.saving) {
+    if (!autosave) setStatus('A save or publish is already in progress.', 'warn');
+    return false;
   }
+  if (autosave && !state.dirty) return false;
+  cancelAutosave();
+  if (!(await ensureDraftRevisions({ autosave }))) return false;
 
-  let revision = state.baseRevision;
-  if (!revision || state.baseRevisionSong !== state.song.filename) {
-    let info;
-    try {
-      info = await fetchEditorLyrics(state.song.filename);
-    } catch (err) {
-      setStatus(`Could not check the current lyrics: ${err.message || err}`, 'error');
-      return;
-    }
-    if (!info.response.ok) {
-      setStatus(info.data.error || `Could not check the current lyrics (${info.response.status}).`, 'error');
-      return;
-    }
-    if (info.data.srt || info.data.words) {
-      const confirmed = await karaokeConfirm({
-        title: 'Replace existing lyrics?',
-        message: `"${selectedStem}" already has lyric files. Saving will replace them.`,
-        confirmLabel: 'Replace lyrics',
-        tone: 'danger',
-        focus: 'cancel'
-      });
-      if (!confirmed) return;
-    }
-    revision = typeof info.data.revision === 'string' ? info.data.revision : null;
-    if (!revision) {
-      setStatus('Could not obtain the current lyric revision.', 'error');
-      return;
-    }
-    state.baseRevision = revision;
-    state.baseRevisionSong = state.song.filename;
-  }
+  const snapshot = historySnapshot();
+  const hasWords = state.wordsLoaded || hasWordCues();
+  const body = {
+    song_id: state.song.filename,
+    base_draft_revision: state.draftRevision,
+    base_active_revision: state.baseActiveRevision,
+  };
+  if (hasWords) body.words = buildWordsJSON();
+  else body.srt = buildSRT();
 
-  const savedSnapshot = JSON.stringify({ cues: state.cues, wordsLoaded: state.wordsLoaded });
+  cancelAutosave();
   state.saving = true;
   updateSaveButton();
-  setStatus('Saving…', 'muted');
+  setStatus(autosave ? 'Autosaving draft…' : 'Saving draft…', 'muted');
   try {
-    const body = {
-      song_id: state.song.filename,
-      base_revision: revision,
-    };
-    if (state.wordsLoaded) body.words = buildWordsJSON();
-    else body.lyrics = buildSRT();
-    const response = await fetch('/api/save-lyrics', {
+    const response = await fetch('/api/editor/draft', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body)
     });
     const data = await response.json().catch(() => ({}));
     if (response.status === 409) {
-      state.baseRevision = null;
-      state.baseRevisionSong = null;
-      throw new Error(data.error || 'Lyrics changed on disk. Reload before saving.');
+      state.draftRevision = null;
+      state.revisionSong = null;
+      throw new Error(data.error || 'The saved draft changed. Reload it before saving.');
     }
     if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
-    if (JSON.stringify({ cues: state.cues, wordsLoaded: state.wordsLoaded }) === savedSnapshot) {
-      state.dirty = false;
+
+    if (historySnapshot() === snapshot) state.dirty = false;
+    state.draftRevision = typeof data.draft_revision === 'string'
+      ? data.draft_revision : null;
+    state.activeRevision = typeof data.active_revision === 'string'
+      ? data.active_revision : state.activeRevision;
+    state.source = 'draft';
+    state.revisionSong = state.song.filename;
+    if (state.dirty) {
+      setStatus(autosave
+        ? 'Draft autosaved; newer edits are still unsaved.'
+        : 'Draft saved; newer edits are still unsaved.', 'warn');
+    } else if (state.activeRevision && state.baseActiveRevision
+        && state.activeRevision !== state.baseActiveRevision) {
+      setStatus('Draft saved, but active lyrics changed since it was based on them. Approval will be blocked until you reload.', 'warn');
+    } else {
+      setStatus(autosave
+        ? 'Draft autosaved locally (not live).'
+        : 'Draft saved locally (not live).', 'ok');
     }
-    state.baseRevision = typeof data.revision === 'string' ? data.revision : null;
-    state.baseRevisionSong = state.song.filename;
+    updateHeader();
+    if (state.dirty) scheduleAutosave();
+    return true;
+  } catch (err) {
+    setStatus(`Draft save failed: ${err.message || err}`, 'error');
+    return false;
+  } finally {
+    state.saving = false;
+    updateSaveButton();
+  }
+}
+
+async function approveLyrics() {
+  if (!state.song || !state.cues.length) {
+    setStatus('Pick a song with cues before publishing.', 'error');
+    return;
+  }
+  const { errors } = validateCues();
+  if (errors.length) {
+    setStatus(`Fix ${errors.length} validation error(s) before publishing.`, 'error');
+    updateValidationView();
+    return;
+  }
+  const selectedStem = fileStem(state.song.filename);
+  const confirmed = await karaokeConfirm({
+    title: 'Publish these lyrics?',
+    message: `This will replace the active lyrics for "${selectedStem}". The player will use them immediately.`,
+    confirmLabel: 'Publish',
+    tone: 'danger',
+    focus: 'cancel'
+  });
+  if (!confirmed) return;
+
+  const saved = await saveDraft();
+  if (!saved) return;
+  if (state.dirty) {
+    setStatus('The draft changed while it was saving. Save again before publishing.', 'warn');
+    return;
+  }
+  if (!state.draftRevision || !state.baseActiveRevision) {
+    setStatus('Could not confirm the saved draft revision.', 'error');
+    return;
+  }
+
+  const approvalSnapshot = historySnapshot();
+  state.saving = true;
+  updateSaveButton();
+  setStatus('Publishing draft…', 'muted');
+  try {
+    const response = await fetch('/api/editor/approve', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        song_id: state.song.filename,
+        draft_revision: state.draftRevision,
+        base_active_revision: state.baseActiveRevision,
+      })
+    });
+    const data = await response.json().catch(() => ({}));
+    if (response.status === 404) {
+      state.draftRevision = null;
+      state.revisionSong = null;
+      throw new Error(data.error || 'No saved draft to publish.');
+    }
+    if (response.status === 409) {
+      if (typeof data.active_revision === 'string') {
+        state.activeRevision = data.active_revision;
+      }
+      if (Object.prototype.hasOwnProperty.call(data, 'draft_revision')) {
+        // A different draft revision exists; do not let a retry publish content
+        // the editor has not loaded. The next save must explicitly replace it.
+        state.draftRevision = null;
+        state.revisionSong = null;
+      }
+      throw new Error(data.error || 'The lyrics changed on disk. Reload before publishing.');
+    }
+    if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+
+    state.source = 'active';
+    state.draftRevision = null;
+    state.baseActiveRevision = typeof data.revision === 'string'
+      ? data.revision : null;
+    state.activeRevision = state.baseActiveRevision;
+    state.revisionSong = state.song.filename;
     state.loadedStem = selectedStem;
+    state.dirty = historySnapshot() !== approvalSnapshot;
+    cancelAutosave();
     state.song.words = !!data.words;
     state.song.lyrics = true;
-    if (data.words) {
-      setStatus(`Saved ${data.saved} + ${data.words}`, 'ok');
-    } else {
-      setStatus(`Saved ${data.saved} (word timings removed)`, 'ok');
-    }
+    setStatus(state.dirty
+      ? `Published ${data.saved}${data.words ? ' + ' + data.words : ''}, but newer edits remain unsaved.`
+      : `Published ${data.saved}${data.words ? ' + ' + data.words : ''} — the player is using the new lyrics.`,
+    state.dirty ? 'warn' : 'ok');
+    updateHeader();
     await loadSongOptions(state.song.filename);
     updateHeader();
+    if (state.dirty) scheduleAutosave();
   } catch (err) {
-    setStatus(`Save failed: ${err.message || err}`, 'error');
+    setStatus(`Publish failed: ${err.message || err}`, 'error');
   } finally {
     state.saving = false;
     updateSaveButton();
@@ -1315,7 +1894,21 @@ document.addEventListener('keydown', evt => {
   if (evt.key === ']' && state.selectedIndex >= 0) { evt.preventDefault(); nudgeCue(state.selectedIndex, 0.1); return; }
   if ((evt.key === 's' || evt.key === 'S') && state.selectedIndex >= 0) { evt.preventDefault(); if (requireAudio()) setCueStart(state.selectedIndex, wavesurfer.getCurrentTime()); return; }
   if ((evt.key === 'e' || evt.key === 'E') && state.selectedIndex >= 0) { evt.preventDefault(); if (requireAudio()) setCueEnd(state.selectedIndex, wavesurfer.getCurrentTime()); return; }
-  if ((evt.ctrlKey || evt.metaKey) && (evt.key === 'z' || evt.key === 'Z')) { evt.preventDefault(); undo(); return; }
+  if ((evt.ctrlKey || evt.metaKey) && (evt.key === 'z' || evt.key === 'Z')) {
+    evt.preventDefault();
+    if (evt.shiftKey) redo(); else undo();
+    return;
+  }
+  if ((evt.ctrlKey || evt.metaKey) && (evt.key === 'y' || evt.key === 'Y')) {
+    evt.preventDefault();
+    redo();
+    return;
+  }
+  if ((evt.ctrlKey || evt.metaKey) && (evt.key === 's' || evt.key === 'S')) {
+    evt.preventDefault();
+    saveDraft();
+    return;
+  }
 });
 
 /* ---------- event wiring ---------- */
@@ -1335,6 +1928,7 @@ $('reloadSongsBtn').addEventListener('click', () => loadSongOptions(songSelect.v
 songSelect.addEventListener('change', () => {
   const song = state.songs.find(s => s.filename === songSelect.value);
   state.song = song || state.song;
+  cancelAutosave();
   updateHeader();
   updateSaveButton();
 });
@@ -1372,10 +1966,16 @@ $('addInstrumentalBtn').addEventListener('click', () => addCue(true));
 $('clearCuesBtn').addEventListener('click', clearCues);
 toggleWordModeBtn.addEventListener('click', dropWordTimings);
 undoBtn.addEventListener('click', undo);
+redoBtn.addEventListener('click', redo);
 $('rippleToggle').addEventListener('change', evt => { state.ripple = !!evt.target.checked; });
 $('followToggle').addEventListener('change', evt => { state.follow = !!evt.target.checked; });
 playPauseBtn.addEventListener('click', () => { if (wavesurfer && state.audioReady) wavesurfer.playPause(); else setStatus('Load audio first.', 'warn'); });
 $('stopBtn').addEventListener('click', () => { if (wavesurfer && state.audioReady) { try { wavesurfer.stop(); } catch {} } });
+if (zoomOutBtn) zoomOutBtn.addEventListener('click', () => changeZoom(-1));
+if (zoomFitBtn) zoomFitBtn.addEventListener('click', () => changeZoom(0));
+if (zoomInBtn) zoomInBtn.addEventListener('click', () => changeZoom(1));
+if (loopCueBtn) loopCueBtn.addEventListener('click', toggleCueLoop);
+if (rateSelect) rateSelect.addEventListener('change', applyPlaybackRate);
 $('applyOffsetBtn').addEventListener('click', () => {
   const value = parseFloat($('offsetInput').value);
   if (!Number.isFinite(value)) { setStatus('Offset must be a number.', 'error'); return; }
@@ -1384,7 +1984,8 @@ $('applyOffsetBtn').addEventListener('click', () => {
 document.querySelectorAll('button[data-shift]').forEach(button => {
   button.addEventListener('click', () => applyShift(parseFloat(button.dataset.shift)));
 });
-saveBtn.addEventListener('click', saveLyrics);
+saveBtn.addEventListener('click', () => saveDraft());
+approveBtn.addEventListener('click', approveLyrics);
 $('previewSrtBtn').addEventListener('click', () => {
   srtOutput.textContent = buildSRT();
   srtOutput.classList.toggle('d-none');

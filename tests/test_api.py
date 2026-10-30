@@ -4,6 +4,7 @@ import os
 
 import pytest
 
+import karaoke.lyrics as lyrics_module
 from app import create_app
 from karaoke.lyrics import lyrics_revision
 
@@ -12,6 +13,25 @@ def save_lyrics_request(client, app, song_id, **payload):
     payload.setdefault(
         "base_revision", lyrics_revision(app.config["LYRICS_DIR"], song_id))
     return client.post("/api/save-lyrics", json={"song_id": song_id, **payload})
+
+
+def editor_draft_info(client, song_id):
+    return client.get(
+        "/api/editor/draft", query_string={"song_id": song_id}).get_json()
+
+
+def save_editor_draft(client, song_id, info, **payload):
+    payload.setdefault("base_draft_revision", info["draft_revision"])
+    payload.setdefault("base_active_revision", info["base_active_revision"])
+    return client.post(
+        "/api/editor/draft", json={"song_id": song_id, **payload})
+
+
+def approve_editor_draft(client, song_id, info, **payload):
+    payload.setdefault("draft_revision", info["draft_revision"])
+    payload.setdefault("base_active_revision", info["base_active_revision"])
+    return client.post(
+        "/api/editor/approve", json={"song_id": song_id, **payload})
 
 
 def test_index_page_renders(client):
@@ -490,3 +510,226 @@ def test_save_lyrics_requires_base_revision(client, app, add_song):
 
     assert res.status_code == 400
     assert "base_revision" in res.get_json()["error"]
+
+
+# --- Draft and approval workflow -------------------------------------------
+
+
+def test_draft_save_does_not_publish_or_appear_in_catalog(
+        client, app, add_song):
+    song = add_song("1_a_b.mp3")
+    stem = song.rsplit(".", 1)[0]
+    info = editor_draft_info(client, song)
+
+    res = save_editor_draft(client, song, info, srt=SRT)
+
+    assert res.status_code == 200, res.get_json()
+    body = res.get_json()
+    assert body["draft_revision"]
+    assert not (app.config["LYRICS_DIR"] / f"{stem}.srt").exists()
+    assert not (app.config["LYRICS_DIR"] / f"{stem}.words.json").exists()
+
+    catalog = client.get("/api/songs").get_json()["songs"]
+    assert catalog[0]["lyrics"] is False
+    assert catalog[0]["words"] is False
+    assert client.get(f"/lyrics/{stem}.srt").status_code == 404
+    assert client.get(
+        f"/lyrics/drafts/{stem}.draft.json").status_code == 404
+    assert client.get(f"/lyrics/drafts/{stem}.srt").status_code == 404
+
+    loaded = editor_draft_info(client, song)
+    assert loaded["source"] == "draft"
+    assert loaded["draft_revision"] == body["draft_revision"]
+    assert loaded["srt"].replace("\r\n", "\n") == SRT
+    assert loaded["words"] is None
+
+
+def test_approve_publishes_word_draft_and_clears_draft(
+        client, app, add_song):
+    song = add_song("1_a_b.mp3")
+    stem = song.rsplit(".", 1)[0]
+    info = editor_draft_info(client, song)
+    draft_res = save_editor_draft(client, song, info, words=WORDS)
+    assert draft_res.status_code == 200, draft_res.get_json()
+    assert not (app.config["LYRICS_DIR"] / f"{stem}.srt").exists()
+    assert not (app.config["LYRICS_DIR"] / f"{stem}.words.json").exists()
+    draft = editor_draft_info(client, song)
+
+    res = approve_editor_draft(client, song, draft)
+
+    assert res.status_code == 200, res.get_json()
+    body = res.get_json()
+    assert body["words"] == f"{stem}.words.json"
+    assert body["revision"] == lyrics_revision(
+        app.config["LYRICS_DIR"], song)
+    assert (app.config["LYRICS_DIR"] / f"{stem}.srt").exists()
+    assert (app.config["LYRICS_DIR"] / f"{stem}.words.json").exists()
+    assert editor_draft_info(client, song)["draft_revision"] is None
+    catalog = client.get("/api/songs").get_json()["songs"]
+    assert catalog[0]["lyrics"] is True
+    assert catalog[0]["words"] is True
+
+
+def test_mixed_line_and_word_cues_publish(client, app, add_song):
+    song = add_song("1_a_b.mp3")
+    stem = song.rsplit(".", 1)[0]
+    mixed = {
+        "lines": [
+            WORDS["lines"][0],
+            {
+                "start": 4.0,
+                "end": 5.5,
+                "text": "Line only",
+                "instrumental": False,
+                "words": [],
+            },
+        ],
+    }
+    info = editor_draft_info(client, song)
+    draft_res = save_editor_draft(client, song, info, words=mixed)
+    assert draft_res.status_code == 200, draft_res.get_json()
+    draft = editor_draft_info(client, song)
+
+    res = approve_editor_draft(client, song, draft)
+
+    assert res.status_code == 200, res.get_json()
+    words = json.loads(
+        (app.config["LYRICS_DIR"] / f"{stem}.words.json").read_text(
+            encoding="utf-8"))
+    assert words["lines"][0]["words"]
+    assert words["lines"][1]["words"] == []
+    srt_text = (app.config["LYRICS_DIR"] / f"{stem}.srt").read_text(
+        encoding="utf-8")
+    assert "Somewhere in between" in srt_text
+    assert "Line only" in srt_text
+
+
+def test_srt_only_publish_removes_stale_active_words(
+        client, app, add_song, add_lyrics):
+    song = add_song("1_a_b.mp3")
+    stem = song.rsplit(".", 1)[0]
+    add_lyrics(stem + ".srt", SRT)
+    add_lyrics(stem + ".words.json", json.dumps(WORDS))
+    info = editor_draft_info(client, song)
+    assert info["source"] == "active"
+    draft_res = save_editor_draft(client, song, info, srt=SRT)
+    assert draft_res.status_code == 200, draft_res.get_json()
+    assert (app.config["LYRICS_DIR"] / f"{stem}.words.json").exists()
+    draft = editor_draft_info(client, song)
+
+    res = approve_editor_draft(client, song, draft)
+
+    assert res.status_code == 200, res.get_json()
+    assert res.get_json()["words"] is None
+    assert (app.config["LYRICS_DIR"] / f"{stem}.srt").exists()
+    assert not (app.config["LYRICS_DIR"] / f"{stem}.words.json").exists()
+
+
+def test_draft_save_rejects_stale_draft_revision(client, app, add_song):
+    song = add_song("1_a_b.mp3")
+    info = editor_draft_info(client, song)
+    first = save_editor_draft(client, song, info, srt=SRT)
+    assert first.status_code == 200
+
+    stale = save_editor_draft(client, song, info, srt=SRT)
+    assert stale.status_code == 409
+    assert stale.get_json()["draft_revision"]
+
+    current = editor_draft_info(client, song)
+    assert current["source"] == "draft"
+
+
+def test_approval_rejects_changed_active_lyrics(client, app, add_song, add_lyrics):
+    song = add_song("1_a_b.mp3")
+    stem = song.rsplit(".", 1)[0]
+    info = editor_draft_info(client, song)
+    draft_res = save_editor_draft(client, song, info, srt=SRT)
+    assert draft_res.status_code == 200
+    draft = editor_draft_info(client, song)
+
+    changed_active = "1\n00:00:00,000 --> 00:00:01,000\nNewer active line\n"
+    add_lyrics(stem + ".srt", changed_active)
+
+    res = approve_editor_draft(client, song, draft)
+
+    assert res.status_code == 409
+    assert "active lyrics changed" in res.get_json()["error"].lower()
+    assert (app.config["LYRICS_DIR"] / f"{stem}.srt").read_text(
+        encoding="utf-8") == changed_active
+    assert editor_draft_info(client, song)["source"] == "draft"
+
+
+def test_publish_failure_restores_active_and_keeps_draft(
+        client, app, add_song, add_lyrics, monkeypatch):
+    song = add_song("1_a_b.mp3")
+    stem = song.rsplit(".", 1)[0]
+    old_srt = "1\n00:00:00,000 --> 00:00:02,000\nOld active line\n"
+    old_words = json.dumps(WORDS)
+    add_lyrics(stem + ".srt", old_srt)
+    add_lyrics(stem + ".words.json", old_words)
+    info = editor_draft_info(client, song)
+    draft_res = save_editor_draft(client, song, info, words=WORDS)
+    assert draft_res.status_code == 200
+    draft = editor_draft_info(client, song)
+
+    real_replace = lyrics_module.os.replace
+    calls = {"count": 0}
+
+    def fail_second_replace(source, destination):
+        calls["count"] += 1
+        if calls["count"] == 2:
+            raise OSError("simulated publish failure")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(lyrics_module.os, "replace", fail_second_replace)
+
+    res = approve_editor_draft(client, song, draft)
+
+    assert res.status_code == 500
+    assert (app.config["LYRICS_DIR"] / f"{stem}.srt").read_text(
+        encoding="utf-8") == old_srt
+    assert (app.config["LYRICS_DIR"] / f"{stem}.words.json").read_text(
+        encoding="utf-8") == old_words
+    assert editor_draft_info(client, song)["source"] == "draft"
+
+
+def test_invalid_srt_is_rejected_without_writes(
+        client, app, add_song, add_lyrics):
+    song = add_song("1_a_b.mp3")
+    stem = song.rsplit(".", 1)[0]
+    bad_srt = "this is not an srt"
+    old_srt = "1\n00:00:00,000 --> 00:00:01,000\nOld active line\n"
+    add_lyrics(stem + ".srt", old_srt)
+
+    active_info = editor_draft_info(client, song)
+    active = client.post("/api/save-lyrics", json={
+        "song_id": song,
+        "lyrics": bad_srt,
+        "base_revision": active_info["active_revision"],
+    })
+    assert active.status_code == 400
+    assert (app.config["LYRICS_DIR"] / f"{stem}.srt").read_text(
+        encoding="utf-8") == old_srt
+
+    draft_info = editor_draft_info(client, song)
+    good_draft = save_editor_draft(client, song, draft_info, srt=SRT)
+    assert good_draft.status_code == 200
+    before = editor_draft_info(client, song)
+    draft = save_editor_draft(client, song, before, srt=bad_srt)
+    assert draft.status_code == 400
+    after = editor_draft_info(client, song)
+    assert after["srt"].replace("\r\n", "\n") == SRT
+    assert after["draft_revision"] == before["draft_revision"]
+
+
+def test_approval_requires_a_saved_draft(client, app, add_song):
+    song = add_song("1_a_b.mp3")
+    info = editor_draft_info(client, song)
+
+    res = client.post("/api/editor/approve", json={
+        "song_id": song,
+        "draft_revision": "not-a-draft",
+        "base_active_revision": info["active_revision"],
+    })
+
+    assert res.status_code == 404

@@ -22,14 +22,16 @@
       <span class="topbar-divider" aria-hidden="true"></span>
       <div class="title-block">
         <h1>Lyric sync editor</h1>
-        <p>Fine-tune each line, then save it straight to the player.</p>
+        <p>Fine-tune each line, save a draft, then approve when it is ready.</p>
       </div>
     </div>
     <div class="topbar-actions">
       <span id="loadBadge" class="badge badge-soft">No lyrics loaded</span>
       <button id="undoBtn" class="btn btn-sm btn-outline-secondary" disabled>Undo</button>
-      <button id="toggleWordModeBtn" class="btn btn-sm btn-outline-warning d-none">Drop word timings</button>
-      <button id="saveBtn" class="btn btn-sm btn-dark">Save changes</button>
+      <button id="redoBtn" class="btn btn-sm btn-outline-secondary" disabled>Redo</button>
+      <button id="toggleWordModeBtn" class="btn btn-sm btn-outline-warning d-none">Drop all word timings</button>
+      <button id="saveBtn" class="btn btn-sm btn-outline-secondary" disabled>Save draft</button>
+      <button id="approveBtn" class="btn btn-sm btn-success" disabled>Approve / publish</button>
     </div>
   </header>
 
@@ -46,6 +48,7 @@
         <button id="reloadSongsBtn" class="btn btn-sm btn-outline-secondary">Refresh list</button>
       </div>
       <div id="audioStatus" class="audio-status">No audio loaded.</div>
+      <p class="draft-note">Drafts are local. The player keeps the active lyrics until you approve.</p>
     </div>
     <div class="load-group">
       <label>Import local files (overrides the editor contents)</label>
@@ -77,6 +80,10 @@
 
       <div id="cues" class="cue-list"></div>
 
+      <div id="wordInspector" class="word-inspector muted-note" aria-live="polite">
+        Select a word chip to edit its timing.
+      </div>
+
       <div class="d-flex gap-2 mt-3 flex-wrap">
         <button id="previewSrtBtn" class="btn btn-sm btn-outline-secondary">Preview SRT</button>
         <button id="downloadSrtBtn" class="btn btn-sm btn-outline-secondary" disabled>Download .srt</button>
@@ -97,6 +104,27 @@
         <button id="playPauseBtn" class="btn btn-sm btn-primary">Play</button>
         <button id="stopBtn" class="btn btn-sm btn-outline-secondary">Stop</button>
         <span id="timeDisplay">00:00:00,000 / 00:00:00,000</span>
+      </div>
+      <div class="timing-tools">
+        <div class="timing-group">
+          <span class="timing-label">Zoom</span>
+          <button id="zoomOutBtn" class="btn btn-sm btn-outline-secondary" type="button" title="Zoom out">−</button>
+          <button id="zoomFitBtn" class="btn btn-sm btn-outline-secondary" type="button" title="Fit waveform">Fit</button>
+          <button id="zoomInBtn" class="btn btn-sm btn-outline-secondary" type="button" title="Zoom in">+</button>
+        </div>
+        <div class="timing-group">
+          <button id="loopCueBtn" class="btn btn-sm btn-outline-secondary" type="button" title="Loop the selected cue">Loop cue</button>
+        </div>
+        <div class="timing-group">
+          <label for="rateSelect">Speed</label>
+          <select id="rateSelect" class="form-select form-select-sm rate-select">
+            <option value="0.5">0.5×</option>
+            <option value="0.75">0.75×</option>
+            <option value="1" selected>1×</option>
+            <option value="1.25">1.25×</option>
+            <option value="1.5">1.5×</option>
+          </select>
+        </div>
       </div>
       <div class="offset-bar">
         <label>Shift all</label>
@@ -120,7 +148,9 @@
       </div>
       <div class="audio-status mt-2">
         Space plays or pauses. Use [ and ] to seek ±1s, or S and E to set the
-        selected cue’s start and end at the playhead. Click a word to seek to it.
+        selected cue’s start and end at the playhead. Select a word chip to set
+        word boundaries or nudge it. Ctrl+Z / Ctrl+Shift+Z undo and redo.
+        Drafts autosave locally; Approve / publish makes them live.
       </div>
     </aside>
   </div>
