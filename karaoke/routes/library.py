@@ -8,9 +8,15 @@ import tempfile
 from flask import Blueprint, current_app, jsonify, request
 
 from karaoke.catalog import enrich_song, find_song, scan_songs
-from karaoke.http import json_body
+from karaoke.http import editor_access_allowed, json_body
 from karaoke.logging import logger
-from karaoke.lyrics import save_lyrics, serialize_word_timings, validate_word_timings
+from karaoke.lyrics import (
+    LyricsConflictError,
+    read_lyrics_bundle,
+    save_lyrics,
+    serialize_word_timings,
+    validate_word_timings,
+)
 from karaoke.transposition import (
     build_audio_filter,
     run_transposition,
@@ -132,43 +138,90 @@ def transpose_audio():
     return jsonify({"url": f"/transposed/{transposed_name}"})
 
 
+@library.get("/api/editor/lyrics")
+def api_editor_lyrics():
+    if not editor_access_allowed():
+        return jsonify({"error": "Sync Editor is unavailable."}), 404
+
+    song_id = request.args.get("song_id")
+    if not isinstance(song_id, str) or not song_id:
+        return jsonify({"error": "song_id is required"}), 400
+    if find_song(current_app.config["SONGS_DIR"], song_id) is None:
+        return jsonify({"error": "Song not found"}), 404
+
+    try:
+        bundle = read_lyrics_bundle(
+            current_app.config["LYRICS_DIR"], song_id)
+    except (OSError, UnicodeDecodeError) as exc:
+        logger.error("Could not read lyrics for %s: %s", song_id, exc)
+        return jsonify({"error": "Could not read lyrics."}), 500
+
+    return jsonify({"song_id": song_id, **bundle})
+
+
 @library.post("/api/save-lyrics")
 def api_save_lyrics():
+    if not editor_access_allowed():
+        return jsonify({"error": "Sync Editor is unavailable."}), 404
+
     data = json_body()
     song_id = data.get("song_id")
     lyrics_text = data.get("lyrics")
     words = data.get("words", None)
+    base_revision = data.get("base_revision")
 
     if not isinstance(song_id, str) or not song_id:
         return jsonify({"error": "song_id is required"}), 400
-    if not isinstance(lyrics_text, str) or not lyrics_text.strip():
-        return jsonify({"error": "non-empty lyrics are required"}), 400
-    if len(lyrics_text.encode("utf-8")) > current_app.config["MAX_LYRICS_BYTES"]:
-        return jsonify({"error": "Lyrics file is too large"}), 400
 
+    words_json = None
+    saved_bytes = 0
     if words is not None:
         error = validate_word_timings(words)
         if error is not None:
             return jsonify({"error": f"Invalid word timings: {error}"}), 400
         try:
             words_json = serialize_word_timings(words, song_id)
+            saved_bytes = len(words_json.encode("utf-8"))
+        except UnicodeEncodeError:
+            return jsonify({"error": "Word timings contain invalid text encoding"}), 400
         except ValueError:
             return jsonify({"error": "Word timings are not valid JSON"}), 400
-        if len(words_json.encode("utf-8")) > current_app.config["MAX_WORDS_BYTES"]:
+        if saved_bytes > current_app.config["MAX_WORDS_BYTES"]:
             return jsonify({"error": "Word timing file is too large"}), 400
+    else:
+        if not isinstance(lyrics_text, str) or not lyrics_text.strip():
+            return jsonify({"error": "non-empty lyrics are required"}), 400
+        try:
+            saved_bytes = len(lyrics_text.encode("utf-8"))
+        except UnicodeEncodeError:
+            return jsonify({"error": "Lyrics contain invalid text encoding"}), 400
+        if saved_bytes > current_app.config["MAX_LYRICS_BYTES"]:
+            return jsonify({"error": "Lyrics file is too large"}), 400
 
     # The song must exist in the catalog: this guarantees the .srt name always
     # matches the audio stem and blocks path traversal.
     if find_song(current_app.config["SONGS_DIR"], song_id) is None:
         return jsonify({"error": "Song not found"}), 404
+    if not isinstance(base_revision, str) or not base_revision:
+        return jsonify({"error": "base_revision is required"}), 400
 
     try:
         result = save_lyrics(
-            current_app.config["LYRICS_DIR"], song_id, lyrics_text, words)
-    except OSError as exc:
+            current_app.config["LYRICS_DIR"], song_id, lyrics_text, words,
+            base_revision=base_revision)
+    except LyricsConflictError as exc:
+        logger.warning("Lyrics conflict for %s; current revision %s",
+                       song_id, exc.revision)
+        return jsonify({
+            "error": "Lyrics changed on disk. Reload before saving.",
+            "revision": exc.revision,
+        }), 409
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except (OSError, UnicodeEncodeError) as exc:
         logger.error("Could not save lyrics for %s: %s", song_id, exc)
         return jsonify({"error": "Could not save lyrics."}), 500
 
     logger.info("Saved lyrics for %s -> %s (%d bytes)",
-                song_id, result["saved"], len(lyrics_text.encode("utf-8")))
+                song_id, result["saved"], saved_bytes)
     return jsonify(result)

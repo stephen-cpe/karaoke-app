@@ -5,6 +5,13 @@ import os
 import pytest
 
 from app import create_app
+from karaoke.lyrics import lyrics_revision
+
+
+def save_lyrics_request(client, app, song_id, **payload):
+    payload.setdefault(
+        "base_revision", lyrics_revision(app.config["LYRICS_DIR"], song_id))
+    return client.post("/api/save-lyrics", json={"song_id": song_id, **payload})
 
 
 def test_index_page_renders(client):
@@ -116,7 +123,7 @@ SRT = "1\n00:00:01,000 --> 00:00:03,500\nSomewhere in between\n\n"
 def test_save_lyrics_writes_matching_srt(client, app, add_song):
     song = add_song("00001_Two Steps Behind_Def Leppard.mp3")
 
-    res = client.post("/api/save-lyrics", json={"song_id": song, "lyrics": SRT})
+    res = save_lyrics_request(client, app, song, lyrics=SRT)
     assert res.status_code == 200
     assert res.get_json()["saved"] == "00001_Two Steps Behind_Def Leppard.srt"
 
@@ -129,7 +136,7 @@ def test_save_lyrics_preserves_unicode(client, app, add_song):
     song = add_song("1_Café Noir_Amélie.mp3")
     srt = "1\n00:00:00,000 --> 00:00:02,000\nCafé ☕ —— déjà vu\n\n"
 
-    res = client.post("/api/save-lyrics", json={"song_id": song, "lyrics": srt})
+    res = save_lyrics_request(client, app, song, lyrics=srt)
     assert res.status_code == 200
 
     path = os.path.join(app.config["LYRICS_DIR"], "1_Café Noir_Amélie.srt")
@@ -141,7 +148,7 @@ def test_save_lyrics_removes_stale_word_timings(client, app, add_song, add_lyric
     song = add_song("00001_Two Steps Behind_Def Leppard.mp3")
     add_lyrics("00001_Two Steps Behind_Def Leppard.words.json", "{}")
 
-    res = client.post("/api/save-lyrics", json={"song_id": song, "lyrics": SRT})
+    res = save_lyrics_request(client, app, song, lyrics=SRT)
     assert res.status_code == 200
     assert not os.path.exists(os.path.join(
         app.config["LYRICS_DIR"], "00001_Two Steps Behind_Def Leppard.words.json"))
@@ -154,9 +161,9 @@ def test_save_lyrics_creates_missing_lyrics_directory(tmp_path):
     lyrics = tmp_path / "new" / "lyrics"  # does not exist yet
 
     app = create_app(songs_dir=songs, lyrics_dir=lyrics,
-                     transposed_dir=tmp_path / "transposed")
-    res = app.test_client().post(
-        "/api/save-lyrics", json={"song_id": "1_a_b.mp3", "lyrics": SRT})
+                     transposed_dir=tmp_path / "transposed",
+                     enable_editor=True)
+    res = save_lyrics_request(app.test_client(), app, "1_a_b.mp3", lyrics=SRT)
 
     assert res.status_code == 200
     assert (lyrics / "1_a_b.srt").exists()
@@ -224,8 +231,7 @@ def test_songs_endpoint_flags_existing_word_timings(client, add_song, add_lyrics
 
 def test_save_lyrics_writes_word_timings(client, app, add_song):
     song = add_song("00001_Two Steps Behind_Def Leppard.mp3")
-    res = client.post("/api/save-lyrics", json={
-        "song_id": song, "lyrics": SRT, "words": WORDS})
+    res = save_lyrics_request(client, app, song, lyrics=SRT, words=WORDS)
     assert res.status_code == 200
     body = res.get_json()
     assert body["saved"] == "00001_Two Steps Behind_Def Leppard.srt"
@@ -244,7 +250,7 @@ def test_save_lyrics_writes_word_timings(client, app, add_song):
 def test_save_lyrics_without_words_removes_stale_word_timings(client, app, add_song, add_lyrics):
     song = add_song("00001_Two Steps Behind_Def Leppard.mp3")
     add_lyrics("00001_Two Steps Behind_Def Leppard.words.json", "{}")
-    res = client.post("/api/save-lyrics", json={"song_id": song, "lyrics": SRT})
+    res = save_lyrics_request(client, app, song, lyrics=SRT)
     assert res.status_code == 200
     assert res.get_json()["words"] is None
     assert not os.path.exists(os.path.join(
@@ -276,8 +282,7 @@ def test_save_lyrics_rejects_invalid_word_timings(client, app, add_song):
 def test_save_lyrics_rejects_oversized_word_timings(client, app, add_song, monkeypatch):
     monkeypatch.setitem(app.config, "MAX_WORDS_BYTES", 64)
     song = add_song("1_a_b.mp3")
-    res = client.post("/api/save-lyrics", json={
-        "song_id": song, "lyrics": SRT, "words": WORDS})
+    res = save_lyrics_request(client, app, song, lyrics=SRT, words=WORDS)
     assert res.status_code == 400
 
 
@@ -333,3 +338,155 @@ def test_relative_media_directories_resolve_from_working_directory(tmp_path, mon
     assert response.status_code == 200
     assert response.data == b"fake-audio"
     assert app.config["SONGS_DIR"] == (tmp_path / "songs").resolve()
+
+
+# --- Editor access and revision tracking ------------------------------------
+
+
+LAN = {"REMOTE_ADDR": "192.168.1.25"}
+
+
+def _editor_app(tmp_path, **kwargs):
+    dirs = {
+        "songs_dir": tmp_path / "songs",
+        "lyrics_dir": tmp_path / "lyrics",
+        "transposed_dir": tmp_path / "transposed",
+    }
+    for directory in dirs.values():
+        directory.mkdir()
+    return create_app(**dirs, **kwargs)
+
+
+def test_editor_requires_localhost_and_enable_flag(client, add_song):
+    song = add_song("1_a_b.mp3")
+
+    assert client.get("/sync_editor.html", environ_base=LAN).status_code == 404
+    assert b"sync_editor.html" not in client.get(
+        "/player", environ_base=LAN).data
+    assert client.get(
+        "/api/editor/lyrics",
+        query_string={"song_id": song},
+        environ_base=LAN,
+    ).status_code == 404
+    assert client.post(
+        "/api/save-lyrics",
+        json={"song_id": song, "lyrics": SRT, "base_revision": "stale"},
+        environ_base=LAN,
+    ).status_code == 404
+
+
+def test_editor_is_disabled_by_default(tmp_path, monkeypatch):
+    monkeypatch.delenv("KARAOKE_EDITOR", raising=False)
+    app = _editor_app(tmp_path)
+    editor_client = app.test_client()
+
+    assert app.config["ENABLE_EDITOR"] is False
+    assert editor_client.get("/sync_editor.html").status_code == 404
+    assert editor_client.post("/api/save-lyrics", json={}).status_code == 404
+    assert editor_client.get(
+        "/api/editor/lyrics", query_string={"song_id": "nope.mp3"}
+    ).status_code == 404
+    assert b"sync_editor.html" not in editor_client.get("/").data
+
+
+def test_editor_env_flag_enables_localhost_page(tmp_path, monkeypatch):
+    monkeypatch.setenv("KARAOKE_EDITOR", "1")
+    app = _editor_app(tmp_path)
+
+    assert app.config["ENABLE_EDITOR"] is True
+    assert app.test_client().get("/sync_editor.html").status_code == 200
+
+
+def test_editor_lyrics_bundle_includes_revision(client, app, add_song, add_lyrics):
+    song = add_song("00001_Two Steps Behind_Def Leppard.mp3")
+    stem = song.rsplit(".", 1)[0]
+    add_lyrics(stem + ".srt", SRT)
+
+    bundle = client.get(
+        "/api/editor/lyrics", query_string={"song_id": song}).get_json()
+
+    assert bundle["srt"].replace("\r\n", "\n") == SRT
+    assert bundle["words"] is None
+    assert bundle["revision"] == lyrics_revision(app.config["LYRICS_DIR"], song)
+
+
+def test_save_words_only_derives_srt_and_roundtrips(
+        client, app, add_song):
+    song = add_song("00001_Two Steps Behind_Def Leppard.mp3")
+    revision = lyrics_revision(app.config["LYRICS_DIR"], song)
+
+    res = client.post("/api/save-lyrics", json={
+        "song_id": song,
+        "words": WORDS,
+        "base_revision": revision,
+    })
+
+    assert res.status_code == 200, res.get_json()
+    body = res.get_json()
+    assert body["revision"] == lyrics_revision(app.config["LYRICS_DIR"], song)
+
+    stem = song.rsplit(".", 1)[0]
+    srt_path = app.config["LYRICS_DIR"] / f"{stem}.srt"
+    srt_text = srt_path.read_text(encoding="utf-8")
+    assert "Somewhere in between" in srt_text
+    assert "00:00:01,000 --> 00:00:03,500" in srt_text
+
+    bundle = client.get(
+        "/api/editor/lyrics", query_string={"song_id": song}).get_json()
+    assert bundle["revision"] == body["revision"]
+    assert json.loads(bundle["words"])["lines"][0]["text"] == "Somewhere in between"
+
+
+def test_line_level_words_save_derives_srt(client, app, add_song):
+    song = add_song("1_a_b.mp3")
+    revision = lyrics_revision(app.config["LYRICS_DIR"], song)
+    words = {
+        "lines": [{
+            "start": 0.5,
+            "end": 2.5,
+            "text": "Line level only",
+            "instrumental": False,
+            "words": [],
+        }],
+    }
+
+    res = client.post("/api/save-lyrics", json={
+        "song_id": song,
+        "words": words,
+        "base_revision": revision,
+    })
+
+    assert res.status_code == 200, res.get_json()
+    stem = song.rsplit(".", 1)[0]
+    srt_text = (app.config["LYRICS_DIR"] / f"{stem}.srt").read_text(encoding="utf-8")
+    assert "Line level only" in srt_text
+    assert "00:00:00,500 --> 00:00:02,500" in srt_text
+
+
+def test_save_lyrics_rejects_stale_revision(client, app, add_song, add_lyrics):
+    song = add_song("1_a_b.mp3")
+    stem = song.rsplit(".", 1)[0]
+    stale_revision = lyrics_revision(app.config["LYRICS_DIR"], song)
+    old_srt = "1\n00:00:00,000 --> 00:00:01,000\nOld line\n"
+    add_lyrics(stem + ".srt", old_srt)
+
+    res = client.post("/api/save-lyrics", json={
+        "song_id": song,
+        "lyrics": SRT,
+        "base_revision": stale_revision,
+    })
+
+    assert res.status_code == 409
+    assert res.get_json()["revision"] == lyrics_revision(
+        app.config["LYRICS_DIR"], song)
+    assert (app.config["LYRICS_DIR"] / f"{stem}.srt").read_text(
+        encoding="utf-8") == old_srt
+
+
+def test_save_lyrics_requires_base_revision(client, app, add_song):
+    song = add_song("1_a_b.mp3")
+
+    res = client.post("/api/save-lyrics", json={"song_id": song, "lyrics": SRT})
+
+    assert res.status_code == 400
+    assert "base_revision" in res.get_json()["error"]

@@ -214,6 +214,62 @@ def test_confirmation_dialog_respects_reduced_motion(browser, live_server):
         context.close()
 
 
+def test_host_player_parses_unnumbered_dot_decimal_srt(host_page):
+    parsed = host_page.evaluate("""() => {
+      parseAndSyncLyrics(
+        "00:00:01.000 --> 00:00:02.500\\nHello dotted world");
+      return lyricsTimeline.map(line => ({
+        start: line.start,
+        end: line.end,
+        text: line.text
+      }));
+    }""")
+
+    assert parsed == [{
+        "start": 1.0,
+        "end": 2.5,
+        "text": "Hello dotted world",
+    }]
+
+
+def test_sync_editor_save_roundtrip(browser_context, live_server, add_lyrics):
+    stem = live_server.songs[0].rsplit(".", 1)[0]
+    add_lyrics(
+        stem + ".srt",
+        "1\n00:00:00,000 --> 00:00:02,000\nHello from the test\n",
+    )
+
+    page = browser_context.new_page()
+    page.goto(live_server.url("/sync_editor.html"), wait_until="networkidle")
+    page.wait_for_function(
+        "() => document.querySelectorAll('#songSelect option').length > 1",
+        timeout=10000,
+    )
+    page.select_option("#songSelect", live_server.songs[0])
+    page.click("#loadSongBtn")
+    page.wait_for_selector("#cues .cue-row", timeout=15000)
+    page.locator("#cues .cue-row").first.locator(
+        "button", has_text="+0.1").click()
+
+    page.click("#saveBtn")
+    page.wait_for_function(
+        "() => document.querySelector('#saveStatus')?.textContent.includes('Saved')",
+        timeout=15000,
+    )
+
+    page.goto(live_server.url("/sync_editor.html"), wait_until="networkidle")
+    page.wait_for_function(
+        "() => document.querySelectorAll('#songSelect option').length > 1",
+        timeout=10000,
+    )
+    page.select_option("#songSelect", live_server.songs[0])
+    page.click("#loadSongBtn")
+    page.wait_for_selector("#cues .cue-row", timeout=15000)
+
+    assert page.locator("#cues .cue-start").first.input_value() == "00:00:00,100"
+    page.close()
+
+
 def test_sync_editor_confirmation_dialogs(browser_context, live_server, add_lyrics):
     stem = live_server.songs[0].rsplit(".", 1)[0]
     add_lyrics(

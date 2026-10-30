@@ -1422,25 +1422,23 @@ function startLyricsAnimation() {
 function parseAndSyncLyrics(srt) {
   clearLyricTimers();
 
-  const lines = srt.split(/\r?\n\r?\n/).map(block => {
+  const normalized = String(srt || "").replace(/^\uFEFF/, "");
+  const lines = normalized.split(/\r?\n\r?\n/).map(block => {
     const parts = block.trim().split(/\r?\n/);
-    if (parts.length >= 2) {
-      const time = parts[1];
-      const text = parts.slice(2).join(" ").trim();
-      if (time && time.includes("-->")) {
-        const [startStr, endStr] = time.split(" --> ");
-        if (!endStr) return null;
-        return {
-          start: parseTime(startStr),
-          end: parseTime(endStr.trim()),
-          text: text
-        };
-      }
+    const timingIndex = parts.findIndex(line => line.includes("-->"));
+    if (timingIndex < 0) return null;
+    const [startStr, endStr] = parts[timingIndex].split("-->");
+    if (!endStr) return null;
+    const start = parseTime(startStr);
+    const end = parseTime(endStr.trim().split(/\s+/)[0]);
+    const text = parts.slice(timingIndex + 1).join(" ").trim();
+    if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) {
+      return null;
     }
-    return null;
+    return { start, end, text };
   }).filter(Boolean);
 
-  lyricsTimeline = lines;
+  lyricsTimeline = lines.sort((a, b) => a.start - b.start || a.end - b.end);
   lineLevelLyricIndex = -1;
 }
 
@@ -1592,9 +1590,16 @@ function clearLyricTimers() {
 }
 
 function parseTime(t) {
-  const [h, m, sWithMs] = t.split(":");
-  const [s, ms] = sWithMs.split(",");
-  return parseInt(h, 10) * 3600 + parseInt(m, 10) * 60 + parseInt(s, 10) + parseInt(ms, 10) / 1000;
+  const text = String(t || "").trim().replace(",", ".");
+  const parts = text.split(":");
+  if (parts.length < 1 || parts.length > 3) return NaN;
+  const values = parts.map(part => Number(part));
+  if (values.some(value => !Number.isFinite(value))) return NaN;
+  let seconds;
+  if (values.length === 3) seconds = values[0] * 3600 + values[1] * 60 + values[2];
+  else if (values.length === 2) seconds = values[0] * 60 + values[1];
+  else seconds = values[0];
+  return Number.isFinite(seconds) ? seconds : NaN;
 }
 
 function loadLyrics(filename) {

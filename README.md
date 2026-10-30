@@ -39,8 +39,9 @@ drag-and-drop copy of the working tree, because it still contains the media.
   separation, Whisper word timestamps and LRCLIB text
 - **Pitch shifting (±4 semitones)** so singers can find their key, with caching
 - **Sync Editor** (waveform + cascading timing) that saves lyrics straight to the
-  server; it is linked from the host player but not the phone remote. The route is
-  not access-controlled, so anyone on the LAN who knows the URL can open it
+  server; it is experimental, local-only, disabled by default, and linked from the
+  localhost host player only when enabled with `--enable-editor` (or
+  `KARAOKE_EDITOR=1`)
 - **Logging built in**: terminal + rotating `karaoke.log` when started with
   `python app.py`, with host-side playback and library errors relayed to the server
 - Helper scripts for loudness normalization and batch pre-transposing songs
@@ -81,6 +82,8 @@ pip install -r requirements.txt -r requirements-dev.txt -r requirements-lyrics.t
 # Or install just the core runtime:
 # pip install -r requirements.txt
 python app.py
+# Optional local-only Sync Editor:
+# python app.py --enable-editor
 ```
 
 The server starts on port **8080**:
@@ -102,10 +105,11 @@ python app.py --dev
 
 > **Note:** the normal server binds to all network interfaces (`0.0.0.0`) by default
 > and has **no authentication**. That is on purpose — it is what lets guests queue
-> songs from their phones — but anyone on the LAN who knows the URLs can also control
-> playback, take over the player, or open the Sync Editor and overwrite lyrics.
-> Only run it on networks you trust. Windows Firewall will ask the first time;
-> allow it on private networks.
+> songs from their phones — but anyone on the LAN can also control playback or take
+> over the player. The Sync Editor is disabled by default and accepts only localhost
+> requests when explicitly enabled; it is not exposed to LAN clients. Only run the
+> server on networks you trust. Windows Firewall will ask the first time; allow it on
+> private networks.
 
 The host and remote use custom CSS; the Sync Editor loads Bootstrap and WaveSurfer
 from `static/vendor/`. All pages use system fonts and make no third-party runtime
@@ -119,8 +123,8 @@ LRCLIB is used only by the lyric pipeline.
   `playback_state.py`; restarting the server starts a fresh session.
 - The host page owns the only shared-session audio output, registers as the active
   player, and reports its true position every second. The phone remote page never
-  creates or plays media; the Sync Editor is a separate editing surface that can
-  preview audio for timing work.
+  creates or plays media; the Sync Editor is a separate, local-only editing surface
+  that can preview audio for timing work when enabled.
 - Phones send REST controls. The server broadcasts the new snapshot over
   `/api/events` (SSE) and queues ordered commands for the host, which acknowledges
   them with `last_command_id`.
@@ -252,8 +256,11 @@ Only `.mp3` and `.wav` files are picked up; other files (`*.jpg`, `*.py`, …) a
 
 ## Adding synced lyrics
 
-1. Open the **Sync editor** from the host player header (or
-   <http://localhost:8080/sync_editor.html>).
+1. Enable the experimental editor for this run with `python app.py --enable-editor`
+   (or `KARAOKE_EDITOR=1`; PowerShell: `$env:KARAOKE_EDITOR = "1"`), then open the
+   **Sync editor** from the host player header (or
+   <http://localhost:8080/sync_editor.html>). It is disabled by default and only
+   accepts localhost requests; `--dev` alone does not enable it.
 2. Load a song from the catalog (audio plus any existing `.srt` and `.words.json`),
    or import local `.srt` / `.words.json` files.
 3. Nudge each cue with `−0.1` / `+0.1`, ripple later cues with the checkbox, or use
@@ -261,19 +268,22 @@ Only `.mp3` and `.wav` files are picked up; other files (`*.jpg`, `*.py`, …) a
    **Start** / **End** buttons at the playhead (or the S/E keys). `[Instrumental]`
    cues are preserved.
 4. Editing a cue boundary can scale or clamp word timings so they stay inside the cue.
-5. Pick the destination song and hit **Save**. The server writes the matching `.srt`
-   *and* `.words.json`, so word-by-word highlighting keeps working. If no word
-   timings are loaded, saving removes the stale sidecar and the player falls back to
-   line-level SRT mode.
+5. Pick the destination song and hit **Save**. When word timings are loaded, the
+   server treats `.words.json` as the source of truth and regenerates the matching
+   `.srt`; when no word timings are loaded, it saves SRT-only and removes the stale
+   sidecar. The player falls back to line-level SRT mode for line-level cues.
 
 The song dropdown marks existing lyric files as `SRT`, `words`, or `SRT+words`. You
 can also drop a `.srt` into `lyrics/` manually, as long as its filename matches the
 audio filename (only the extension differs).
 
-The Sync Editor is linked from the host player but not the phone remote; the route
-is not access-controlled, so anyone on the LAN who knows the URL can open it. The
-host player expects standard numbered SRT cues with comma-decimal timestamps
-(`00:00:01,000`); the Sync Editor and phone remote accept a few more variants.
+The host player, phone remote, Sync Editor, and lyric checker accept normal SRT cue
+blocks; cue numbers are optional and both comma and dot decimal separators work.
+Line-level lyric cues without word timings are valid; the checker only flags them
+as structural problems when run with `--strict`.
+
+Saves carry the current lyric revision. If another edit changes the files first, the
+server rejects the save with a conflict instead of overwriting the newer lyrics.
 
 ### Automatic timing with `tools/generate_lyrics.py`
 
@@ -327,10 +337,13 @@ Validate the generated files without re-running the audio pipeline:
 ```powershell
 python tools\check_lyrics.py            # structural checks for every .words.json sidecar
 python tools\check_lyrics.py --energy   # also flag silent cues and late vocal onsets
+python tools\check_lyrics.py --strict   # require word timings on every lyric cue in sidecars
 ```
 
 Structural problems return a non-zero exit code. Energy findings are warnings:
-backing vocals, ad-libs, and separation bleed commonly trigger them.
+backing vocals, ad-libs, and separation bleed commonly trigger them. Line-level
+lyrics are valid by default; use `--strict` when checking pipeline-generated files
+that are expected to have word timings.
 
 For an agent handoff, see `docs/AGENTS.md`. The wrapper runs generation and, when
 generation succeeds, validation:
@@ -356,10 +369,10 @@ Long instrumental gaps (longer than three seconds) become `[Instrumental]` cues;
 shorter gaps with audible vocal energy are left alone. A lyric cue ends at the
 first sung phrase: held notes stay with their line, while later backing vocals or
 ad-libs that are not in the lyric reference are left to the surrounding
-`[Instrumental]` cue. Saving an edited SRT from the Sync Editor writes a matching
-`.srt`; if no word timings were loaded, the stale `.words.json` is removed so the
-player cannot show stale word timings. When the editor loads word timings, saving
-writes both files so word-by-word highlighting is preserved.
+`[Instrumental]` cue. Saving from the Sync Editor treats `.words.json` as the
+source of truth and regenerates the `.srt`; saving SRT-only removes the stale
+`.words.json` so the player cannot show stale word timings. Word-by-word
+highlighting is preserved when the editor saves word timings.
 
 ## Pitch shifting
 
@@ -386,7 +399,8 @@ python app.py
 | Method | Path | Description |
 |---|---|---|
 | GET | `/`, `/player`, `/remote` | Role-aware root (localhost = player, LAN = remote); explicit overrides |
-| GET | `/sync_editor.html` | Lyric Sync Editor (host-oriented; not access-controlled) |
+| GET | `/sync_editor.html` | Lyric Sync Editor (disabled by default; localhost + editor flag required) |
+| GET | `/api/editor/lyrics?song_id=<filename>` | Current SRT/words text plus a revision hash for conflict detection (editor only) |
 | GET | `/api/info` | Role, `server_id`, join/remote/player URLs, host connectivity, LAN IP and port |
 | GET | `/api/state` | Full shared snapshot: `server_id`, `revision`, `host_connected`, `host_last_seen_seconds`, status, position, duration, current song, queue, transpose, volume, error, and `last_command_id` |
 | GET | `/api/events?role=host\|remote&client_id=…` | SSE stream: `state` snapshots, `command` frames for the host, and `host_revoked` |
@@ -397,10 +411,13 @@ python app.py
 | POST | `/api/host/ended`, `/api/host/error`, `/api/host/disconnect` | Host lifecycle events |
 | GET | `/api/songs` | Scanned catalog: `id`, `title`, `artist`, `filename`, `lyrics`, `words` |
 | GET/POST | `/transpose?song_id=<filename>&semitones=<n>` | Returns `{"url": ...}` for original / cached / generated audio |
-| POST | `/api/save-lyrics` | `{"song_id": <filename>, "lyrics": <srt text>, "words": <words json? optional>}` → writes `lyrics/<stem>.srt` and writes or removes `lyrics/<stem>.words.json`; validates optional word timings |
+| POST | `/api/save-lyrics` | Editor-only lyric save: `{"song_id": <filename>, "base_revision": <hash>, "words": <words json? optional>, "lyrics": <srt text? optional>}`. With `words`, JSON is canonical and SRT is regenerated; without it, SRT-only is saved and the sidecar removed. A stale `base_revision` returns `409`. |
 | POST | `/api/log` | Client-side log relay (`[browser] …`); the host uses it for playback and library errors |
 | GET | `/manifest.webmanifest`, `/sw.js` | PWA manifest and remote service worker |
 | GET | `/songs/…`, `/lyrics/…`, `/transposed/…` | Media file serving (only `.mp3`/`.wav`, `.srt`/`.words.json` as appropriate) |
+
+`/api/editor/lyrics` and `/api/save-lyrics` return 404 unless the Sync Editor is
+enabled and the request comes from localhost.
 
 Shared-control actions: `add` (`filename`), `remove` (`index`), `clear`, `reorder`
 (`from`, `to`), `skip`, `play`, `pause`, `restart`, `seek` (`position`), `transpose`
@@ -416,17 +433,18 @@ venv\Scripts\ruff check .
 
 The suite covers filename parsing, the catalog endpoint, media-route extension
 filtering, lyrics saving (including traversal, non-string/NUL filenames, oversize
-rejection, and stale word-timing cleanup), transposition behavior and failure
-cleanup, the shared-state model (host takeover, command acknowledgement, timeout
-freezing, queue ordering, stale ended events), the role-aware pages, the
-control/state/host APIs, SSE framing, logging sanitization, and the PWA routes.
-FFmpeg is mocked, so the tests run anywhere without it. The exact test count is
-whatever `pytest` reports for your checkout; it is intentionally not duplicated
-here.
+rejection, and stale word-timing cleanup), SRT generation from word timings, editor
+access gating, save revision conflicts, transposition behavior and failure cleanup,
+the shared-state model (host takeover, command acknowledgement, timeout freezing,
+queue ordering, stale ended events), the role-aware pages, the control/state/host
+APIs, SSE framing, logging sanitization, and the PWA routes. FFmpeg is mocked, so the
+tests run anywhere without it. The exact test count is whatever `pytest` reports for
+your checkout; it is intentionally not duplicated here.
 
 Browser tests use Playwright against a temporary local Flask server. They cover
-host player library/queue interactions, the phone remote, shared confirmation
-dialogs, keyboard focus, reduced motion, and Sync Editor prompts:
+host player library/queue interactions, host lyric parser tolerance, the phone
+remote, shared confirmation dialogs, keyboard focus, reduced motion, Sync Editor
+prompts, and an editor save/reload round trip:
 
 ```powershell
 venv\Scripts\python -m playwright install chromium  # once, unless Edge or Chrome is installed
@@ -506,9 +524,11 @@ runtime by `static/background.js`; it contains no third-party visual assets.
   on the LAN, but service-worker caching and installability require localhost or HTTPS.
 - **Background rendering:** the animated backdrop needs WebGL. Without it, the host
   shows a static CSS nebula fallback. `prefers-reduced-motion` freezes the animation.
-- **No authentication:** anyone on the network can queue songs, control playback,
-  change key or volume, take over the player, or open the Sync Editor and overwrite
-  lyrics. Only run it on networks you trust.
+- **No guest authentication:** anyone on the network can queue songs, control
+  playback, change key or volume, and take over the player. That is intentional for
+  the party flow. The Sync Editor is disabled by default and localhost-only when
+  enabled, so it is not part of the unauthenticated LAN surface. Only run the server
+  on networks you trust.
 - **Large libraries:** the song and queue lists render every row; thousands of songs
   would want pagination or virtual scrolling.
 - **Transposition concurrency:** two simultaneous requests for the same uncached song

@@ -1,7 +1,8 @@
-﻿"""KARAOKE APP Flask application factory."""
+"""KARAOKE APP Flask application factory."""
 from __future__ import annotations
 
 import logging as stdlib_logging
+import os
 import time
 from pathlib import Path
 from typing import Any
@@ -23,9 +24,19 @@ from karaoke.routes import register_blueprints
 from playback_state import PlaybackError, PlaybackState
 from utils import single_line
 
+_EDITOR_ENV_VAR = "KARAOKE_EDITOR"
+
+
+def _env_flag(name: str) -> bool:
+    """Return True for common truthy environment-variable values."""
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
 
 def create_app(songs_dir: Any = "songs", lyrics_dir: Any = "lyrics",
-               transposed_dir: Any = "transposed") -> Flask:
+               transposed_dir: Any = "transposed",
+               enable_editor: bool | None = None) -> Flask:
+    if enable_editor is None:
+        enable_editor = _env_flag(_EDITOR_ENV_VAR)
     project_root = Path(__file__).resolve().parent.parent
     app = Flask(
         __name__,
@@ -45,6 +56,7 @@ def create_app(songs_dir: Any = "songs", lyrics_dir: Any = "lyrics",
         MAX_SEMITONES=MAX_SEMITONES,
         FFMPEG_FILTER=DEFAULT_FFMPEG_FILTER,
         FFMPEG_TIMEOUT_SECONDS=FFMPEG_TIMEOUT_SECONDS,
+        ENABLE_EDITOR=bool(enable_editor),
     )
     # One shared karaoke session per server process. Tests create separate app
     # objects, so a test can never leak its queue into another test.

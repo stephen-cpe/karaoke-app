@@ -6,7 +6,7 @@ import socket
 from functools import lru_cache
 from typing import Any
 
-from flask import request
+from flask import current_app, request
 
 from karaoke.config import DEFAULT_PORT, MAX_CLIENT_ID_LENGTH
 from karaoke.errors import ApiError
@@ -22,6 +22,11 @@ def is_local_request() -> bool:
     if isinstance(parsed, ipaddress.IPv6Address) and parsed.ipv4_mapped:
         parsed = parsed.ipv4_mapped
     return parsed.is_loopback
+
+
+def editor_access_allowed() -> bool:
+    """Return True when the local-only Sync Editor may be used."""
+    return bool(current_app.config.get("ENABLE_EDITOR")) and is_local_request()
 
 
 def client_id_from(data: Any) -> str:

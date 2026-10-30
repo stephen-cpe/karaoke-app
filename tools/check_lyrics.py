@@ -4,9 +4,12 @@ Usage (from the project root):
     python tools/check_lyrics.py                  # all songs
     python tools/check_lyrics.py --song Innocent  # one song (substring)
     python tools/check_lyrics.py --energy         # also inspect vocal energy
+    python tools/check_lyrics.py --strict         # require words on lyric cues
 
 Structural problems make the command exit non-zero. Energy findings are
 diagnostic warnings: backing vocals, ad-libs, and bleed can all trip them.
+Line-level lyric cues without word timings are valid; use ``--strict`` to
+flag them when checking pipeline-generated files.
 """
 from __future__ import annotations
 
@@ -119,7 +122,9 @@ def check_sidecar(stem: str, lyrics_dir: Path = LYRICS_DIR):
 
         lyric_count += 1
         if not words:
-            problems.append(f"cue {index}: lyric cue has no words: {text!r}")
+            # Line-level cues are a supported fallback. Strict mode is applied
+            # by the CLI so the generated pipeline can still be checked for
+            # complete word timings.
             continue
 
         previous_word_end = None
@@ -263,6 +268,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="only check stems containing TEXT (repeatable)")
     parser.add_argument("--energy", action="store_true",
                         help="inspect cached vocal stems for quiet/late cues")
+    parser.add_argument("--strict", action="store_true",
+                        help="treat line-level lyric cues without word timings as problems")
     parser.add_argument("--verbose", action="store_true",
                         help="show the first and last three cues")
     parser.add_argument("--cache-dir", type=Path, default=DEFAULT_CACHE_DIR,
@@ -290,12 +297,26 @@ def main(argv: list[str] | None = None) -> int:
             continue
         problems, lines, lyric_count, instrumental_count, word_count = (
             check_sidecar(stem, LYRICS_DIR))
+        line_level_indexes = [
+            index for index, line in enumerate(lines, 1)
+            if isinstance(line, dict)
+            and not line.get("instrumental")
+            and not line.get("words")
+        ]
+        if args.strict:
+            problems.extend(
+                f"cue {index}: lyric cue has no word timings"
+                for index in line_level_indexes
+            )
         total_problems += len(problems)
         print(
             f"{stem}: {len(lines)} cues "
             f"({lyric_count} lyric, {instrumental_count} instrumental), "
             f"{word_count} words, {len(problems)} structural problem(s)"
         )
+        if line_level_indexes and not args.strict:
+            print(f"  note: {len(line_level_indexes)} line-level lyric cue(s); "
+                  "use --strict to flag them")
         for problem in problems[:20]:
             print(f"  PROBLEM: {problem}")
         if len(problems) > 20:

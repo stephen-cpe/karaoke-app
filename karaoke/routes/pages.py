@@ -1,4 +1,4 @@
-﻿"""Page, PWA, and media-serving routes."""
+"""Page, PWA, and media-serving routes."""
 from __future__ import annotations
 
 import os
@@ -6,7 +6,7 @@ import os
 from flask import Blueprint, abort, current_app, render_template, send_from_directory
 
 from karaoke.config import AUDIO_EXTENSIONS, LYRICS_EXTENSIONS
-from karaoke.http import is_local_request
+from karaoke.http import editor_access_allowed, is_local_request
 
 pages = Blueprint("pages", __name__)
 
@@ -15,12 +15,16 @@ pages = Blueprint("pages", __name__)
 def index():
     # The browser on the karaoke machine (localhost) is the audio player.
     # Every phone/tablet on the LAN gets the controls-only remote.
-    return render_template("index.html" if is_local_request() else "remote.html")
+    if is_local_request():
+        return render_template(
+            "index.html", editor_available=editor_access_allowed())
+    return render_template("remote.html")
 
 
 @pages.get("/player", strict_slashes=False)
 def player_page():
-    return render_template("index.html")
+    return render_template(
+        "index.html", editor_available=editor_access_allowed())
 
 
 @pages.get("/remote", strict_slashes=False)
@@ -30,6 +34,8 @@ def remote_page():
 
 @pages.get("/sync_editor.html")
 def sync_editor():
+    if not editor_access_allowed():
+        abort(404)
     return render_template("sync_editor.html")
 
 

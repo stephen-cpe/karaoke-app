@@ -24,9 +24,10 @@
 - `static/background.js` — host-only procedural WebGL star/nebula/galaxy background.
 - `static/remote.js`, `static/remote.css`, `templates/remote.html` — controls-only
   phone remote. It must not create audio/video elements or play media.
-- `templates/index.html` — host player page, including the sync editor link.
+- `templates/index.html` — host player page, including the Sync Editor link when
+  the editor is enabled for localhost.
 - `static/sync_editor.js`, `static/sync_editor.css`, `templates/sync_editor.html` —
-  lyric sync editor (logic kept out of the template).
+  experimental local-only lyric sync editor (logic kept out of the template).
 - `static/confirm-dialog.js`, `static/confirm-dialog.css` — shared modal confirmation
   dialog used by all pages.
 - `static/manifest.webmanifest`, `static/sw.js`, `static/icon-*.png`,
@@ -45,9 +46,11 @@
 
 - Localhost gets the player at `/`; LAN clients get the remote. `/player` and
   `/remote` force either role. Only the host player page may output audio for the
-  shared session; the Sync Editor can preview audio for timing work.
-- `/sync_editor.html` is linked only from the host page, but the route is not
-  access-controlled; any LAN client that knows the URL can open it and save lyrics.
+  shared session; the Sync Editor can preview audio for timing work when enabled.
+- The Sync Editor is experimental and disabled by default. Enable it with
+  `--enable-editor` or `KARAOKE_EDITOR=1`; the page, save API, and editor load API
+  return 404 for LAN clients or when disabled, and the host-page link is hidden.
+  Do not use `--dev` as the editor gate.
 - The server owns the queue and playback state. Phones call `/api/control`;
   state reaches browsers through `/api/events` (SSE) with polling fallback.
 - Only one host is active. A second player takes over and the old host receives
@@ -134,6 +137,9 @@ edits are safe. To regenerate one specific song explicitly:
 - Each new song logs `wrote ... .srt`.
 - Both `<stem>.srt` and `<stem>.words.json` exist. The checker scans only
   `.words.json`, so an SRT without a sidecar is not validated.
+- Line-level lyric cues without word timings are valid. Use
+  `python tools\check_lyrics.py --strict` only when checking pipeline-generated
+  files that are expected to have complete word timings.
 - The run ends with `done: N ok, 0 failed`.
 - The checker ends with `total structural problems: 0`.
 - No `duration mismatch` warning. If present, stop and report both durations;

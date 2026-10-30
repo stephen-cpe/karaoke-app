@@ -15,7 +15,7 @@ def app(tmp_path):
     }
     for directory in dirs.values():
         directory.mkdir()
-    return create_app(**dirs)
+    return create_app(**dirs, enable_editor=True)
 
 
 @pytest.fixture

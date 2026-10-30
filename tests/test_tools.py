@@ -30,3 +30,43 @@ def test_check_sidecar_handles_malformed_lines(tmp_path):
     assert lines == ["not an object"]
     assert "not an object" in problems[0]
     assert (lyric_count, instrumental_count, word_count) == (0, 0, 0)
+
+
+def test_check_sidecar_allows_line_level_cues(tmp_path):
+    (tmp_path / "song.words.json").write_text(json.dumps({
+        "lines": [{
+            "start": 0,
+            "end": 1,
+            "text": "Hello",
+            "instrumental": False,
+            "words": [],
+        }],
+    }), encoding="utf-8")
+    (tmp_path / "song.srt").write_text(
+        "1\n00:00:00,000 --> 00:00:01,000\nHello\n", encoding="utf-8")
+
+    problems, lines, lyric_count, instrumental_count, word_count = (
+        check_lyrics.check_sidecar("song", tmp_path))
+
+    assert problems == []
+    assert lyric_count == 1
+    assert instrumental_count == 0
+    assert word_count == 0
+
+
+def test_check_lyrics_strict_flags_line_level_cues(tmp_path, monkeypatch):
+    (tmp_path / "song.words.json").write_text(json.dumps({
+        "lines": [{
+            "start": 0,
+            "end": 1,
+            "text": "Hello",
+            "instrumental": False,
+            "words": [],
+        }],
+    }), encoding="utf-8")
+    (tmp_path / "song.srt").write_text(
+        "1\n00:00:00,000 --> 00:00:01,000\nHello\n", encoding="utf-8")
+    monkeypatch.setattr(check_lyrics, "LYRICS_DIR", tmp_path)
+
+    assert check_lyrics.main(["--song", "song"]) == 0
+    assert check_lyrics.main(["--song", "song", "--strict"]) == 1

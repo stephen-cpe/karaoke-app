@@ -4,6 +4,8 @@ const state = {
   songs: [],
   song: null,          // selected save destination
   loadedStem: null,    // stem the cues came from (for mismatch warnings)
+  baseRevision: null,  // server revision the cues were loaded from
+  baseRevisionSong: null,
   duration: 0,
   wordsLoaded: false,
   wordsMeta: null,
@@ -977,11 +979,21 @@ async function loadSongOptions(selectedFilename) {
     setStatus(`Failed to load songs: ${err.message || err}`, 'error');
   }
 }
+async function fetchEditorLyrics(filename) {
+  const response = await fetch(
+    `/api/editor/lyrics?song_id=${encodeURIComponent(filename)}`,
+    { cache: 'no-store' });
+  const data = await response.json().catch(() => ({}));
+  return { response, data };
+}
+
 async function loadSong(song) {
   if (!song || !(await confirmDiscard())) return;
   const token = ++state.loadToken;
   state.song = song;
   state.loadedStem = null;
+  state.baseRevision = null;
+  state.baseRevisionSong = null;
   state.cues = [];
   state.wordsLoaded = false;
   state.wordsMeta = null;
@@ -996,17 +1008,35 @@ async function loadSong(song) {
   updateHeader();
 
   const stem = fileStem(song.filename);
-  const responses = await Promise.allSettled([
-    fetch(`/lyrics/${encodeURIComponent(stem)}.srt`),
-    fetch(`/lyrics/${encodeURIComponent(stem)}.words.json`)
-  ]);
-  const srtResponse = responses[0];
-  const wordsResponse = responses[1];
-  const srtText = (srtResponse.status === 'fulfilled' && srtResponse.value.ok)
-    ? await srtResponse.value.text().catch(() => null) : null;
-  const wordsJson = (wordsResponse.status === 'fulfilled' && wordsResponse.value.ok)
-    ? await wordsResponse.value.json().catch(() => null) : null;
+  let bundle;
+  try {
+    bundle = await fetchEditorLyrics(song.filename);
+  } catch (err) {
+    if (token !== state.loadToken) return;
+    setStatus(`Could not load lyrics: ${err.message || err}`, 'error');
+    updateHeader();
+    return;
+  }
   if (token !== state.loadToken) return;
+  if (!bundle.response.ok) {
+    setStatus(bundle.data.error || `Could not load lyrics (${bundle.response.status}).`, 'error');
+    updateHeader();
+    return;
+  }
+
+  const srtText = typeof bundle.data.srt === 'string' ? bundle.data.srt : null;
+  const hasWordsFile = typeof bundle.data.words === 'string' && bundle.data.words.length > 0;
+  let wordsJson = null;
+  if (hasWordsFile) {
+    try {
+      wordsJson = JSON.parse(bundle.data.words);
+    } catch {
+      wordsJson = null;
+    }
+  }
+  state.baseRevision = typeof bundle.data.revision === 'string'
+    ? bundle.data.revision : null;
+  state.baseRevisionSong = song.filename;
 
   const srtCues = srtText ? parseSRT(srtText) : [];
   const parsedWords = wordsJson ? parseWordsData(wordsJson) : null;
@@ -1030,12 +1060,12 @@ async function loadSong(song) {
     state.wordsLoaded = false;
     state.wordsMeta = null;
     state.loadedStem = stem;
-    if (wordsJson) {
+    if (hasWordsFile) {
       setStatus('Loaded .srt only. The word timing file could not be used and will be replaced on save.', 'warn');
     } else {
       setStatus('Loaded .srt only (no word timings).', 'warn');
     }
-  } else if (wordsJson) {
+  } else if (hasWordsFile) {
     setStatus('The word timing file is invalid, so nothing was loaded.', 'error');
   } else {
     setStatus('No lyrics found for this song yet. Add cues or import a file, then save.', 'warn');
@@ -1062,6 +1092,8 @@ async function importSrtFile(file) {
     state.loadedStem = lyricsStem(file.name);
     state.selectedIndex = 0;
     state.history = [];
+    state.baseRevision = null;
+    state.baseRevisionSong = null;
     state.dirty = true;
     renderAll();
     const song = matchSongByStem(lyricsStem(file.name));
@@ -1096,6 +1128,8 @@ async function importWordsFile(file) {
     state.loadedStem = lyricsStem(file.name);
     state.selectedIndex = 0;
     state.history = [];
+    state.baseRevision = null;
+    state.baseRevisionSong = null;
     state.dirty = true;
     renderAll();
     if (result.warnings && result.warnings.length) setStatus(`Imported ${result.cues.length} cues with warnings: ${result.warnings[0]}`, 'warn');
@@ -1145,6 +1179,38 @@ async function saveLyrics() {
     if (!confirmed) return;
   }
 
+  let revision = state.baseRevision;
+  if (!revision || state.baseRevisionSong !== state.song.filename) {
+    let info;
+    try {
+      info = await fetchEditorLyrics(state.song.filename);
+    } catch (err) {
+      setStatus(`Could not check the current lyrics: ${err.message || err}`, 'error');
+      return;
+    }
+    if (!info.response.ok) {
+      setStatus(info.data.error || `Could not check the current lyrics (${info.response.status}).`, 'error');
+      return;
+    }
+    if (info.data.srt || info.data.words) {
+      const confirmed = await karaokeConfirm({
+        title: 'Replace existing lyrics?',
+        message: `"${selectedStem}" already has lyric files. Saving will replace them.`,
+        confirmLabel: 'Replace lyrics',
+        tone: 'danger',
+        focus: 'cancel'
+      });
+      if (!confirmed) return;
+    }
+    revision = typeof info.data.revision === 'string' ? info.data.revision : null;
+    if (!revision) {
+      setStatus('Could not obtain the current lyric revision.', 'error');
+      return;
+    }
+    state.baseRevision = revision;
+    state.baseRevisionSong = state.song.filename;
+  }
+
   const savedSnapshot = JSON.stringify({ cues: state.cues, wordsLoaded: state.wordsLoaded });
   state.saving = true;
   updateSaveButton();
@@ -1152,19 +1218,27 @@ async function saveLyrics() {
   try {
     const body = {
       song_id: state.song.filename,
-      lyrics: buildSRT(),
+      base_revision: revision,
     };
     if (state.wordsLoaded) body.words = buildWordsJSON();
+    else body.lyrics = buildSRT();
     const response = await fetch('/api/save-lyrics', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body)
     });
     const data = await response.json().catch(() => ({}));
+    if (response.status === 409) {
+      state.baseRevision = null;
+      state.baseRevisionSong = null;
+      throw new Error(data.error || 'Lyrics changed on disk. Reload before saving.');
+    }
     if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
     if (JSON.stringify({ cues: state.cues, wordsLoaded: state.wordsLoaded }) === savedSnapshot) {
       state.dirty = false;
     }
+    state.baseRevision = typeof data.revision === 'string' ? data.revision : null;
+    state.baseRevisionSong = state.song.filename;
     state.loadedStem = selectedStem;
     state.song.words = !!data.words;
     state.song.lyrics = true;

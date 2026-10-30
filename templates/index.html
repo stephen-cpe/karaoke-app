@@ -54,10 +54,12 @@
           <span class="header-action-label">Up next</span>
           <span class="queue-badge" id="queue-count" aria-label="0 songs in queue">0</span>
         </a>
+        {% if editor_available %}
         <a class="header-action sync-editor-link" href="/sync_editor.html">
           <svg class="icon" aria-hidden="true"><use href="#icon-tune"></use></svg>
           <span class="header-action-label">Sync editor</span>
         </a>
+        {% endif %}
       </nav>
     </div>
   </header>
