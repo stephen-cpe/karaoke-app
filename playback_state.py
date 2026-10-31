@@ -193,6 +193,16 @@ class PlaybackState:
                     del self._subscribers[subscriber_id]
                     break
 
+    def close_subscribers(self) -> None:
+        """Wake every SSE stream so the Waitress server can shut down.
+
+        The sentinel is internal and is never serialized as a browser event;
+        the event-stream generator consumes it and returns.
+        """
+        with self._lock:
+            for subscriber in list(self._subscribers.values()):
+                subscriber.push("shutdown", {})
+
     def pending_commands(self) -> list[dict[str, Any]]:
         with self._lock:
             return [dict(command) for command in self._pending_commands]

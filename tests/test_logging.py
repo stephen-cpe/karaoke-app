@@ -133,7 +133,8 @@ def test_transpose_logs_ffmpeg_failure_with_output(client, add_song, capture_all
     def failing(*args, **kwargs):
         raise subprocess.CalledProcessError(1, "ffmpeg", stderr=b"boom: no such filter")
 
-    monkeypatch.setattr(subprocess, "run", failing)
+    monkeypatch.setattr(
+        transposition_module, "_run_ffmpeg_process", failing)
     client.get("/transpose", query_string={"song_id": song, "semitones": 1})
 
     errors = [r.getMessage() for r in capture_all.records

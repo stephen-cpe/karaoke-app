@@ -1,0 +1,161 @@
+name: Windows release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build (for example 0.0.1). No release is published."
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Windows x64 distribution
+    runs-on: windows-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up native CPython x64
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          architecture: "x64"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            packaging/requirements-desktop.txt
+            packaging/requirements-build.txt
+
+      - name: Set up Node.js for JavaScript tests
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Determine build version
+        shell: pwsh
+        run: |
+          if ("${{ github.event_name }}" -eq "push") {
+            $rawVersion = "${{ github.ref_name }}"
+          } else {
+            $rawVersion = "${{ inputs.version }}"
+          }
+          $version = $rawVersion.Trim() -replace '^[vV]', ''
+          if ($version -notmatch '^\d+\.\d+\.\d+$') {
+            throw "Invalid version '$rawVersion'; expected v0.0.1 or 0.0.1."
+          }
+          "KARAOKE_VERSION=$version" >> $env:GITHUB_ENV
+
+      - name: Install core, desktop, and build dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt `
+            -r packaging/requirements-desktop.txt `
+            -r packaging/requirements-build.txt `
+            pytest ruff
+
+      - name: Run Python tests
+        shell: pwsh
+        run: python -m pytest -m "not browser"
+
+      - name: Run JavaScript tests
+        shell: pwsh
+        run: node --test tests/js/reconcile.test.js
+
+      - name: Run Ruff
+        shell: pwsh
+        run: python -m ruff check .
+
+      - name: Cache FFmpeg download
+        uses: actions/cache@v4
+        with:
+          path: packaging/cache
+          key: ffmpeg-9.0.2-essentials-windows-x64
+
+      - name: Build portable distribution
+        shell: pwsh
+        run: .\packaging\build.ps1 -Version $env:KARAOKE_VERSION -SkipTests
+
+      - name: Upload distribution artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: karaoke-app-windows
+          path: |
+            dist/karaoke-app-*-win64.zip
+            dist/karaoke-app-*-win64.zip.sha256
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub pre-release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Download distribution artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: karaoke-app-windows
+          path: release
+
+      - name: Validate tag against application version
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $version = $tag -replace '^[vV]', ''
+          $match = Select-String -Path "karaoke/version.py" -Pattern '__version__\s*=\s*"([^"]+)"'
+          if (-not $match) { throw "Could not read karaoke/version.py." }
+          $sourceVersion = $match.Matches[0].Groups[1].Value
+          if ($sourceVersion -ne $version) {
+            throw "Tag $tag does not match karaoke/version.py ($sourceVersion)."
+          }
+          "KARAOKE_TAG=$tag" >> $env:GITHUB_ENV
+          "KARAOKE_VERSION=$version" >> $env:GITHUB_ENV
+
+      - name: Prepare release notes
+        shell: pwsh
+        run: |
+          $template = Get-Content packaging/release-notes-template.md -Raw
+          $notes = $template.Replace("{{VERSION}}", $env:KARAOKE_TAG)
+          Set-Content -Path release-notes.md -Value $notes -Encoding UTF8
+
+      - name: Ensure the release does not already exist
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release view $env:KARAOKE_TAG --json tagName 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            throw "Release $env:KARAOKE_TAG already exists. Existing releases are never overwritten."
+          }
+
+      - name: Publish pre-release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $zip = Get-ChildItem release -Recurse -Filter 'karaoke-app-*-win64.zip' |
+            Select-Object -First 1
+          $checksum = Get-ChildItem release -Recurse -Filter 'karaoke-app-*-win64.zip.sha256' |
+            Select-Object -First 1
+          if (-not $zip -or -not $checksum) {
+            throw "Distribution ZIP or checksum missing."
+          }
+          gh release create $env:KARAOKE_TAG `
+            $zip.FullName `
+            $checksum.FullName `
+            --title "Karaoke App $env:KARAOKE_TAG" `
+            --notes-file release-notes.md `
+            --prerelease `
+            --verify-tag

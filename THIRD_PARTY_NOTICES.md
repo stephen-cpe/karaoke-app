@@ -11,8 +11,12 @@ their own licenses.
 
 | Package | Version tested | License |
 |---|---|---|
+| Python | 3.13.9 | PSF-2.0 |
+| Tcl/Tk (desktop shell) | 8.6 | BSD-style |
 | Flask | 3.1.3 | BSD-3-Clause |
 | Waitress | 3.0.2 | ZPL 2.1 |
+| pystray | 0.19.5 | LGPL-3.0 |
+| Pillow | 13.0.0 | MIT-CMU |
 
 ## Development and helper dependencies
 
@@ -23,6 +27,12 @@ their own licenses.
 | ruff | 0.17.3 | MIT |
 | pydub | 0.25.1 | MIT |
 | audioop-lts | 0.2.2 | PSF-2.0 |
+
+## Windows packaging dependencies
+
+| Package | Version tested | License | Notes |
+|---|---|---|---|
+| PyInstaller | 6.22.3 | GPL-2.0-or-later with a special exception | Build tool and bootloader; the exception permits building and distributing non-free applications |
 
 ## Lyric timing pipeline (optional)
 
@@ -52,22 +62,26 @@ weights or a prebuilt environment.
 
 These files are served locally so the web UI does not need a CDN or Google Fonts.
 
-## External programs and services (not bundled)
+## External programs and services
 
 - **FFmpeg** is used for pitch shifting, audio normalization, and the
-  lyric-extraction/energy checks. FFmpeg is licensed under the LGPL-2.1-or-later
-  by default, but some builds include GPL components and are therefore GPL. Check
-  the license of the build you install. This project does not distribute FFmpeg.
-- **Rubber Band** is the preferred FFmpeg pitch-shift filter. Rubber Band is
-  GPL-2.0-or-later or available under a commercial license. This project does not
-  distribute Rubber Band or an FFmpeg build that includes it.
+  lyric-extraction/energy checks. The Windows distribution bundles the
+  **FFmpeg 9.0.2 essentials static build from Gyan Doshi**, which is GPLv3 and
+  includes `librubberband`. The exact package, checksum, build configuration,
+  license, and source-code links are in `packaging/FFMPEG-SOURCE-OFFER.txt` and
+  are copied into the distribution's `ffmpeg/` folder. FFmpeg is invoked as a
+  separate executable.
+- **Rubber Band** is the preferred FFmpeg pitch-shift filter. The bundled
+  FFmpeg build includes Rubber Band v4.0.0, licensed GPL-2.0-or-later or
+  available under a commercial license. The distribution includes the GPLv3
+  license text and source references.
 - **LRCLIB** is a third-party lyrics service used by the optional timing pipeline.
   Its API documentation says the service is free, needs no API key, and asks
   clients to identify themselves and behave considerately. Its responses are not
   bundled. Lyrics remain the property of their respective rights holders; using
   LRCLIB does not grant redistribution rights.
 - **NVIDIA CUDA runtime packages** are optional proprietary redistributables and
-  are not bundled.
+  are not bundled in the core Windows application.
 
 ## Media and visual assets
 
@@ -79,6 +93,11 @@ documented in this repository. Do not assume they are original, cleared, or
 licensed for redistribution; replace them with assets you have rights to before
 publishing. The host page's animated background is generated at runtime by
 `static/background.js` and uses no third-party visual assets.
+
+The Windows distribution includes a `licenses/` folder with the license texts
+collected for the bundled Python/Tk runtime, Python packages, PyInstaller, and
+other runtime components. `ffmpeg/` contains the FFmpeg license, build README,
+and source offer. These notices are informational and are not legal advice.
 
 ## Project license status
 

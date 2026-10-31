@@ -66,6 +66,16 @@ tools/.cache/
 *.bak
 *.orig
 
+# --- Windows desktop build artifacts --------------------------------------
+.python313/
+.venv-build/
+build/
+dist/
+packaging/build/
+packaging/cache/
+packaging/vendor/
+karaoke-app-*.zip
+
 # --- OS / editor junk -----------------------------------------------------
 .DS_Store
 Thumbs.db

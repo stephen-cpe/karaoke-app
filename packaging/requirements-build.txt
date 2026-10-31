@@ -1,0 +1,2 @@
+# Build-only dependencies. Not installed in the end-user distribution.
+pyinstaller==6.22.3

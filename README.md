@@ -9,7 +9,9 @@ your voice.
 > **Project status:** This is a personal, experimental, educational hobby
 > project, not a product. It is **very early pre-alpha** software: behavior and
 > file layouts may change, and it is provided **as-is, with no warranty** and no
-> support commitment. See [Licensing and media](#licensing-and-media).
+> support commitment. The initial public portable executable release is
+> **v0.0.1 (PRE-ALPHA)**. See `docs/VERSIONING.md` and
+> [Licensing and media](#licensing-and-media).
 
 ## What is not included
 
@@ -52,11 +54,12 @@ drag-and-drop copy of the working tree, because it still contains the media.
 ## Requirements
 
 - **Python 3.13+** (developed on 3.13/3.14)
-- **FFmpeg** on your PATH — required for on-demand transposition, audio
-  normalization, batch pre-transposing, and lyric generation. Playback of
-  pre-generated files works without it. Most builds work, but the default
-  filter (`rubberband`) requires an FFmpeg compiled with librubberband; see
-  [Pitch shifting](#pitch-shifting) for a fallback filter.
+- **FFmpeg** on your PATH for source/developer use — required for on-demand
+  transposition, audio normalization, batch pre-transposing, and lyric
+  generation. Playback of pre-generated files works without it. The packaged
+  Windows distribution bundles FFmpeg with `librubberband`; see
+  [Pitch shifting](#pitch-shifting) for the fallback filter used in
+  development environments.
 - A browser. Before audio can start, the host player needs a user gesture; click
   **Enable sound** once (browser autoplay policy). Phones get the controls-only
   remote by default.
@@ -119,6 +122,36 @@ requests. `app.py` probes FFmpeg at startup for diagnostics; pitch shifting,
 normalization, and lyric tooling only invoke it when you use those features.
 LRCLIB is used only by the lyric pipeline.
 
+## Windows desktop distribution
+
+The portable Windows build is a one-folder PyInstaller distribution. It
+includes the Python runtime, core Flask/Waitress dependencies, Tkinter desktop
+shell, tray integration, frontend assets, and FFmpeg with `librubberband`.
+End users do not need Python, FFmpeg, a command line, or an internet connection.
+
+1. Extract the `karaoke-app` folder to a writable location such as Documents
+   or the Desktop.
+2. Double-click `karaoke-app.exe`.
+3. Use **Open player** in the application window, or open the displayed
+   player URL, and click **Enable sound** once in the browser.
+4. Add instrumentals to `songs/` and optional lyrics to `lyrics/`. The
+   `transposed/` cache is generated on demand when a key change is requested.
+
+The application creates `songs/`, `lyrics/`, and `transposed/` beside the
+executable if they are missing. These directories must remain writable;
+do not extract into Program Files. `karaoke.log` is written beside the
+executable, with a fallback to `%LOCALAPPDATA%\KaraokeApp\logs\` if necessary.
+
+The packaged app preserves the existing `0.0.0.0` binding and unauthenticated
+LAN remote model. Use it only on a trusted private network. Windows Firewall
+must allow the app on private networks for phone remotes. The initial
+executable is unsigned, so Windows SmartScreen may require
+**More info → Run anyway**. The app tries port 8080 and automatically falls
+back through port 8099; the actual URL is always shown in the window.
+
+See `docs/VERSIONING.md` for the project-specific pre-alpha versioning policy.
+The initial public executable release is `v0.0.1`.
+
 ## Shared playback model
 
 - The Flask process keeps the queue and playback state **in memory** in
@@ -149,16 +182,19 @@ Share → **Add to Home Screen**; offline caching still requires HTTPS.
 
 ```
 karaoke_app/
-├── app.py                    # entry point: imports/re-exports create_app, logging, Waitress/dev server
+├── app.py                    # development entry point: create_app, logging, Waitress/dev server
+├── desktop.py                # PyInstaller/development entry point for the Windows GUI
 ├── karaoke/                  # Flask application factory, blueprints, and services
 │   ├── __init__.py           # create_app(), app config, error handlers, request logging
 │   ├── config.py             # compatibility re-export of the application constants
 │   ├── errors.py             # ApiError exception type
 │   ├── catalog.py            # filename parsing, scanning, catalog enrichment
 │   ├── lyrics.py             # word-timing validation and atomic lyric saves
-│   ├── transposition.py      # FFmpeg detection, filter building, transposition runner
+│   ├── transposition.py      # FFmpeg resolution, detection, filter building, runner
 │   ├── http.py               # request/client helpers
 │   ├── logging.py            # console + rotating-file logging
+│   ├── desktop.py            # Tkinter launcher, tray, port fallback, shutdown lifecycle
+│   ├── version.py            # canonical application version and pre-alpha metadata
 │   └── routes/               # pages and media, shared session API, library API, browser logs
 ├── constants.py              # application-wide constants shared with session state
 ├── playback_state.py         # thread-safe in-memory queue, host lifecycle, commands
@@ -193,7 +229,21 @@ karaoke_app/
 │   ├── browser/              # Playwright host, remote, and Lyrics Editor UI tests
 │   └── js/                   # Node unit tests for text/timing reconciliation
 ├── docs/
-│   └── AGENTS.md             # agent handoff and lyric-generation workflow
+│   ├── AGENTS.md             # agent handoff and lyric-generation workflow
+│   ├── VERSIONING.md         # project-specific pre-alpha versioning/release policy
+│   └── WINDOWS_ACCEPTANCE.md # clean-machine and manual release acceptance checklist
+├── packaging/
+│   ├── karaoke-app.spec      # PyInstaller one-folder build definition
+│   ├── build.ps1             # local/CI build and distribution staging
+│   ├── build_assets.py       # icon and Windows version resource generation
+│   ├── copy_licenses.py      # third-party license staging
+│   ├── requirements-desktop.txt
+│   ├── requirements-build.txt
+│   ├── README-DISTRIBUTION.txt
+│   ├── FFMPEG-SOURCE-OFFER.txt
+│   └── release-notes-template.md
+├── .github/workflows/
+│   └── windows-release.yml   # tag-triggered Windows build and pre-release
 ├── pyproject.toml            # Ruff configuration
 ├── pytest.ini
 ├── requirements*.txt         # core, dev, media, lyrics, and optional CUDA groups
@@ -511,6 +561,47 @@ venv\Scripts\python -m pytest -m "not browser"
 Playwright uses an installed Edge, Chrome, or bundled Chromium; if none is
 available, the browser tests skip instead of failing the suite.
 
+## Building the Windows distribution
+
+The Windows build uses native CPython **3.13.9 x64**, PyInstaller 6.22.3
+one-folder packaging, and the same PowerShell script in local builds and GitHub
+Actions. Python 3.14 is supported by the app, but the release build uses 3.13
+because its Tk 8.6 runtime is reliably collected by PyInstaller.
+
+```powershell
+# Use the CPython 3.13.x x64 interpreter for the release build.
+py -3.13 -m venv .venv-build
+.\.venv-build\Scripts\python -m pip install --upgrade pip
+.\.venv-build\Scripts\python -m pip install -r requirements.txt `
+  -r packaging\requirements-desktop.txt `
+  -r packaging\requirements-build.txt pytest ruff
+.\.venv-build\Scripts\python -m pytest -m "not browser"
+node --test tests\js\reconcile.test.js
+.\.venv-build\Scripts\python -m ruff check .
+.\packaging\build.ps1 -Version 0.0.1 -Python .\.venv-build\Scripts\python.exe
+```
+
+`packaging/build.ps1` downloads and checksum-verifies the pinned Gyan FFmpeg
+9.0.2 essentials build, confirms the `rubberband` filter, generates the icon
+and Windows version resource, runs PyInstaller, stages empty media folders
+and license/source notices, verifies the layout, and creates:
+
+```text
+dist/karaoke-app/                         # runnable portable folder
+dist/karaoke-app-v0.0.1-win64.zip        # distribution ZIP
+dist/karaoke-app-v0.0.1-win64.zip.sha256
+```
+
+The build never includes songs, `original_songs/`, lyrics, AI models, CUDA
+libraries, caches, tests, or development tools. The FFmpeg download is cached
+under `packaging/cache/`, and build output is ignored by Git.
+
+The GitHub workflow runs the same script for an authorized `v*` tag and
+publishes a prerelease; ordinary branch pushes do not build or release.
+A clean Windows 11 x64 machine without Python is a required manual acceptance
+test and is not claimed as verified by a local build alone. Use
+`docs/WINDOWS_ACCEPTANCE.md` for the complete manual checklist.
+
 ## Logging & troubleshooting
 
 When started through `python app.py`, the server logs to the terminal **and** to
@@ -541,7 +632,7 @@ Reading the common entries:
 | `WARNING … GET /songs/00002_….mp3 -> 404` | A catalog entry has no file on disk — refresh the page to rescan |
 | `[browser] Audio playback failed … MEDIA_ERR_SRC_NOT_SUPPORTED` | The browser downloaded the file but could not decode it (corrupt/unsupported) |
 | `[browser] Browser blocked playback until the host screen is clicked` | The browser blocked autoplay — click **Enable sound** on the host page once |
-| `ffmpeg: not found on PATH` | Install FFmpeg for on-demand transposition (pre-generated files still play) |
+| `ffmpeg: not found on PATH` | Development build only: install FFmpeg for on-demand transposition. The packaged distribution includes it. |
 | `Transpose failed … rubberband` | Your FFmpeg lacks librubberband — set `KARAOKE_FFMPEG_FILTER` (see above) |
 
 ## Licensing and media
@@ -552,8 +643,12 @@ and any media you add are **not** covered by it and keep their own terms. The
 project is provided "as-is", without warranty. This section is not legal advice.
 
 Third-party components, vendored assets, and their licenses are listed in
-`THIRD_PARTY_NOTICES.md`. FFmpeg and Rubber Band are external programs, not
-bundled; their license terms depend on the build you install.
+`THIRD_PARTY_NOTICES.md`. The portable Windows distribution bundles FFmpeg
+9.0.2 (Gyan Doshi essentials build, GPLv3) with Rubber Band 4.0.0 for on-demand
+pitch shifting. Its GPL license, build README, and source-code offer are
+included in the distribution's `ffmpeg/` folder. The FFmpeg binary is a
+separate executable invoked by the app; the project's own source remains
+MIT-licensed. Review the notices and source links before redistributing.
 
 Songs, instrumentals, and lyrics are **not included**. Do not commit media you
 do not have rights to. LRCLIB is a third-party service; lyrics returned by it
@@ -607,5 +702,7 @@ runtime by `static/background.js`; it contains no third-party visual assets.
 - **Backend modules:** `app.py` is the entry point; Flask blueprints and shared
   services live under `karaoke/`. Keep route handlers thin and put reusable
   behavior in the service modules rather than growing `app.py` again.
-- **CI:** CI is not configured. The project's own code is MIT-licensed (see
+- **CI:** Windows tag builds are defined in
+  `.github/workflows/windows-release.yml`; the workflow publishes a pre-release
+  only for an authorized `v*` tag. The project's own code is MIT-licensed (see
   `LICENSE`).

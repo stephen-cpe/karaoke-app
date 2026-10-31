@@ -38,6 +38,7 @@ def api_events():
         role = "remote"
     client_id = (request.args.get("client_id") or "").strip()[:MAX_CLIENT_ID_LENGTH]
     state = _state()
+    shutdown_event = current_app.extensions.get("shutdown_event")
     subscriber, snapshot = state.subscribe_with_snapshot(role, client_id)
 
     def generate():
@@ -45,12 +46,17 @@ def api_events():
             yield "retry: 3000\n\n"
             yield format_sse("state", snapshot)
             while True:
+                if shutdown_event is not None and shutdown_event.is_set():
+                    break
                 try:
                     event, data = subscriber.events.get(timeout=SSE_KEEPALIVE_SECONDS)
                 except thread_queue.Empty:
                     state.refresh_presence()
                     yield ": keep-alive\n\n"
                     continue
+                if event == "shutdown" or (
+                        shutdown_event is not None and shutdown_event.is_set()):
+                    break
                 yield format_sse(event, data)
         finally:
             state.unsubscribe(subscriber)
@@ -125,6 +131,9 @@ def api_info():
         "player_url": base_url("localhost", port) + "/player",
         "lan_ip": lan_ip,
         "port": port,
+        "version": current_app.config.get("APP_VERSION"),
+        "version_label": current_app.config.get("APP_VERSION_LABEL"),
+        "pre_alpha": current_app.config.get("APP_PRE_ALPHA"),
     })
 
 
