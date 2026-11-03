@@ -9,6 +9,7 @@
   <link rel="stylesheet" href="/static/styles.css" />
   <link rel="stylesheet" href="/static/confirm-dialog.css" />
   <script defer src="/static/confirm-dialog.js"></script>
+  <script defer src="/static/vendor/qrcode-generator.js"></script>
   <script defer src="/static/background.js"></script>
   <script defer src="/static/scripts.js"></script>
 </head>
@@ -65,57 +66,66 @@
   </header>
 
   <main class="app-main">
-    <section class="page-heading" aria-labelledby="library-title">
-      <div>
-        <p class="eyebrow">Your library</p>
-        <h1 id="library-title">Songs</h1>
-        <p class="page-subtitle" id="song-summary">Loading your library…</p>
-      </div>
-      <div class="heading-side">
-        <div class="host-join" id="host-join">
-          <div class="host-join-status">
-            <span class="status-dot" id="host-status-dot" aria-hidden="true"></span>
-            <span id="host-status-text" aria-live="polite">Connecting player…</span>
-          </div>
-          <p class="host-join-label">Phones can join here</p>
-          <div class="host-join-row">
-            <code id="host-join-url">Finding this server…</code>
-            <button class="join-copy" id="copy-join-url" type="button" title="Copy the join link">Copy</button>
-          </div>
-        </div>
-      </div>
-    </section>
-
-    <div class="content-layout">
-      <section class="surface library" aria-labelledby="all-songs-title">
-        <div class="library-toolbar">
-          <h2 id="all-songs-title">All songs</h2>
-          <span class="library-meta">Sorted A–Z</span>
-        </div>
-        <div id="song-list-content" class="song-list" aria-live="polite"></div>
-      </section>
-
-      <aside class="surface queue-panel" aria-labelledby="queue-heading">
-        <div class="queue-header">
+    <div class="page-layout">
+      <div class="page-main">
+        <section class="page-heading" aria-labelledby="library-title">
           <div>
-            <p class="eyebrow">Sing next</p>
-            <h2 id="queue-heading">Up next</h2>
+            <p class="eyebrow">Your library</p>
+            <h1 id="library-title">Songs</h1>
+            <p class="page-subtitle" id="song-summary">Loading your library…</p>
           </div>
-          <div class="queue-header-actions">
-            <span class="queue-summary" id="queue-summary">Empty</span>
-            <button class="queue-clear" id="queue-clear" type="button" hidden>Clear</button>
+        </section>
+
+        <section class="surface library" aria-labelledby="all-songs-title">
+          <div class="library-toolbar">
+            <h2 id="all-songs-title">All songs</h2>
+            <span class="library-meta">Sorted A–Z</span>
+          </div>
+          <div id="song-list-content" class="song-list" aria-live="polite"></div>
+        </section>
+      </div>
+
+      <div class="page-sidebar">
+        <div class="heading-side">
+          <div class="host-join" id="host-join">
+            <div class="host-join-status">
+              <span class="status-dot" id="host-status-dot" aria-hidden="true"></span>
+              <span id="host-status-text" aria-live="polite">Connecting player…</span>
+            </div>
+            <p class="host-join-label">Phones can join here</p>
+            <p class="host-join-note">Connect your phone to the same Wi-Fi or network as this computer, then scan the QR code.</p>
+            <div class="host-join-qr is-placeholder" id="host-join-qr">
+              <span class="host-join-qr-placeholder">QR code will appear when the join address is ready.</span>
+            </div>
+            <div class="host-join-row">
+              <code id="host-join-url">Finding this server…</code>
+              <button class="join-copy" id="copy-join-url" type="button" title="Copy the join link">Copy</button>
+            </div>
           </div>
         </div>
-        <div id="queue-display" class="queue-list" aria-live="polite">
-          <div class="queue-empty">
-            <span class="empty-icon" aria-hidden="true">
-              <svg class="icon"><use href="#icon-queue"></use></svg>
-            </span>
-            <p class="empty-title">Your queue is empty</p>
-            <p class="empty-copy">Add songs from the library and they’ll line up here.</p>
+
+        <aside class="surface queue-panel" aria-labelledby="queue-heading">
+          <div class="queue-header">
+            <div>
+              <p class="eyebrow">Sing next</p>
+              <h2 id="queue-heading">Up next</h2>
+            </div>
+            <div class="queue-header-actions">
+              <span class="queue-summary" id="queue-summary">Empty</span>
+              <button class="queue-clear" id="queue-clear" type="button" hidden>Clear</button>
+            </div>
           </div>
-        </div>
-      </aside>
+          <div id="queue-display" class="queue-list" aria-live="polite">
+            <div class="queue-empty">
+              <span class="empty-icon" aria-hidden="true">
+                <svg class="icon"><use href="#icon-queue"></use></svg>
+              </span>
+              <p class="empty-title">Your queue is empty</p>
+              <p class="empty-copy">Add songs from the library and they’ll line up here.</p>
+            </div>
+          </div>
+        </aside>
+      </div>
     </div>
   </main>
 

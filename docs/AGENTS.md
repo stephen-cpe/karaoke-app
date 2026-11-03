@@ -22,7 +22,8 @@
 - `playback_state.py` — thread-safe in-memory session: queue, host lifecycle,
   presence timeout, ordered host commands, and command acknowledgement.
 - `utils.py` — shared finite-number validation, integer parsing, and log sanitizing.
-- `static/vendor/` — local Bootstrap and WaveSurfer builds plus their license files.
+- `static/vendor/` — local Bootstrap, WaveSurfer, and qrcode-generator builds plus
+  their license files.
 - `requirements*.txt` — core, dev/test, media-helper, lyric-pipeline, and optional
   CUDA dependency groups.
 - `THIRD_PARTY_NOTICES.md` — dependency, asset, and license notes.
@@ -135,16 +136,16 @@
   .\.venv-build\Scripts\python -m pytest -m "not browser"
   node --test tests\js\reconcile.test.js
   .\.venv-build\Scripts\python -m ruff check .
-  .\packaging\build.ps1 -Version 0.0.1 `
+  .\packaging\build.ps1 -Version 0.0.2 `
     -Python .\.venv-build\Scripts\python.exe
   ```
 
   Use the same build script in GitHub Actions. Do not commit `build/`, `dist/`,
   `packaging/cache/`, `packaging/build/`, or downloaded FFmpeg binaries.
 - Versioning and release authorization follow `docs/VERSIONING.md`. The
-  initial public executable release is `v0.0.1`, marked as a prerelease; never
-  promote to `1.0.0` or publish a release without the maintainer's explicit
-  decision.
+  initial public executable release was `v0.0.1`; the current planned pre-alpha
+  release is `v0.0.2`. Never promote to `1.0.0` or publish a release without the
+  maintainer's explicit decision.
 - Complete `docs/WINDOWS_ACCEPTANCE.md` on a clean Windows 11 x64 machine
   before declaring a release ready. Automated tests and a local build do not
   satisfy that clean-machine requirement.
@@ -163,11 +164,12 @@
   licensing or asset ownership without explicit user approval.
 - Versioning and release policy are documented in `docs/VERSIONING.md`. Keep
   `karaoke/version.py`, the executable metadata, the GUI label, and release
-  tags in sync. The initial public executable release is `v0.0.1`; do not
-  promote the project to `1.0.0` or publish a release without the maintainer's
-  explicit decision.
+  tags in sync. The initial public executable release was `v0.0.1`; the current
+  planned pre-alpha release is `v0.0.2`. Do not promote the project to `1.0.0`
+  or publish a release without the maintainer's explicit decision.
 - The Lyrics Editor loads Bootstrap and WaveSurfer from `static/vendor/`; the host
-  and remote use custom CSS. Do not reintroduce CDN or Google Fonts links.
+  and remote use custom CSS. The host player also loads the vendored
+  qrcode-generator. Do not reintroduce CDN or Google Fonts links.
 
 ## Adding lyrics for new songs
 

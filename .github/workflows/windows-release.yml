@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: "Existing release tag to publish (for example v0.0.1)."
+        description: "Existing release tag to publish (for example v0.0.2)."
         required: true
         type: string
 
@@ -41,7 +41,7 @@ jobs:
           }
           $tag = $tag.Trim()
           if ($tag -notmatch '^v\d+\.\d+\.\d+$') {
-            throw "Invalid release tag '$tag'; expected an existing tag such as v0.0.1."
+            throw "Invalid release tag '$tag'; expected an existing tag such as v0.0.2."
           }
 
           $tagCommit = (& git rev-parse "refs/tags/$tag^{commit}" 2>$null).Trim()

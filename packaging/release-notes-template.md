@@ -21,7 +21,8 @@ private network as the player computer.
 ## Included
 
 - Windows x64 desktop launcher and local Flask/Waitress player server.
-- Player, phone remote, queue management, synced lyrics, and pitch shifting.
+- Player with a locally generated phone-join QR code, touch-friendly phone
+  remote queue reordering, synced lyrics, and pitch shifting.
 - Bundled FFmpeg 9.0.2 essentials build with librubberband support.
 - Empty `songs/`, `lyrics/`, and `transposed/` folders beside the executable.
 

@@ -9,9 +9,9 @@ your voice.
 > **Project status:** This is a personal, experimental, educational hobby
 > project, not a product. It is **very early pre-alpha** software: behavior and
 > file layouts may change, and it is provided **as-is, with no warranty** and no
-> support commitment. The initial public portable executable release is
-> **v0.0.1 (PRE-ALPHA)**. See `docs/VERSIONING.md` and
-> [Licensing and media](#licensing-and-media).
+> support commitment. The initial public portable executable release was
+> **v0.0.1 (PRE-ALPHA)**; the next planned release is **v0.0.2 (PRE-ALPHA)**.
+> See `docs/VERSIONING.md` and [Licensing and media](#licensing-and-media).
 
 ## What is not included
 
@@ -29,7 +29,10 @@ drag-and-drop copy of the working tree, because it still contains the media.
   phone remote stays live over Server-Sent Events (SSE) with polling as a fallback
 - **Phone remote and installable PWA** — now playing, progress, the current lyric
   line with word highlighting, song search, queue add/remove/reorder/clear, pause,
-  skip, restart, seek, key, and volume, with no audio element on the remote page
+  skip, restart, seek, key, and volume, with no audio element on the remote page.
+  Queue rows also support touch-friendly press-and-hold drag reordering
+- **Easy phone joining** — the host player shows a locally generated QR code and
+  copyable join URL for phones on the same network, with no online QR service
 - **Song catalog scanned live** from the `songs/` folder — no manual list to maintain
 - Live search, one-click queueing, and an always-visible **Up next** panel
 - **Synced lyrics with word-by-word highlighting**, displayed full-screen over a
@@ -151,7 +154,8 @@ executable is unsigned, so Windows SmartScreen may require
 back through port 8099; the actual URL is always shown in the window.
 
 See `docs/VERSIONING.md` for the project-specific pre-alpha versioning policy.
-The initial public executable release is `v0.0.1`.
+The initial public executable release was `v0.0.1`; the next planned release is
+`v0.0.2`.
 
 ## Shared playback model
 
@@ -579,7 +583,7 @@ py -3.13 -m venv .venv-build
 .\.venv-build\Scripts\python -m pytest -m "not browser"
 node --test tests\js\reconcile.test.js
 .\.venv-build\Scripts\python -m ruff check .
-.\packaging\build.ps1 -Version 0.0.1 -Python .\.venv-build\Scripts\python.exe
+.\packaging\build.ps1 -Version 0.0.2 -Python .\.venv-build\Scripts\python.exe
 ```
 
 `packaging/build.ps1` downloads and checksum-verifies the pinned Gyan FFmpeg
@@ -589,8 +593,8 @@ and license/source notices, verifies the layout, and creates:
 
 ```text
 dist/karaoke-app/                         # runnable portable folder
-dist/karaoke-app-v0.0.1-win64.zip        # distribution ZIP
-dist/karaoke-app-v0.0.1-win64.zip.sha256
+dist/karaoke-app-v0.0.2-win64.zip        # distribution ZIP
+dist/karaoke-app-v0.0.2-win64.zip.sha256
 ```
 
 The build never includes songs, `original_songs/`, lyrics, AI models, CUDA

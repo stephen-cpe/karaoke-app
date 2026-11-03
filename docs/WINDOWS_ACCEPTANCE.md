@@ -25,7 +25,7 @@ Python installed before declaring the release ready.
 - [ ] Confirm a startup/status window appears with meaningful status text and
       the dark charcoal launcher theme.
 - [ ] Confirm the main window displays `KARAOKE APP`,
-      `Version: 0.0.1 (PRE-ALPHA)`, `Status: Running`, the local player URL,
+      `Version: 0.0.2 (PRE-ALPHA)`, `Status: Running`, the local player URL,
       and the detected LAN URLs, with light text on a dark background and
       readable accent buttons.
 - [ ] Confirm the active Windows title bar is dark where the installed Windows
@@ -95,9 +95,9 @@ Python installed before declaring the release ready.
 
 - [ ] Compare the GUI label, `karaoke-app.exe` FileVersion/ProductVersion,
       `README-DISTRIBUTION.txt`, and the release tag. All must identify
-      `0.0.1 (PRE-ALPHA)` / `v0.0.1`.
+      `0.0.2 (PRE-ALPHA)` / `v0.0.2`.
 - [ ] Confirm the GitHub Release is marked as a pre-release and titled
-      `Karaoke App v0.0.1`.
+      `Karaoke App v0.0.2`.
 - [ ] Confirm the ZIP checksum matches the published `.sha256` asset.
 - [ ] Confirm no songs, `original_songs/`, `.srt`, `.words.json`, AI models,
       caches, development tools, or personal data are in the ZIP.

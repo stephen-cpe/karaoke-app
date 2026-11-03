@@ -367,8 +367,8 @@ body.has-song .app-main {
 }
 
 .host-join {
-  width: min(100%, 360px);
-  padding: 12px 14px;
+  width: min(100%, 320px);
+  padding: 11px 13px;
   border: 1px solid var(--border);
   border-radius: 14px;
   background: rgba(24, 24, 24, 0.82);
@@ -420,6 +420,48 @@ body.has-song .app-main {
   text-transform: uppercase;
 }
 
+.host-join-note {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 11.5px;
+  line-height: 1.45;
+}
+
+.host-join-qr {
+  width: min(100%, 144px);
+  aspect-ratio: 1;
+  margin: 9px auto 10px;
+  padding: 6px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 10px;
+  background: #fff;
+  box-shadow: 0 8px 22px rgba(0, 0, 0, 0.28);
+}
+
+.host-join-qr svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+  shape-rendering: crispEdges;
+}
+
+.host-join-qr.is-placeholder {
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  border: 1px dashed rgba(255, 255, 255, 0.16);
+  background: rgba(255, 255, 255, 0.035);
+  box-shadow: none;
+}
+
+.host-join-qr-placeholder {
+  max-width: 24ch;
+  color: var(--text-tertiary);
+  font-size: 11.5px;
+  line-height: 1.5;
+  text-align: center;
+}
+
 .host-join-row {
   display: flex;
   align-items: center;
@@ -456,11 +498,22 @@ body.has-song .app-main {
   color: #0f0f0f;
 }
 
-.content-layout {
+.page-layout {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 340px;
   gap: 24px;
   align-items: start;
+}
+
+.page-main {
+  min-width: 0;
+}
+
+.page-sidebar {
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+  min-width: 0;
 }
 
 .surface {
@@ -1548,24 +1601,45 @@ body:not(.has-song) .key-control {
     gap: 16px;
   }
 
-  .content-layout {
+  .page-layout {
     grid-template-columns: minmax(0, 1fr) 310px;
   }
 }
 
 @media (max-width: 1000px) {
-  .content-layout {
-    grid-template-columns: minmax(0, 1fr);
+  .page-layout {
+    display: flex;
+    flex-direction: column;
+    gap: 18px;
+  }
+
+  .page-main,
+  .page-sidebar {
+    display: contents;
+  }
+
+  .page-heading {
+    order: 1;
+    margin-bottom: 0;
+  }
+
+  .heading-side {
+    order: 2;
+    align-items: stretch;
+  }
+
+  .library {
+    order: 3;
+  }
+
+  .queue-panel {
+    order: 4;
   }
 
   .queue-panel,
   body.has-song .queue-panel {
     position: static;
     max-height: 460px;
-  }
-
-  .page-heading {
-    align-items: flex-start;
   }
 }
 
@@ -1633,7 +1707,7 @@ body:not(.has-song) .key-control {
   }
 
   .page-heading {
-    margin-bottom: 18px;
+    margin-bottom: 0;
   }
 
   .page-heading h1 {

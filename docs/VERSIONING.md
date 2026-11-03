@@ -70,6 +70,20 @@ There is no independently maintained version in the GUI or CI workflow.
 7. GitHub Releases remain pre-releases until the maintainer explicitly
    authorizes a stable release.
 
+## Next planned pre-alpha release
+
+- Version: `0.0.2`
+- Tag: `v0.0.2`
+- Release title: `Karaoke App v0.0.2`
+- Mark as a GitHub pre-release.
+- Label it as an early pre-alpha build.
+- Focus: touch-friendly phone-remote queue reordering, the host-player join QR
+  code, and compact host layout improvements.
+- Include a disclaimer that bugs, incomplete functionality, and unexpected
+  behavior are possible.
+- Attach the Windows x64 ZIP and its SHA-256 checksum.
+- Do not include copyrighted media, source AI models, caches, or personal data.
+
 ## Initial public executable release
 
 - Tag: `v0.0.1`

@@ -58,6 +58,7 @@ let autoSkipTimer = null;
 let transposeBusy = false;
 let transposeBusyToken = 0;
 let hostNoticeTimer = null;
+let joinUrlObserver = null;
 let queueRenderKey = "";
 let transposeRenderKey = "";
 let lyricsRequestToken = 0;
@@ -139,6 +140,7 @@ const durationTimeEl = document.getElementById("duration-time");
 const hostStatusDot = document.getElementById("host-status-dot");
 const hostStatusText = document.getElementById("host-status-text");
 const hostJoinUrl = document.getElementById("host-join-url");
+const hostJoinQr = document.getElementById("host-join-qr");
 const copyJoinUrlButton = document.getElementById("copy-join-url");
 const hostOverlay = document.getElementById("host-overlay");
 const hostOverlayTitle = document.getElementById("host-overlay-title");
@@ -166,6 +168,76 @@ function makeIcon(name, className = "") {
   use.setAttribute("href", "#icon-" + name);
   svg.appendChild(use);
   return svg;
+}
+
+function setJoinQrPlaceholder(message = "QR code will appear when the join address is ready.") {
+  if (!hostJoinQr) return;
+  hostJoinQr.classList.add("is-placeholder");
+  hostJoinQr.removeAttribute("role");
+  hostJoinQr.removeAttribute("aria-label");
+  delete hostJoinQr.dataset.joinUrl;
+
+  const current = hostJoinQr.firstElementChild;
+  if (hostJoinQr.childElementCount === 1 && current &&
+      current.classList.contains("host-join-qr-placeholder") &&
+      current.textContent === message) {
+    return;
+  }
+  hostJoinQr.replaceChildren(
+    makeElement("span", "host-join-qr-placeholder", message));
+}
+
+function updateJoinQr(value) {
+  if (!hostJoinQr) return;
+
+  const url = String(value || "").trim();
+  if (!url || /^Finding this server/i.test(url)) {
+    setJoinQrPlaceholder();
+    return;
+  }
+
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      throw new Error("Unsupported join URL protocol.");
+    }
+  } catch {
+    setJoinQrPlaceholder();
+    return;
+  }
+
+  if (hostJoinQr.dataset.joinUrl === url && hostJoinQr.querySelector("svg")) {
+    return;
+  }
+  if (typeof window.qrcode !== "function") {
+    setJoinQrPlaceholder("QR code unavailable. Use the address below.");
+    return;
+  }
+
+  try {
+    const qr = window.qrcode(0, "M");
+    qr.addData(url);
+    qr.make();
+    const markup = qr.createSvgTag({
+      cellSize: 8,
+      margin: 32,
+      scalable: true,
+      alt: "QR code for the phone join address"
+    });
+    const template = document.createElement("template");
+    template.innerHTML = markup;
+    const svg = template.content.firstElementChild;
+    if (!svg) throw new Error("QR code markup was empty.");
+
+    hostJoinQr.classList.remove("is-placeholder");
+    hostJoinQr.replaceChildren(svg);
+    hostJoinQr.dataset.joinUrl = url;
+    hostJoinQr.setAttribute("role", "img");
+    hostJoinQr.setAttribute("aria-label", `QR code for the join address ${url}`);
+  } catch (err) {
+    console.warn("Could not draw the join QR code:", err);
+    setJoinQrPlaceholder("QR code unavailable. Use the address below.");
+  }
 }
 
 function pluralize(count, singular, plural = singular + "s") {
@@ -1918,6 +1990,18 @@ if (hostReloadButton) {
 
 // --- STARTUP --------------------------------------------------------------
 
+if (hostJoinUrl) {
+  updateJoinQr(hostJoinUrl.textContent);
+  joinUrlObserver = new MutationObserver(() => {
+    updateJoinQr(hostJoinUrl.textContent);
+  });
+  joinUrlObserver.observe(hostJoinUrl, {
+    childList: true,
+    characterData: true,
+    subtree: true
+  });
+}
+
 fetch("/api/info", { cache: "no-store" })
   .then(res => res.ok ? res.json() : null)
   .then(info => {
@@ -1925,12 +2009,14 @@ fetch("/api/info", { cache: "no-store" })
     const joinUrl = info.join_url || `${location.protocol}//${location.hostname}:${info.port || location.port}`;
     hostJoinUrl.textContent = joinUrl;
     hostJoinUrl.title = joinUrl;
+    updateJoinQr(joinUrl);
   })
   .catch(() => {
     if (hostJoinUrl) {
       const fallback = `${location.protocol}//${location.hostname}:${location.port}`;
       hostJoinUrl.textContent = fallback;
       hostJoinUrl.title = fallback;
+      updateJoinQr(fallback);
     }
   });
 
