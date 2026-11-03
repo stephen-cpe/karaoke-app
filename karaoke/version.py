@@ -7,7 +7,7 @@ silently drift apart.
 from __future__ import annotations
 
 APP_NAME = "KARAOKE APP"
-__version__ = "0.0.1"
+__version__ = "0.0.2"
 IS_PRE_ALPHA = True
 
 

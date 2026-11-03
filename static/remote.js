@@ -24,6 +24,10 @@
   const SSE_RETRY_MAX_MS = 15000;
   const POLL_INTERVAL_MS = 2500;
   const HEARTBEAT_INTERVAL_MS = 4000;
+  const QUEUE_LONG_PRESS_MS = 420;
+  const QUEUE_LONG_PRESS_SLOP_PX = 10;
+  const QUEUE_AUTOSCROLL_EDGE_PX = 88;
+  const QUEUE_AUTOSCROLL_MAX_PX = 18;
 
   // --- DOM ---------------------------------------------------------------
   const ui = {
@@ -110,6 +114,24 @@
   let lastVolumeValue = null;
   let lastVolumeAt = 0;
   const addPending = new Set();
+
+  const queueDrag = {
+    pending: false,
+    active: false,
+    pointerId: null,
+    row: null,
+    ghost: null,
+    indicator: null,
+    fromIndex: -1,
+    toIndex: -1,
+    startX: 0,
+    startY: 0,
+    pointerY: 0,
+    grabOffsetY: 0,
+    rowHeight: 0,
+    timer: null,
+    frame: null
+  };
 
   // Library / tabs / PWA
   let songs = [];
@@ -232,6 +254,7 @@
     hadNetworkError = true;
     live = false;
     closeEvents();
+    cancelQueueDrag();
     stopPlaybackLoop();
     updateConnectionUI();
     renderTransport();
@@ -1060,6 +1083,9 @@
 
   function renderQueue() {
     if (!ui.queueList) return;
+    // Keep the rows stable while a finger is holding or dragging one. The
+    // queue state still updates; the next render picks up the latest order.
+    if (queueDrag.pending || queueDrag.active) return;
     lastQueueSignature = queueFingerprint();
     ui.queueList.replaceChildren();
 
@@ -1074,6 +1100,7 @@
 
     queue.forEach((song, index) => {
       const row = makeElement("div", "queue-row");
+      row.dataset.queueIndex = String(index);
       row.append(makeElement("span", "queue-index", String(index + 1).padStart(2, "0")));
 
       const copy = makeElement("div", "queue-copy");
@@ -1127,6 +1154,278 @@
     const target = index + delta;
     if (target < 0 || target >= queue.length) return;
     runQueueAction("reorder", { from: index, to: target }, "Could not reorder the queue.");
+  }
+
+  function clearQueueLongPressTimer() {
+    if (queueDrag.timer === null) return;
+    clearTimeout(queueDrag.timer);
+    queueDrag.timer = null;
+  }
+
+  function beginQueueLongPress(event) {
+    if (queueDrag.pending || queueDrag.active) return;
+    if (event.isPrimary === false) return;
+    if (event.pointerType === "mouse" && event.button !== 0) return;
+    if (queueBusy || !reachable) return;
+
+    const queue = shared ? shared.queue : [];
+    if (queue.length < 2) return;
+
+    const target = event.target;
+    if (!target || typeof target.closest !== "function") return;
+    if (target.closest("button, a, input, select, textarea")) return;
+
+    const row = target.closest(".queue-row");
+    if (!row || !ui.queueList || !ui.queueList.contains(row)) return;
+
+    const index = Number(row.dataset.queueIndex);
+    if (!Number.isInteger(index) || index < 0 || index >= queue.length) return;
+
+    queueDrag.pending = true;
+    queueDrag.pointerId = event.pointerId;
+    queueDrag.row = row;
+    queueDrag.fromIndex = index;
+    queueDrag.toIndex = index;
+    queueDrag.startX = event.clientX;
+    queueDrag.startY = event.clientY;
+    queueDrag.pointerY = event.clientY;
+    queueDrag.timer = setTimeout(startQueueDrag, QUEUE_LONG_PRESS_MS);
+  }
+
+  function startQueueDrag() {
+    queueDrag.timer = null;
+    if (!queueDrag.pending || queueDrag.active) return;
+
+    const row = queueDrag.row;
+    const queue = shared ? shared.queue : [];
+    if (!row || !row.isConnected || queueBusy || !reachable ||
+        queueDrag.fromIndex < 0 || queueDrag.fromIndex >= queue.length) {
+      cancelQueueDrag();
+      return;
+    }
+
+    const rect = row.getBoundingClientRect();
+    if (!rect.width || !rect.height) {
+      cancelQueueDrag();
+      return;
+    }
+
+    queueDrag.pending = false;
+    queueDrag.active = true;
+    queueDrag.toIndex = queueDrag.fromIndex;
+    queueDrag.rowHeight = rect.height;
+    queueDrag.grabOffsetY = clamp(queueDrag.startY - rect.top, 0, rect.height);
+    queueDrag.pointerY = queueDrag.startY;
+
+    const ghost = row.cloneNode(true);
+    ghost.classList.add("queue-drag-ghost");
+    ghost.classList.remove("is-drag-origin");
+    ghost.removeAttribute("data-queue-index");
+    ghost.setAttribute("aria-hidden", "true");
+    ghost.style.left = `${rect.left}px`;
+    ghost.style.top = `${rect.top}px`;
+    ghost.style.width = `${rect.width}px`;
+    ghost.style.height = `${rect.height}px`;
+    document.body.appendChild(ghost);
+    queueDrag.ghost = ghost;
+
+    row.classList.add("is-drag-origin");
+    row.setAttribute("aria-grabbed", "true");
+    if (ui.queueList) ui.queueList.classList.add("is-reordering");
+    document.body.classList.add("is-reordering-queue");
+
+    const indicator = makeElement("div", "queue-drop-indicator");
+    indicator.setAttribute("aria-hidden", "true");
+    if (ui.queueList) ui.queueList.appendChild(indicator);
+    queueDrag.indicator = indicator;
+
+    try {
+      row.setPointerCapture(queueDrag.pointerId);
+    } catch {
+      // Synthetic pointers and older browsers may not support capture.
+    }
+
+    updateQueueDropTarget();
+    queueDrag.frame = requestAnimationFrame(queueDragTick);
+  }
+
+  function updateQueueDropTarget() {
+    if (!queueDrag.active || !ui.queueList) return;
+
+    const rows = Array.from(ui.queueList.querySelectorAll(".queue-row"));
+    if (!rows.length) return;
+
+    const ghostCenter = queueDrag.pointerY - queueDrag.grabOffsetY +
+      queueDrag.rowHeight / 2;
+    let target = queueDrag.fromIndex;
+
+    const originRect = rows[queueDrag.fromIndex].getBoundingClientRect();
+    const originMidpoint = originRect.top + originRect.height / 2;
+
+    if (ghostCenter < originMidpoint) {
+      // Moving up: use the first row the ghost has crossed. Scanning from the
+      // top means later iterations must not overwrite the higher target.
+      for (let index = 0; index < queueDrag.fromIndex; index += 1) {
+        const rect = rows[index].getBoundingClientRect();
+        if (ghostCenter < rect.top + rect.height / 2) {
+          target = index;
+          break;
+        }
+      }
+    } else {
+      // Moving down: use the last row the ghost has crossed.
+      for (let index = queueDrag.fromIndex + 1; index < rows.length; index += 1) {
+        const rect = rows[index].getBoundingClientRect();
+        if (ghostCenter > rect.top + rect.height / 2) target = index;
+      }
+    }
+
+    target = clamp(target, 0, rows.length - 1);
+    queueDrag.toIndex = target;
+
+    const indicator = queueDrag.indicator;
+    const targetRow = rows[target];
+    if (!indicator || !targetRow) return;
+
+    indicator.hidden = false;
+    const listRect = ui.queueList.getBoundingClientRect();
+    const targetRect = targetRow.getBoundingClientRect();
+    const top = target <= queueDrag.fromIndex
+      ? targetRect.top - listRect.top
+      : targetRect.bottom - listRect.top;
+    indicator.style.top = `${Math.round(top - 1)}px`;
+  }
+
+  function queueDragTick() {
+    queueDrag.frame = null;
+    if (!queueDrag.active) return;
+
+    const viewport = window.innerHeight || document.documentElement.clientHeight;
+    const edge = Math.min(
+      QUEUE_AUTOSCROLL_EDGE_PX,
+      Math.max(56, viewport * 0.16));
+    let delta = 0;
+
+    if (queueDrag.pointerY < edge) {
+      const ratio = Math.min(1, (edge - queueDrag.pointerY) / edge);
+      delta = -Math.max(2, Math.round(ratio * QUEUE_AUTOSCROLL_MAX_PX));
+    } else if (queueDrag.pointerY > viewport - edge) {
+      const ratio = Math.min(
+        1, (queueDrag.pointerY - (viewport - edge)) / edge);
+      delta = Math.max(2, Math.round(ratio * QUEUE_AUTOSCROLL_MAX_PX));
+    }
+
+    if (delta) {
+      const before = window.scrollY;
+      window.scrollBy(0, delta);
+      if (window.scrollY !== before) updateQueueDropTarget();
+    }
+
+    queueDrag.frame = requestAnimationFrame(queueDragTick);
+  }
+
+  function queueDragPointerMove(event) {
+    if (!queueDrag.pending && !queueDrag.active) return;
+    if (queueDrag.pointerId !== null && event.pointerId !== queueDrag.pointerId) return;
+
+    if (queueDrag.pending) {
+      const dx = event.clientX - queueDrag.startX;
+      const dy = event.clientY - queueDrag.startY;
+      if (Math.hypot(dx, dy) > QUEUE_LONG_PRESS_SLOP_PX) cancelQueueDrag();
+      return;
+    }
+
+    if (!queueDrag.active) return;
+    queueDrag.pointerY = event.clientY;
+    if (queueDrag.ghost) {
+      queueDrag.ghost.style.top = `${event.clientY - queueDrag.grabOffsetY}px`;
+    }
+    updateQueueDropTarget();
+  }
+
+  function finishQueueDragPointer(event) {
+    if (queueDrag.pointerId !== null && event.pointerId !== queueDrag.pointerId) return;
+    if (queueDrag.pending && !queueDrag.active) {
+      cancelQueueDrag();
+      return;
+    }
+    if (!queueDrag.active) return;
+
+    const from = queueDrag.fromIndex;
+    const to = queueDrag.toIndex;
+    const shouldReorder = to !== from && !queueBusy && reachable;
+    stopQueueDrag();
+
+    if (shouldReorder) {
+      runQueueAction("reorder", { from, to }, "Could not reorder the queue.");
+    } else {
+      renderQueue();
+    }
+  }
+
+  function queueDragPointerCancel(event) {
+    if (queueDrag.pointerId !== null && event.pointerId !== queueDrag.pointerId) return;
+    cancelQueueDrag();
+  }
+
+  function stopQueueDrag() {
+    const wasActive = queueDrag.active;
+    clearQueueLongPressTimer();
+
+    if (queueDrag.frame !== null) {
+      cancelAnimationFrame(queueDrag.frame);
+      queueDrag.frame = null;
+    }
+
+    const row = queueDrag.row;
+    const pointerId = queueDrag.pointerId;
+    if (row) {
+      row.classList.remove("is-drag-origin");
+      row.removeAttribute("aria-grabbed");
+      if (pointerId !== null) {
+        try {
+          if (row.hasPointerCapture(pointerId)) row.releasePointerCapture(pointerId);
+        } catch {
+          // The pointer may already be gone.
+        }
+      }
+    }
+
+    if (queueDrag.ghost) queueDrag.ghost.remove();
+    if (queueDrag.indicator) queueDrag.indicator.remove();
+    if (ui.queueList) ui.queueList.classList.remove("is-reordering");
+    document.body.classList.remove("is-reordering-queue");
+
+    queueDrag.pending = false;
+    queueDrag.active = false;
+    queueDrag.pointerId = null;
+    queueDrag.row = null;
+    queueDrag.ghost = null;
+    queueDrag.indicator = null;
+    queueDrag.fromIndex = -1;
+    queueDrag.toIndex = -1;
+    queueDrag.startX = 0;
+    queueDrag.startY = 0;
+    queueDrag.pointerY = 0;
+    queueDrag.grabOffsetY = 0;
+    queueDrag.rowHeight = 0;
+
+    return wasActive;
+  }
+
+  function cancelQueueDrag() {
+    const wasActive = stopQueueDrag();
+    if (wasActive || lastQueueSignature !== queueFingerprint()) renderQueue();
+  }
+
+  function preventQueueDragTouchScroll(event) {
+    if (!queueDrag.active) return;
+    if (event.cancelable) event.preventDefault();
+  }
+
+  function suppressQueueDragContextMenu(event) {
+    if (!queueDrag.pending && !queueDrag.active) return;
+    event.preventDefault();
   }
 
   async function clearQueue() {
@@ -1599,6 +1898,17 @@
     if (ui.clearQueue) ui.clearQueue.addEventListener("click", clearQueue);
     if (ui.stopClear) ui.stopClear.addEventListener("click", stopAndClear);
 
+    if (ui.queueList) {
+      ui.queueList.addEventListener("pointerdown", beginQueueLongPress);
+      ui.queueList.addEventListener(
+        "touchmove", preventQueueDragTouchScroll, { passive: false });
+      ui.queueList.addEventListener("contextmenu", suppressQueueDragContextMenu);
+    }
+    window.addEventListener("pointermove", queueDragPointerMove);
+    window.addEventListener("pointerup", finishQueueDragPointer);
+    window.addEventListener("pointercancel", queueDragPointerCancel);
+    window.addEventListener("blur", cancelQueueDrag);
+
     if (ui.searchInput) {
       ui.searchInput.addEventListener("input", () => {
         searchQuery = ui.searchInput.value.trim();
@@ -1660,6 +1970,7 @@
 
     document.addEventListener("visibilitychange", () => {
       if (document.hidden) {
+        cancelQueueDrag();
         stopPlaybackLoop();
         return;
       }

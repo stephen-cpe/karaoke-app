@@ -33,7 +33,7 @@ if (-not $Version) {
 }
 $Version = $Version.Trim() -replace '^[vV]', ''
 if ($Version -notmatch '^\d+\.\d+\.\d+$') {
-    throw "Invalid version '$Version'. Use a value such as 0.0.1 or v0.0.1."
+    throw "Invalid version '$Version'. Use a value such as 0.0.2 or v0.0.2."
 }
 if ($Version -ne $SourceVersion) {
     throw "Version '$Version' does not match karaoke/version.py ('$SourceVersion')."
@@ -167,6 +167,8 @@ $required = @(
     (Join-Path $StageDir "_internal\static\remote.js"),
     (Join-Path $StageDir "_internal\static\sync_editor.js"),
     (Join-Path $StageDir "_internal\static\vendor\wavesurfer.min.js"),
+    (Join-Path $StageDir "_internal\static\vendor\qrcode-generator.js"),
+    (Join-Path $StageDir "_internal\static\vendor\qrcode-generator.LICENSE.txt"),
     (Join-Path $StageDir "_internal\static\manifest.webmanifest")
 )
 foreach ($Path in $required) {

@@ -14,17 +14,17 @@ from karaoke import desktop, transposition, version
 
 
 def test_version_label_and_config(app):
-    assert version.__version__ == "0.0.1"
-    assert version.version_label() == "0.0.1 (PRE-ALPHA)"
-    assert app.config["APP_VERSION"] == "0.0.1"
-    assert app.config["APP_VERSION_LABEL"] == "0.0.1 (PRE-ALPHA)"
+    assert version.__version__ == "0.0.2"
+    assert version.version_label() == "0.0.2 (PRE-ALPHA)"
+    assert app.config["APP_VERSION"] == "0.0.2"
+    assert app.config["APP_VERSION_LABEL"] == "0.0.2 (PRE-ALPHA)"
     assert app.config["APP_PRE_ALPHA"] is True
 
 
 def test_info_endpoint_exposes_version(client):
     info = client.get("/api/info").get_json()
-    assert info["version"] == "0.0.1"
-    assert info["version_label"] == "0.0.1 (PRE-ALPHA)"
+    assert info["version"] == "0.0.2"
+    assert info["version_label"] == "0.0.2 (PRE-ALPHA)"
     assert info["pre_alpha"] is True
 
 

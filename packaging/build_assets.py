@@ -16,7 +16,7 @@ def parse_version(value: str) -> tuple[int, int, int]:
         text = text[1:]
     parts = text.split(".")
     if len(parts) != 3 or not all(part.isdigit() for part in parts):
-        raise SystemExit(f"Invalid version {value!r}; expected v0.0.1 or 0.0.1")
+        raise SystemExit(f"Invalid version {value!r}; expected v0.0.2 or 0.0.2")
     return tuple(int(part) for part in parts)  # type: ignore[return-value]
 
 

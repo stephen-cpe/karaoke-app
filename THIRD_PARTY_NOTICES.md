@@ -59,8 +59,11 @@ weights or a prebuilt environment.
 |---|---|---|---|
 | Bootstrap CSS | 5.3.3 | MIT | `static/vendor/bootstrap.LICENSE.txt` |
 | WaveSurfer.js | 7.12.12 | BSD-3-Clause | `static/vendor/wavesurfer.LICENSE.txt` |
+| qrcode-generator | 1.4.4 | MIT | `static/vendor/qrcode-generator.LICENSE.txt` |
 
 These files are served locally so the web UI does not need a CDN or Google Fonts.
+The host player uses qrcode-generator to draw the phone join QR code locally and
+offline.
 
 ## External programs and services
 
