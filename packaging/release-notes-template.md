@@ -51,11 +51,11 @@ personal data are not included. Add only media you have the right to use.
 
 The project source is MIT-licensed. Third-party components retain their own
 licenses. See `LICENSE`, `THIRD_PARTY_NOTICES.md`, `licenses/`, and
-`ffmpeg/README.txt`/`ffmpeg/SOURCE-OFFER.txt` in the distribution.
+`ffmpeg/README.txt`/`ffmpeg/FFMPEG-SOURCE-OFFER.txt` in the distribution.
 
 ## Verification scope
 
-The packaged application has been built and tested in the project's available
-Windows environment. A clean Windows 11 machine without Python installed
-remains a required manual acceptance test. See the repository documentation
-for the full acceptance checklist.
+The packaging build has been acceptance-tested on a clean Windows 11 x64
+machine without Python or FFmpeg installed. The latest dark-mode refinement
+still requires a final visual check on the target machine. See the repository
+documentation for the full acceptance checklist.

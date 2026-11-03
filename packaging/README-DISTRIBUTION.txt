@@ -89,4 +89,4 @@ LICENSES
 The project source is MIT-licensed. Third-party components and assets retain
 their own licenses. See LICENSE and THIRD_PARTY_NOTICES.md, the licenses/
 folder, and the ffmpeg/ folder. FFmpeg and Rubber Band source links and build
-information are included in ffmpeg/SOURCE-OFFER.txt and ffmpeg/README.txt.
+information are included in ffmpeg/FFMPEG-SOURCE-OFFER.txt and ffmpeg/README.txt.
