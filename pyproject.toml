@@ -4,6 +4,13 @@ target-version = "py313"
 exclude = [
   ".git",
   ".pytest_cache",
+  ".python313",
+  ".venv",
+  ".venv-build",
+  "build",
+  "dist",
+  "packaging/build",
+  "packaging/cache",
   "tools/.cache",
   "venv",
   "static/vendor",

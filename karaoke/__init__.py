@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import logging as stdlib_logging
 import os
+import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -21,10 +23,23 @@ from karaoke.config import (
 from karaoke.errors import ApiError
 from karaoke.logging import logger, setup_logging
 from karaoke.routes import register_blueprints
+from karaoke.version import APP_NAME, IS_PRE_ALPHA, __version__, version_label
 from playback_state import PlaybackError, PlaybackState
 from utils import single_line
 
 _EDITOR_ENV_VAR = "KARAOKE_EDITOR"
+
+
+def _resource_root() -> Path:
+    """Return the root containing bundled templates and static assets.
+
+    PyInstaller one-folder builds set ``sys._MEIPASS`` to the internal
+    bundle directory.  User media always lives beside the executable, so it
+    must not use this helper.
+    """
+    if getattr(sys, "frozen", False) and getattr(sys, "_MEIPASS", None):
+        return Path(sys._MEIPASS)
+    return Path(__file__).resolve().parent.parent
 
 
 def _env_flag(name: str) -> bool:
@@ -37,7 +52,7 @@ def create_app(songs_dir: Any = "songs", lyrics_dir: Any = "lyrics",
                enable_editor: bool | None = None) -> Flask:
     if enable_editor is None:
         enable_editor = _env_flag(_EDITOR_ENV_VAR)
-    project_root = Path(__file__).resolve().parent.parent
+    project_root = _resource_root()
     app = Flask(
         __name__,
         template_folder=str(project_root / "templates"),
@@ -57,10 +72,17 @@ def create_app(songs_dir: Any = "songs", lyrics_dir: Any = "lyrics",
         FFMPEG_FILTER=DEFAULT_FFMPEG_FILTER,
         FFMPEG_TIMEOUT_SECONDS=FFMPEG_TIMEOUT_SECONDS,
         ENABLE_EDITOR=bool(enable_editor),
+        APP_NAME=APP_NAME,
+        APP_VERSION=__version__,
+        APP_VERSION_LABEL=version_label(),
+        APP_PRE_ALPHA=IS_PRE_ALPHA,
     )
     # One shared karaoke session per server process. Tests create separate app
     # objects, so a test can never leak its queue into another test.
     app.extensions["playback"] = PlaybackState()
+    # The desktop launcher sets this before closing Waitress.  SSE generators
+    # check it so active browser streams do not keep the server thread alive.
+    app.extensions["shutdown_event"] = threading.Event()
     register_blueprints(app)
 
     @app.errorhandler(ApiError)

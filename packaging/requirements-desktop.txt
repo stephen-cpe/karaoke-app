@@ -1,0 +1,5 @@
+# Desktop launcher dependencies for the packaged Windows application.
+# These are intentionally separate from the core Flask + Waitress runtime.
+-r ../requirements.txt
+pystray==0.19.5
+Pillow==13.0.0

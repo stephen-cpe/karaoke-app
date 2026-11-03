@@ -1,0 +1,37 @@
+FFmpeg and Rubber Band source-code availability
+================================================
+
+The bundled FFmpeg executable is the static Windows x64 build published by
+Gyan Doshi ("gyan.dev"):
+
+  Package: ffmpeg-9.0.2-essentials_build.zip
+  Version: 9.0.2-essentials_build-www.gyan.dev
+  Build date: 2026-09-19
+  License: GPL v3
+  Upstream download:
+    https://github.com/GyanD/codexffmpeg/releases/download/9.0.2/ffmpeg-9.0.2-essentials_build.zip
+  SHA-256:
+    60f467265b1e312373dbcd92200c2618a74850f98d3d078e94296bb3fa2047ba
+  Build README and complete configure options:
+    ffmpeg/README.txt (also bundled)
+
+Corresponding FFmpeg source:
+  https://github.com/FFmpeg/FFmpeg/commit/946fcce07b
+Build tooling and release source:
+  https://github.com/GyanD/codexffmpeg
+
+Rubber Band (librubberband) version used by this build:
+  v4.0.0
+  License: GPL-2.0-or-later
+  Source: https://github.com/breakfastquay/rubberband
+  Project: https://breakfastquay.com/rubberband/
+
+The GPL v3 license text is included as ffmpeg/LICENSE. The FFmpeg build's
+README.txt records the complete configure options and versions of every
+external library included in this build.
+
+This distribution is an aggregate containing a separate FFmpeg executable
+invoked as a child process; the KARAOKE APP source remains MIT-licensed.
+Third-party components keep their own licenses. If you redistribute this
+ZIP, retain these notices, the license texts, and access to the corresponding
+source code. This notice is provided for compliance and is not legal advice.

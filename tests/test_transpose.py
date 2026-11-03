@@ -3,17 +3,18 @@
 import os
 import subprocess
 
+from karaoke import transposition as transposition_module
+
 
 def fake_ffmpeg(monkeypatch, calls):
-    """Patch subprocess.run with a stub that 'produces' the output file."""
+    """Patch the process runner with a stub that produces the output file."""
 
-    def _run(cmd, **kwargs):
+    def _run(cmd, timeout):
         calls.append(cmd)
         with open(cmd[-1], "wb") as fh:
             fh.write(b"transposed")
-        return subprocess.CompletedProcess(cmd, 0)
 
-    monkeypatch.setattr(subprocess, "run", _run)
+    monkeypatch.setattr(transposition_module, "_run_ffmpeg_process", _run)
 
 
 def test_semitones_zero_returns_original_song(client, add_song):
@@ -101,7 +102,7 @@ def test_missing_ffmpeg_returns_clear_error(client, add_song, monkeypatch):
     def no_ffmpeg(*args, **kwargs):
         raise FileNotFoundError("ffmpeg not found")
 
-    monkeypatch.setattr(subprocess, "run", no_ffmpeg)
+    monkeypatch.setattr(transposition_module, "_run_ffmpeg_process", no_ffmpeg)
     res = client.get("/transpose", query_string={"song_id": song, "semitones": 1})
     assert res.status_code == 500
     assert "ffmpeg" in res.get_json()["error"]
@@ -110,12 +111,12 @@ def test_missing_ffmpeg_returns_clear_error(client, add_song, monkeypatch):
 def test_failed_ffmpeg_returns_details_and_removes_partial_file(client, app, add_song, monkeypatch):
     song = add_song("1_a_b.mp3")
 
-    def failing(cmd, **kwargs):
+    def failing(cmd, timeout):
         with open(cmd[-1], "wb") as fh:
             fh.write(b"partial")
         raise subprocess.CalledProcessError(1, "ffmpeg", stderr=b"boom")
 
-    monkeypatch.setattr(subprocess, "run", failing)
+    monkeypatch.setattr(transposition_module, "_run_ffmpeg_process", failing)
     res = client.get("/transpose", query_string={"song_id": song, "semitones": 1})
     assert res.status_code == 500
     assert res.get_json()["details"] == "boom"
@@ -125,12 +126,12 @@ def test_failed_ffmpeg_returns_details_and_removes_partial_file(client, app, add
 def test_ffmpeg_timeout_returns_504_and_removes_partial_file(client, app, add_song, monkeypatch):
     song = add_song("1_a_b.mp3")
 
-    def timing_out(cmd, **kwargs):
+    def timing_out(cmd, timeout):
         with open(cmd[-1], "wb") as fh:
             fh.write(b"partial")
-        raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout", 1))
+        raise subprocess.TimeoutExpired(cmd, timeout)
 
-    monkeypatch.setattr(subprocess, "run", timing_out)
+    monkeypatch.setattr(transposition_module, "_run_ffmpeg_process", timing_out)
     res = client.get("/transpose", query_string={"song_id": song, "semitones": 1})
     assert res.status_code == 504
     assert "timed out" in res.get_json()["error"].lower()

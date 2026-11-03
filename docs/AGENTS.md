@@ -2,16 +2,22 @@
 
 ## Project layout
 
-- `app.py` — entry point: imports/re-exports `create_app()`, configures logging, and
-  starts Waitress or the Flask dev server.
+- `app.py` — development entry point: imports/re-exports `create_app()`, configures
+  logging, and starts Waitress or the Flask dev server.
+- `desktop.py` — PyInstaller/development entry point for the Windows desktop shell.
 - `karaoke/` — Flask application package:
   - `__init__.py` — app factory, config, error handlers, request logging.
   - `catalog.py`, `lyrics.py`, `transposition.py` — shared services.
   - `http.py`, `logging.py`, `config.py` — request, logging, and config helpers
     (`config.py` re-exports the application constants).
   - `errors.py` — `ApiError` exception type.
+  - `desktop.py` — Tkinter launcher, tray lifecycle, port fallback, and graceful
+    Waitress shutdown.
+  - `version.py` — canonical application version and pre-alpha metadata.
   - `routes/` — pages and media, shared-session API, library API, and browser-log
     blueprints.
+- `packaging/` — PyInstaller spec, Windows build script, desktop requirements,
+  license/source-offer staging, and release-notes template.
 - `constants.py` — constants shared by the Flask package and session state.
 - `playback_state.py` — thread-safe in-memory session: queue, host lifecycle,
   presence timeout, ordered host commands, and command acknowledgement.
@@ -102,6 +108,47 @@
   if Edge or Chrome is not present.
 - Do not modify the lyric timing pipeline during app/UI work.
 
+## Windows desktop packaging
+
+- The distributable is a PyInstaller one-folder build named `karaoke-app.exe`.
+  Keep `python app.py`, `python app.py --dev`, and all existing tests working.
+- `desktop.py` must import `karaoke.create_app` rather than importing `app.py`,
+  because `app.py` creates a default app at import time.
+- In a frozen build, templates/static come from PyInstaller's `_MEIPASS`;
+  `songs/`, `lyrics/`, and `transposed/` always live beside the executable and
+  must be writable. Never use `_MEIPASS` for user media.
+- The packaged launcher must keep the existing `0.0.0.0` binding and
+  unauthenticated LAN model. Do not add authentication without approval.
+- Preserve the FFmpeg fallback for pre-generated transposed tracks. The
+  distributed build bundles FFmpeg 9.0.2 essentials (GPLv3) with
+  librubberband; keep its notices, source offer, and checksum verification.
+- Build locally with:
+
+  ```powershell
+  # Use a clean CPython 3.13.x x64 environment for release builds.
+  # Python 3.14's Tk 9 library layout is not reliably collected by the
+  # current PyInstaller release; normal app development can still use 3.14.
+  py -3.13 -m venv .venv-build
+  .\.venv-build\Scripts\python -m pip install -r requirements.txt `
+    -r packaging\requirements-desktop.txt `
+    -r packaging\requirements-build.txt pytest ruff
+  .\.venv-build\Scripts\python -m pytest -m "not browser"
+  node --test tests\js\reconcile.test.js
+  .\.venv-build\Scripts\python -m ruff check .
+  .\packaging\build.ps1 -Version 0.0.1 `
+    -Python .\.venv-build\Scripts\python.exe
+  ```
+
+  Use the same build script in GitHub Actions. Do not commit `build/`, `dist/`,
+  `packaging/cache/`, `packaging/build/`, or downloaded FFmpeg binaries.
+- Versioning and release authorization follow `docs/VERSIONING.md`. The
+  initial public executable release is `v0.0.1`, marked as a prerelease; never
+  promote to `1.0.0` or publish a release without the maintainer's explicit
+  decision.
+- Complete `docs/WINDOWS_ACCEPTANCE.md` on a clean Windows 11 x64 machine
+  before declaring a release ready. Automated tests and a local build do not
+  satisfy that clean-machine requirement.
+
 ## Repository hygiene
 
 - Never commit audio, video, `.srt`, or `.words.json` files. They are copyrighted
@@ -114,8 +161,11 @@
   `.gitkeep` placeholders are tracked.
 - The project source is MIT-licensed (see `LICENSE`). Do not change repository
   licensing or asset ownership without explicit user approval.
-- Do not add a public version number, release tag, or versioning scheme. Existing
-  cache names and the lyric tool's User-Agent are tooling details, not releases.
+- Versioning and release policy are documented in `docs/VERSIONING.md`. Keep
+  `karaoke/version.py`, the executable metadata, the GUI label, and release
+  tags in sync. The initial public executable release is `v0.0.1`; do not
+  promote the project to `1.0.0` or publish a release without the maintainer's
+  explicit decision.
 - The Lyrics Editor loads Bootstrap and WaveSurfer from `static/vendor/`; the host
   and remote use custom CSS. Do not reintroduce CDN or Google Fonts links.
 
