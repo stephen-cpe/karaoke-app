@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import os
+import tkinter as tk
 import uuid
 from pathlib import Path
+from tkinter import ttk
 from types import SimpleNamespace
 
 import pytest
@@ -43,6 +45,19 @@ def test_ensure_data_directories_reports_unwritable_folder(
     monkeypatch.setattr(Path, "write_text", fail_write)
     with pytest.raises(desktop.StartupError, match="not writable"):
         desktop.ensure_data_directories(tmp_path)
+
+
+def test_dark_style_configures_ttk_palette():
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        desktop.configure_dark_style(root)
+        style = ttk.Style(root)
+        assert style.lookup("TFrame", "background") == desktop.DARK_BG
+        assert style.lookup("TLabel", "foreground") == desktop.DARK_TEXT
+        assert style.lookup("Accent.TButton", "background") == desktop.ACCENT
+    finally:
+        root.destroy()
 
 
 def test_urls_for_port_uses_detected_lan_ip(monkeypatch):

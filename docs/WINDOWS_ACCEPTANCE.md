@@ -22,10 +22,17 @@ Python installed before declaring the release ready.
 - [ ] Double-click `karaoke-app.exe`.
 - [ ] Confirm Windows SmartScreen behavior is documented and the app starts
       after choosing **More info → Run anyway** if needed.
-- [ ] Confirm a startup/status window appears with meaningful status text.
+- [ ] Confirm a startup/status window appears with meaningful status text and
+      the dark charcoal launcher theme.
 - [ ] Confirm the main window displays `KARAOKE APP`,
       `Version: 0.0.1 (PRE-ALPHA)`, `Status: Running`, the local player URL,
-      and the detected LAN URLs.
+      and the detected LAN URLs, with light text on a dark background and
+      readable accent buttons.
+- [ ] Confirm the active Windows title bar is dark where the installed Windows
+      version/DWM supports it. Inactive title bars may follow the Windows system
+      theme; note the observed behavior.
+- [ ] Open a launcher error/secondary dialog and confirm it remains dark rather
+      than reverting to a light native message box.
 - [ ] Confirm the local player opens in the default browser.
 - [ ] Confirm `karaoke.log` is created beside the executable.
 

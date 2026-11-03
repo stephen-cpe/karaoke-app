@@ -125,8 +125,9 @@ LRCLIB is used only by the lyric pipeline.
 ## Windows desktop distribution
 
 The portable Windows build is a one-folder PyInstaller distribution. It
-includes the Python runtime, core Flask/Waitress dependencies, Tkinter desktop
-shell, tray integration, frontend assets, and FFmpeg with `librubberband`.
+includes the Python runtime, core Flask/Waitress dependencies, a dark-themed
+Tkinter desktop shell, tray integration, frontend assets, and FFmpeg with
+`librubberband`.
 End users do not need Python, FFmpeg, a command line, or an internet connection.
 
 1. Extract the `karaoke-app` folder to a writable location such as Documents

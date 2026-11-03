@@ -18,7 +18,7 @@ import time
 import tkinter as tk
 import webbrowser
 from pathlib import Path
-from tkinter import messagebox, ttk
+from tkinter import ttk
 from typing import Any
 from urllib.error import URLError
 from urllib.request import urlopen
@@ -40,6 +40,23 @@ PORT_END = 8099
 DEFAULT_THREADS = 16
 MUTEX_NAME = "Local\\KaraokeApp-5D7B52F1-0A0E-4E2C-9A3C-6F4B7D1E2A90"
 
+# Palette shared with the host player's dark cyberpunk theme.  Tk does not
+# understand the CSS rgba() borders, so solid near-black equivalents are used.
+DARK_BG = "#0f0f0f"
+DARK_SURFACE = "#181818"
+DARK_RAISED = "#212121"
+DARK_BORDER = "#2a2a2a"
+DARK_BORDER_STRONG = "#3a3a3a"
+DARK_TEXT = "#f1f1f1"
+DARK_TEXT_SECONDARY = "#aaaaaa"
+DARK_TEXT_TERTIARY = "#858585"
+ACCENT = "#ff0033"
+ACCENT_BRIGHT = "#ff3355"
+FOCUS = "#3ea6ff"
+SUCCESS = "#34d399"
+WARNING = "#fbbf24"
+ERROR = "#ff4d6d"
+
 
 class StartupError(RuntimeError):
     """A user-visible startup failure."""
@@ -57,6 +74,240 @@ def resource_root() -> Path:
     if getattr(sys, "frozen", False) and getattr(sys, "_MEIPASS", None):
         return Path(sys._MEIPASS)
     return app_root()
+
+
+def apply_dark_title_bar(window: tk.Misc) -> None:
+    """Ask Windows 10/11 to draw a dark title bar, when supported."""
+    if os.name != "nt":
+        return
+    try:
+        window.update_idletasks()
+        hwnd = window.winfo_id()
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        dwmapi = ctypes.WinDLL("dwmapi", use_last_error=True)
+        user32.GetParent.argtypes = [ctypes.c_void_p]
+        user32.GetParent.restype = ctypes.c_void_p
+        dwmapi.DwmSetWindowAttribute.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p, ctypes.c_uint,
+        ]
+        dwmapi.DwmSetWindowAttribute.restype = ctypes.c_long
+        parent = user32.GetParent(hwnd)
+        value = ctypes.c_int(1)
+        for candidate in (hwnd, parent):
+            if not candidate:
+                continue
+            for attribute in (20, 19):
+                result = dwmapi.DwmSetWindowAttribute(
+                    ctypes.c_void_p(candidate), attribute,
+                    ctypes.byref(value), ctypes.sizeof(value))
+                if result == 0:
+                    return
+    except (AttributeError, OSError, TypeError, tk.TclError):
+        # DWM is unavailable on older systems or non-Windows sessions.
+        pass
+
+
+def configure_dark_style(root: tk.Misc) -> None:
+    """Apply the launcher's dark ttk theme consistently to one Tk root."""
+    style = ttk.Style(root)
+    try:
+        style.theme_use("clam")
+    except tk.TclError:
+        pass
+
+    style.configure(
+        ".", background=DARK_BG, foreground=DARK_TEXT,
+        fieldbackground=DARK_SURFACE, bordercolor=DARK_BORDER,
+    )
+    style.configure("TFrame", background=DARK_BG)
+    style.configure("TLabel", background=DARK_BG, foreground=DARK_TEXT)
+    style.configure(
+        "Title.TLabel", background=DARK_BG, foreground=DARK_TEXT,
+        font=("Segoe UI", 20, "bold"),
+    )
+    style.configure(
+        "Subtitle.TLabel", background=DARK_BG, foreground=DARK_TEXT_SECONDARY,
+        font=("Segoe UI", 10),
+    )
+    style.configure(
+        "Field.TLabel", background=DARK_BG, foreground=DARK_TEXT,
+        font=("Segoe UI", 10, "bold"),
+    )
+    style.configure(
+        "Muted.TLabel", background=DARK_BG, foreground=DARK_TEXT_TERTIARY,
+        font=("Segoe UI", 9),
+    )
+    style.configure(
+        "Warning.TLabel", background=DARK_BG, foreground=WARNING,
+        font=("Segoe UI", 9),
+    )
+    for name, color in (
+        ("StatusRunning.TLabel", SUCCESS),
+        ("StatusStopped.TLabel", ERROR),
+        ("StatusStarting.TLabel", ACCENT_BRIGHT),
+        ("StatusWarning.TLabel", WARNING),
+    ):
+        style.configure(
+            name, background=DARK_BG, foreground=color,
+            font=("Segoe UI", 10, "bold"),
+        )
+
+    style.configure(
+        "TButton", background=DARK_RAISED, foreground=DARK_TEXT,
+        bordercolor=DARK_BORDER_STRONG, borderwidth=1, padding=(10, 6),
+        font=("Segoe UI", 9), relief="flat",
+    )
+    style.map(
+        "TButton",
+        background=[
+            ("disabled", DARK_SURFACE),
+            ("pressed", "#303030"),
+            ("active", "#2a2a2a"),
+        ],
+        foreground=[("disabled", DARK_TEXT_TERTIARY), ("active", DARK_TEXT)],
+        bordercolor=[("focus", FOCUS)],
+    )
+    style.configure(
+        "Small.TButton", background=DARK_RAISED, foreground=DARK_TEXT,
+        padding=(6, 4), font=("Segoe UI", 9),
+    )
+    style.configure(
+        "Accent.TButton", background=ACCENT, foreground="#ffffff",
+        bordercolor=ACCENT_BRIGHT, padding=(12, 6),
+        font=("Segoe UI", 9, "bold"), relief="flat",
+    )
+    style.map(
+        "Accent.TButton",
+        background=[
+            ("disabled", "#5b1d29"),
+            ("pressed", "#d6002b"),
+            ("active", ACCENT_BRIGHT),
+        ],
+        foreground=[("disabled", "#c9a5ad")],
+        bordercolor=[("focus", FOCUS)],
+    )
+    style.configure(
+        "Danger.TButton", background=DARK_RAISED, foreground=ERROR,
+        bordercolor=DARK_BORDER_STRONG, padding=(10, 6),
+        font=("Segoe UI", 9), relief="flat",
+    )
+    style.map(
+        "Danger.TButton",
+        background=[
+            ("disabled", DARK_SURFACE),
+            ("pressed", "#301b21"),
+            ("active", "#2a171b"),
+        ],
+        foreground=[("disabled", DARK_TEXT_TERTIARY), ("active", "#ff7a8f")],
+        bordercolor=[("focus", FOCUS)],
+    )
+
+    style.configure(
+        "TEntry", background=DARK_SURFACE, fieldbackground=DARK_SURFACE,
+        foreground=DARK_TEXT, insertcolor=DARK_TEXT,
+        bordercolor=DARK_BORDER, lightcolor=DARK_BORDER,
+        darkcolor=DARK_BORDER, padding=5, font=("Consolas", 9),
+    )
+    style.map(
+        "TEntry",
+        fieldbackground=[("readonly", DARK_SURFACE)],
+        foreground=[("readonly", DARK_TEXT)],
+        bordercolor=[("focus", FOCUS)],
+    )
+    style.configure("TSeparator", background=DARK_BORDER)
+
+    style.configure(
+        "Dialog.TFrame", background=DARK_BG,
+    )
+    style.configure(
+        "DialogTitle.TLabel", background=DARK_BG, foreground=DARK_TEXT,
+        font=("Segoe UI", 14, "bold"),
+    )
+    style.configure(
+        "DialogMessage.TLabel", background=DARK_BG, foreground=DARK_TEXT_SECONDARY,
+        font=("Segoe UI", 10),
+    )
+
+
+def show_message(parent: tk.Misc | None, title: str, message: str,
+                 kind: str = "error") -> None:
+    """Show a modal, dark-themed message dialog without native light chrome."""
+    owns_root = parent is None
+    root = None
+    if owns_root:
+        root = tk.Tk()
+        root.withdraw()
+        parent = root
+    configure_dark_style(parent)
+
+    dialog = tk.Toplevel(parent)
+    dialog.withdraw()
+    dialog.title(title)
+    dialog.configure(bg=DARK_BG)
+    dialog.resizable(False, False)
+    try:
+        # A transient child of a withdrawn root can remain hidden on Windows.
+        # Only bind it to the parent when the parent is actually visible.
+        if parent.winfo_viewable():
+            dialog.transient(parent)
+    except tk.TclError:
+        pass
+
+    frame = ttk.Frame(dialog, style="Dialog.TFrame", padding=(22, 18))
+    frame.pack(fill="both", expand=True)
+    accent = ERROR if kind == "error" else ACCENT
+    tk.Frame(frame, bg=accent, height=3).pack(fill="x", pady=(0, 12))
+    ttk.Label(frame, text=title, style="DialogTitle.TLabel").pack(
+        anchor="w", fill="x")
+    ttk.Label(
+        frame, text=message, style="DialogMessage.TLabel",
+        wraplength=560, justify="left",
+    ).pack(anchor="w", fill="x", pady=(10, 18))
+
+    def close_dialog(_event: tk.Event | None = None) -> None:
+        if not dialog.winfo_exists():
+            return
+        try:
+            dialog.grab_release()
+        except tk.TclError:
+            pass
+        dialog.destroy()
+
+    ttk.Button(
+        frame, text="OK", style="Accent.TButton", command=close_dialog,
+    ).pack(anchor="e")
+    dialog.protocol("WM_DELETE_WINDOW", close_dialog)
+    dialog.bind("<Return>", close_dialog)
+    dialog.bind("<Escape>", close_dialog)
+    dialog.bind("<FocusIn>", lambda _event: apply_dark_title_bar(dialog))
+    dialog.update_idletasks()
+
+    width = max(420, dialog.winfo_reqwidth())
+    height = dialog.winfo_reqheight()
+    if parent.winfo_viewable():
+        parent_x = parent.winfo_rootx()
+        parent_y = parent.winfo_rooty()
+        parent_w = parent.winfo_width()
+        parent_h = parent.winfo_height()
+        x = parent_x + max(0, (parent_w - width) // 2)
+        y = parent_y + max(0, (parent_h - height) // 2)
+    else:
+        x = (dialog.winfo_screenwidth() - width) // 2
+        y = (dialog.winfo_screenheight() - height) // 2
+    x = max(0, min(x, dialog.winfo_screenwidth() - width))
+    y = max(0, min(y, dialog.winfo_screenheight() - height))
+    dialog.geometry(f"{width}x{height}+{x}+{y}")
+    dialog.deiconify()
+    dialog.lift()
+    apply_dark_title_bar(dialog)
+    try:
+        dialog.grab_set()
+    except tk.TclError:
+        pass
+    dialog.focus_force()
+    dialog.wait_window()
+    if owns_root and root is not None:
+        root.destroy()
 
 
 def ensure_data_directories(base_dir: Path) -> dict[str, Path]:
@@ -233,6 +484,8 @@ class DesktopApp:
         self.root.title(APP_NAME)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close_request)
         self.root.report_callback_exception = self._report_callback_exception
+        self.root.bind("<FocusIn>", lambda _event: apply_dark_title_bar(self.root))
+        configure_dark_style(self.root)
         self._apply_window_icon()
         self._build_splash()
         self.root.after(50, self._start_startup)
@@ -259,26 +512,26 @@ class DesktopApp:
     def _build_splash(self) -> None:
         self.root.overrideredirect(True)
         self.root.resizable(False, False)
-        self.root.configure(bg="#0f0f13")
-        frame = tk.Frame(self.root, bg="#0f0f13", padx=30, pady=24)
+        self.root.configure(bg=DARK_BG)
+        frame = tk.Frame(self.root, bg=DARK_BG, padx=30, pady=24)
         frame.pack(fill="both", expand=True)
         self._add_logo(frame, size=(96, 96))
         tk.Label(
-            frame, text=APP_NAME, bg="#0f0f13", fg="#ffffff",
+            frame, text=APP_NAME, bg=DARK_BG, fg=DARK_TEXT,
             font=("Segoe UI", 20, "bold"),
         ).pack(pady=(12, 2))
         tk.Label(
-            frame, text=f"Version: {version_label()}", bg="#0f0f13",
-            fg="#b8b8c7", font=("Segoe UI", 10),
+            frame, text=f"Version: {version_label()}", bg=DARK_BG,
+            fg=DARK_TEXT_SECONDARY, font=("Segoe UI", 10),
         ).pack()
         self.splash_status = tk.Label(
-            frame, text="Starting KARAOKE APP…", bg="#0f0f13",
-            fg="#ff4d6d", font=("Segoe UI", 10, "bold"),
+            frame, text="Starting KARAOKE APP…", bg=DARK_BG,
+            fg=ACCENT_BRIGHT, font=("Segoe UI", 10, "bold"),
         )
         self.splash_status.pack(pady=(18, 4))
         tk.Label(
             frame, text="Loading bundled runtime and preparing folders",
-            bg="#0f0f13", fg="#858596", font=("Segoe UI", 9),
+            bg=DARK_BG, fg=DARK_TEXT_TERTIARY, font=("Segoe UI", 9),
         ).pack()
         self.root.update_idletasks()
         width = max(390, self.root.winfo_reqwidth())
@@ -290,7 +543,7 @@ class DesktopApp:
         self.root.lift()
 
     def _add_logo(self, parent: tk.Widget, size: tuple[int, int],
-                  background: str = "#0f0f13") -> None:
+                  background: str = DARK_BG) -> None:
         """Add the logo using Pillow, falling back to text if unavailable."""
         try:
             from PIL import Image, ImageTk
@@ -301,7 +554,7 @@ class DesktopApp:
             tk.Label(parent, image=photo, bg=background).pack(side="left")
         except Exception:
             tk.Label(
-                parent, text="K", bg="#ff4d6d", fg="#ffffff",
+                parent, text="K", bg=ACCENT, fg="#ffffff",
                 font=("Segoe UI", 28, "bold"), width=3, height=1,
             ).pack(side="left")
 
@@ -310,36 +563,32 @@ class DesktopApp:
             child.destroy()
         self.root.overrideredirect(False)
         self.root.resizable(True, False)
-        self.root.configure(bg="#f4f4f7")
+        self.root.configure(bg=DARK_BG)
         self.root.title(APP_NAME)
+        configure_dark_style(self.root)
 
-        style = ttk.Style(self.root)
-        try:
-            style.theme_use("vista")
-        except tk.TclError:
-            pass
-
-        outer = ttk.Frame(self.root, padding=(24, 20))
+        outer = ttk.Frame(self.root, style="TFrame", padding=(24, 20))
         outer.pack(fill="both", expand=True)
-        heading = ttk.Frame(outer)
+        heading = ttk.Frame(outer, style="TFrame")
         heading.pack(fill="x")
-        self._add_logo(heading, size=(58, 58), background="#f4f4f7")
-        title_box = ttk.Frame(heading)
+        self._add_logo(heading, size=(58, 58), background=DARK_BG)
+        title_box = ttk.Frame(heading, style="TFrame")
         title_box.pack(side="left", padx=(14, 0), fill="x", expand=True)
         ttk.Label(
-            title_box, text=APP_NAME, font=("Segoe UI", 20, "bold"),
+            title_box, text=APP_NAME, style="Title.TLabel",
         ).pack(anchor="w")
         ttk.Label(
             title_box, text=f"Version: {version_label()}",
-            font=("Segoe UI", 10),
+            style="Subtitle.TLabel",
         ).pack(anchor="w", pady=(2, 0))
         self.status_var = tk.StringVar(value="Status: Running")
-        ttk.Label(
+        self.status_label = ttk.Label(
             title_box, textvariable=self.status_var,
-            font=("Segoe UI", 10, "bold"), foreground="#16803c",
-        ).pack(anchor="w", pady=(4, 0))
+            style="StatusRunning.TLabel",
+        )
+        self.status_label.pack(anchor="w", pady=(4, 0))
 
-        ttk.Separator(outer).pack(fill="x", pady=16)
+        tk.Frame(outer, bg=DARK_BORDER, height=1).pack(fill="x", pady=16)
         self._add_url_block(
             outer, "Player on this PC:", self.urls["local_player"])
         if self.urls["lan_available"]:
@@ -352,34 +601,37 @@ class DesktopApp:
                 outer,
                 text="Phone remotes: no LAN address detected. "
                      "Connect this computer to the local network to enable remotes.",
-                foreground="#9a4b00", wraplength=680,
+                style="Warning.TLabel", wraplength=680,
             ).pack(anchor="w", pady=(0, 10))
 
         ttk.Label(
             outer,
             text="Use KARAOKE APP only on a trusted private network. "
                  "Do not expose it through router port forwarding to the internet.",
-            foreground="#666677", wraplength=680,
+            style="Muted.TLabel", wraplength=680,
         ).pack(anchor="w", pady=(4, 12))
         ttk.Label(
             outer, text=f"Pitch shifting: {self.ffmpeg_description}",
-            foreground="#666677", wraplength=680,
+            style="Muted.TLabel", wraplength=680,
         ).pack(anchor="w")
         ttk.Label(
-            outer, text=f"Log: {self.log_path}", foreground="#666677",
+            outer, text=f"Log: {self.log_path}", style="Muted.TLabel",
             wraplength=680,
         ).pack(anchor="w", pady=(4, 12))
 
-        actions = ttk.Frame(outer)
+        actions = ttk.Frame(outer, style="TFrame")
         actions.pack(fill="x", pady=(8, 0))
         ttk.Button(
-            actions, text="Open player", command=self._open_player,
+            actions, text="Open player", style="Accent.TButton",
+            command=self._open_player,
         ).pack(side="left")
         ttk.Button(
-            actions, text="Minimize to tray", command=self._hide_to_tray,
+            actions, text="Minimize to tray", style="TButton",
+            command=self._hide_to_tray,
         ).pack(side="left", padx=8)
         ttk.Button(
-            actions, text="Exit", command=self._request_shutdown,
+            actions, text="Exit", style="Danger.TButton",
+            command=self._request_shutdown,
         ).pack(side="right")
 
         self.root.update_idletasks()
@@ -389,27 +641,36 @@ class DesktopApp:
         y = max(0, (self.root.winfo_screenheight() - height) // 2)
         self.root.geometry(f"{width}x{height}+{x}+{y}")
         self.root.deiconify()
+        self.root.update_idletasks()
+        apply_dark_title_bar(self.root)
         self.root.lift()
         self.root.focus_force()
 
     def _add_url_block(self, parent: ttk.Frame, label: str, url: str) -> None:
-        block = ttk.Frame(parent)
+        block = ttk.Frame(parent, style="TFrame")
         block.pack(fill="x", pady=(0, 12))
-        ttk.Label(block, text=label, font=("Segoe UI", 10, "bold")).pack(anchor="w")
-        entry = ttk.Entry(block, width=70)
+        ttk.Label(block, text=label, style="Field.TLabel").pack(anchor="w")
+        entry = ttk.Entry(block, width=70, style="TEntry")
         entry.insert(0, url)
         entry.configure(state="readonly")
         entry.pack(anchor="w", pady=(3, 0))
         entry.bind("<Button-1>", lambda _event: entry.selection_range(0, "end"))
         ttk.Button(
-            block, text="Copy", width=7,
+            block, text="Copy", width=7, style="Small.TButton",
             command=lambda: self._copy(url),
         ).pack(anchor="w", pady=(4, 0))
+
+    def _set_status(self, text: str, style: str = "StatusRunning.TLabel") -> None:
+        if hasattr(self, "status_var"):
+            self.status_var.set(text)
+        label = getattr(self, "status_label", None)
+        if label is not None:
+            label.configure(style=style)
 
     def _copy(self, value: str) -> None:
         self.root.clipboard_clear()
         self.root.clipboard_append(value)
-        self.status_var.set("Status: Running · copied link")
+        self._set_status("Status: Running · copied link")
 
     # ------------------------------------------------------------------
     # Startup worker
@@ -494,11 +755,11 @@ class DesktopApp:
                 elif kind == "startup_error":
                     self._show_error(str(payload))
                 elif kind == "server_error":
-                    self.status_var.set("Status: Stopped — check the log")
-                    messagebox.showerror(
-                        APP_NAME,
+                    self._set_status(
+                        "Status: Stopped — check the log", "StatusStopped.TLabel")
+                    show_message(
+                        self.root, APP_NAME,
                         f"The karaoke server stopped unexpectedly.\n\n{payload}",
-                        parent=self.root,
                     )
                 elif kind == "restore":
                     self._show_window()
@@ -523,13 +784,14 @@ class DesktopApp:
     def _show_error(self, message: str) -> None:
         if self._closing:
             return
-        messagebox.showerror(APP_NAME, message, parent=self.root)
+        self._set_status("Status: Stopped — check the log", "StatusStopped.TLabel")
+        show_message(self.root, APP_NAME, message)
         self._request_shutdown(exit_code=1)
 
     def _report_callback_exception(self, exc_type, exc_value, exc_tb) -> None:
         logger.exception("GUI callback failed", exc_info=(exc_type, exc_value, exc_tb))
         if not self._closing:
-            messagebox.showerror(APP_NAME, str(exc_value), parent=self.root)
+            show_message(self.root, APP_NAME, str(exc_value))
 
     # ------------------------------------------------------------------
     # Tray and commands
@@ -559,13 +821,15 @@ class DesktopApp:
         except Exception as exc:
             logger.warning("System tray unavailable: %s", exc)
             self.tray_available = False
-            if hasattr(self, "status_var"):
-                self.status_var.set("Status: Running (tray unavailable)")
+            self._set_status(
+                "Status: Running (tray unavailable)", "StatusWarning.TLabel")
 
     def _show_window(self) -> None:
         if self._closing:
             return
         self.root.deiconify()
+        self.root.update_idletasks()
+        apply_dark_title_bar(self.root)
         self.root.lift()
         self.root.focus_force()
 
@@ -585,8 +849,8 @@ class DesktopApp:
         try:
             webbrowser.open(self.urls["local_player"])
         except Exception as exc:
-            messagebox.showerror(APP_NAME, f"Could not open the browser:\n{exc}",
-                                 parent=self.root)
+            show_message(
+                self.root, APP_NAME, f"Could not open the browser:\n{exc}")
 
     # ------------------------------------------------------------------
     # Shutdown
@@ -595,8 +859,7 @@ class DesktopApp:
         if self._closing:
             return
         self._closing = True
-        if hasattr(self, "status_var"):
-            self.status_var.set("Status: Stopping…")
+        self._set_status("Status: Stopping…", "StatusWarning.TLabel")
         try:
             self.root.update_idletasks()
         except tk.TclError:
@@ -656,10 +919,13 @@ class DesktopApp:
 def _show_already_running() -> None:
     root = tk.Tk()
     root.withdraw()
-    messagebox.showinfo(
+    configure_dark_style(root)
+    show_message(
+        root,
         APP_NAME,
         "KARAOKE APP is already running. Use its system tray icon to restore "
         "the window.",
+        kind="info",
     )
     root.destroy()
 
@@ -752,7 +1018,7 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:
         logger.exception("Could not create the single-instance guard")
         try:
-            messagebox.showerror(APP_NAME, str(exc))
+            show_message(None, APP_NAME, str(exc))
         except Exception:
             pass
         return 1
@@ -769,7 +1035,7 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:
         logger.exception("Could not start the desktop application")
         try:
-            messagebox.showerror(APP_NAME, str(exc))
+            show_message(None, APP_NAME, str(exc))
         except Exception:
             pass
         single_instance.close()
