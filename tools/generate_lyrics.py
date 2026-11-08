@@ -26,7 +26,18 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from tools.lyrics import asr, audio, cache, cues, langdetect, publish, qa, reference, textnorm  # noqa: E402
+from tools.lyrics import (  # noqa: E402
+    align,
+    asr,
+    audio,
+    cache,
+    cues,
+    langdetect,
+    publish,
+    qa,
+    reference,
+    textnorm,
+)
 
 SONGS_DIR = PROJECT_ROOT / "songs"
 ORIGINALS_DIR = PROJECT_ROOT / "original_songs"
@@ -201,6 +212,7 @@ def _candidate_summary(item: dict[str, Any]) -> dict[str, Any]:
         "energy_score": round(float(item.get("energy_score", 0.0)), 4),
         "penalty": round(float(item.get("penalty", 0.0)), 3),
         "word_sync": bool(item.get("word_sync")),
+        "alignment": item.get("alignment"),
     }
 
 
@@ -233,10 +245,123 @@ def _reject_suspect_reference_offset(reference_dict: dict[str, Any] | None,
     log.warning("  %s", message)
 
 
+def _needs_full_asr(language: str, has_reference: bool,
+                    align_english: bool) -> tuple[bool, str]:
+    if not has_reference:
+        return True, "ASR text is the lyric source"
+    if language == "en":
+        if align_english:
+            return False, "English forced-alignment path requested"
+        return True, "English compatibility path keeps ASR timing"
+    if language in ("ja", "ko"):
+        return True, "JA/KO forced alignment needs romanization (Phase 3)"
+    if language == "tl":
+        return False, "known Tagalog text is force-aligned"
+    return True, "no forced-alignment path for this language"
+
+
+def _prepare_alignment_candidates(records: list[dict[str, Any]], language: str,
+                                  duration: float, audio_data, client
+                                  ) -> list[dict[str, Any]]:
+    prepared = []
+    for record in records:
+        try:
+            forms = reference.record_forms(record)
+            item = reference.score_record(
+                record, forms, language, duration, audio_data, local=None)
+        except Exception as exc:
+            log.warning("  candidate parse failed for %s: %s",
+                        record.get("id"), exc)
+            continue
+        if item["duration_error"] > reference.LRCLIB_DURATION_TOLERANCE:
+            continue
+        if item["record"].get("instrumental"):
+            continue
+        if float(item.get("compatibility") or 0.0) < 0.5:
+            continue
+        prepared.append(item)
+
+    prepared.sort(key=lambda item: item["score"], reverse=True)
+    full = []
+    for item in prepared:
+        record_id = item["record"].get("id")
+        if record_id is not None:
+            try:
+                full_record = client.fetch_by_id(int(record_id))
+            except Exception as exc:
+                log.warning("  LRCLIB by-id fetch failed for %s: %s",
+                            record_id, exc)
+                full_record = None
+            if full_record:
+                forms = reference.record_forms(full_record)
+                rescored = reference.score_record(
+                    full_record, forms, language, duration, audio_data,
+                    local=None)
+                if rescored["duration_error"] <= reference.LRCLIB_DURATION_TOLERANCE:
+                    item = rescored
+        full.append(item)
+    return full
+
+
+def _align_candidates(candidates: list[dict[str, Any]], language: str,
+                      audio_data, session: align.AlignSession
+                      ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    emissions, stride = session.prepare_emissions(audio_data)
+    emissions_seconds = session.seconds
+    total_align_seconds = 0.0
+    for item in candidates:
+        result = session.align_candidate(
+            emissions, stride, item["lines"], item["tokens"], language)
+        item["alignment"] = result.summary
+        item["line_alignment"] = result.lines
+        total_align_seconds += float(result.summary.get("seconds") or 0.0)
+    candidates.sort(key=align.candidate_rank_key, reverse=True)
+    info = {
+        "model": session.model_name,
+        "device": session.device,
+        "dtype": str(session.dtype),
+        "load_seconds": round(session.load_seconds, 2),
+        "emissions_seconds": round(emissions_seconds, 2),
+        "candidate_seconds": round(total_align_seconds, 2),
+        "candidates_aligned": len(candidates),
+    }
+    return candidates, info
+
+
+def _alignment_lines_summary(line_alignments: list[dict[str, Any]]
+                             ) -> list[dict[str, Any]]:
+    return [{
+        "reference_line": int(line.get("index", index)) + 1,
+        "coverage": round(float(line.get("coverage") or 0.0), 4),
+        "aligned_words": int(line.get("aligned_words") or 0),
+        "total_words": int(line.get("total_words") or 0),
+    } for index, line in enumerate(line_alignments)]
+
+
+def _timing_source_summary(final_cues: list[dict[str, Any]]) -> dict[str, Any]:
+    counts: dict[str, int] = {}
+    asr_fallback_lines = []
+    line_level_lines = []
+    for index, cue in enumerate(final_cues, 1):
+        source = str(cue.get("timing_source") or "none")
+        counts[source] = counts.get(source, 0) + 1
+        if source == "asr" and not cue.get("instrumental"):
+            if cue.get("line_fallback_reason"):
+                asr_fallback_lines.append(index)
+        if (not cue.get("instrumental") and not cue.get("words")):
+            line_level_lines.append(index)
+    return {
+        "counts": counts,
+        "asr_fallback_lines": asr_fallback_lines,
+        "line_level_lines": line_level_lines,
+    }
+
+
 def process_song(stem: str, original: Path, karaoke: Path, cache_dir: Path,
                  *, use_online: bool, force: bool, output_dir: Path,
                  overwrite_edited: bool, reports_dir: Path,
-                 backups_dir: Path, source_dir: Path) -> dict[str, Any]:
+                 backups_dir: Path, source_dir: Path,
+                 align_english: bool = False) -> dict[str, Any]:
     report: dict[str, Any] = {
         "stem": stem,
         "status": "running",
@@ -312,6 +437,10 @@ def process_song(stem: str, original: Path, karaoke: Path, cache_dir: Path,
         session = asr.WhisperSession()
         lid_results: list[dict[str, Any]] = []
         model_info: dict[str, Any] = {}
+        transcript: dict[str, Any] | None = None
+        local: list[dict[str, Any]] = []
+        asr_used = False
+        asr_reason = ""
         try:
             started = time.perf_counter()
             try:
@@ -359,39 +488,85 @@ def process_song(stem: str, original: Path, karaoke: Path, cache_dir: Path,
                 float(decision.get("confidence", 0.0)), 4)
             report["stages"]["language_id"]["audio"] = lid_summary
 
-            prompt = asr.build_prompt(
-                title, artist, language,
-                reference_text if reference_text else None)
-            started = time.perf_counter()
-            transcript, cache_info = asr.transcribe_cached(
-                stem, vocals, stem_info["original_sha256"], language, prompt,
-                cache_dir, force=force, session=session)
-            report["stages"]["asr"] = {
-                **cache_info,
-                "seconds": cache_info.get("seconds", _seconds(started)),
-                "language": language,
-                "prompt_chars": len(prompt),
-                "words": sum(len(segment.get("words") or [])
-                             for segment in transcript.get("segments") or []),
-            }
             model_info = {
                 "model": asr.MODEL_NAME,
                 "device": session.device,
                 "compute_type": session.compute_type,
                 "load_seconds": round(session.load_seconds, 2),
                 "fallback_used": session.fallback_used,
+                "purpose": "language-id",
             }
-            if cache_info.get("cache_hit"):
-                log.info("  transcript cache hit: %s", cache_info["path"])
+            has_reference = bool(
+                (override and override.get("lines"))
+                or (lookup and lookup.records))
+            full_asr_needed, asr_reason = _needs_full_asr(
+                language, has_reference, align_english)
+            english_compat = (
+                language == "en" and has_reference and not align_english)
+            if full_asr_needed:
+                prompt = asr.build_prompt(title, artist, language, None)
+                started = time.perf_counter()
+                legacy_transcript = None
+                legacy_path = None
+                if english_compat and not force:
+                    legacy_transcript, legacy_path = asr.load_legacy_transcript(
+                        cache_dir, stem, duration, language)
+                if legacy_transcript is not None:
+                    transcript = legacy_transcript
+                    asr_reason = (
+                        "English compatibility reuses the pre-Phase-1 transcript cache")
+                    report["stages"]["asr"] = {
+                        "used": True,
+                        "legacy_transcript": True,
+                        "cache_hit": True,
+                        "path": legacy_path,
+                        "seconds": 0.0,
+                        "language": language,
+                        "prompt_chars": 0,
+                        "words": sum(len(segment.get("words") or [])
+                                     for segment in transcript.get("segments") or []),
+                        "reason": asr_reason,
+                    }
+                    model_info["purpose"] = "language-id + legacy transcript"
+                    asr_used = True
+                    log.info("  using legacy English transcript: %s", legacy_path)
+                else:
+                    transcript, cache_info = asr.transcribe_cached(
+                        stem, vocals, stem_info["original_sha256"], language, prompt,
+                        cache_dir, force=force, session=session)
+                    report["stages"]["asr"] = {
+                        **cache_info,
+                        "seconds": cache_info.get("seconds", _seconds(started)),
+                        "language": language,
+                        "prompt_chars": len(prompt),
+                        "words": sum(len(segment.get("words") or [])
+                                     for segment in transcript.get("segments") or []),
+                        "used": True,
+                        "reason": asr_reason,
+                    }
+                    model_info["purpose"] = "language-id + transcription"
+                    asr_used = True
+                    if cache_info.get("cache_hit"):
+                        log.info("  transcript cache hit: %s", cache_info["path"])
+                    else:
+                        log.info("  transcribed in %.1fs",
+                                 report["stages"]["asr"]["seconds"])
             else:
-                log.info("  transcribed in %.1fs", report["stages"]["asr"]["seconds"])
+                report["stages"]["asr"] = {
+                    "used": False,
+                    "reason": asr_reason,
+                    "seconds": 0.0,
+                    "language": language,
+                }
+                log.info("  full ASR skipped: %s", asr_reason)
         finally:
             session.close()
 
-        transcript = asr.strip_hallucinations(transcript)
-        transcript = asr.filter_silent_words(transcript, vocals, audio_data)
-        local = asr.local_words(transcript, language)
-        report["stages"]["asr"]["local_words"] = len(local)
+        if transcript is not None:
+            transcript = asr.strip_hallucinations(transcript)
+            transcript = asr.filter_silent_words(transcript, vocals, audio_data)
+            local = asr.local_words(transcript, language)
+            report["stages"]["asr"]["local_words"] = len(local)
 
         chosen = None
         candidates: list[dict[str, Any]] = []
@@ -399,39 +574,144 @@ def process_song(stem: str, original: Path, karaoke: Path, cache_dir: Path,
         reference_line_count = 0
         text_source = "asr"
         timing_source = "asr"
+        built: list[dict[str, Any]] = []
+        alignment_info: dict[str, Any] | None = None
+        line_alignments: list[dict[str, Any]] = []
+        aligner_info: dict[str, Any] = {}
+        asr_lines: list[dict[str, Any]] | None = None
 
         if override and override.get("lines"):
-            reference_dict = reference.reference_from_override(
-                override, language, duration, local)
-            reference_dict["local"] = local
-            cues.align_reference_words(reference_dict, local, duration, language)
-            _reject_suspect_reference_offset(reference_dict, report)
-            reference_line_count = _reference_line_count(reference_dict, language)
-            built = cues.build_lyric_lines(
-                reference_dict, duration, audio_data, language)
-            text_source = "user"
-        elif lookup and lookup.records:
-            chosen, candidates = reference.choose_candidate(
-                lookup.records, language, duration, audio_data, local=local,
-                fetch_full=client.fetch_by_id)
-            if chosen:
-                reference_dict = reference.reference_from_candidate(chosen)
+            if full_asr_needed:
+                reference_dict = reference.reference_from_override(
+                    override, language, duration, local)
                 reference_dict["local"] = local
                 cues.align_reference_words(reference_dict, local, duration, language)
+                cues.drop_duplicate_unmatched_lines(reference_dict, language)
                 _reject_suspect_reference_offset(reference_dict, report)
                 reference_line_count = _reference_line_count(reference_dict, language)
                 built = cues.build_lyric_lines(
                     reference_dict, duration, audio_data, language)
-                text_source = reference_dict.get("text_source", "lrclib-plain")
+                text_source = "user"
                 timing_source = "asr"
             else:
-                built = cues.build_from_transcript(transcript, duration, language)
-                text_source = "asr"
-                timing_source = "asr"
+                reference_dict = reference.reference_from_override(
+                    override, language, duration, [])
+                reference_line_count = _reference_line_count(reference_dict, language)
+                align_session = align.AlignSession()
+                try:
+                    started = time.perf_counter()
+                    result = align_session.align_audio_candidate(
+                        audio_data, reference_dict["lines"],
+                        reference_dict["tokens"], language)
+                    alignment_info = result.summary
+                    line_alignments = result.lines
+                    aligner_info = {
+                        "model": align_session.model_name,
+                        "device": align_session.device,
+                        "dtype": str(align_session.dtype),
+                        "load_seconds": round(align_session.load_seconds, 2),
+                        "seconds": _seconds(started),
+                    }
+                    report["stages"]["alignment"] = aligner_info
+                    built = cues.build_aligned_lines(
+                        reference_dict, line_alignments, duration,
+                        audio_data, language)
+                    text_source = "user"
+                    timing_source = "forced-alignment"
+                finally:
+                    align_session.close()
+        elif lookup and lookup.records:
+            if not full_asr_needed:
+                candidate_items = _prepare_alignment_candidates(
+                    lookup.records, language, duration, audio_data, client)
+                if not candidate_items:
+                    raise RuntimeError(
+                        "no LRCLIB candidate could be prepared for forced alignment")
+                align_session = align.AlignSession()
+                try:
+                    started = time.perf_counter()
+                    candidates, aligner_info = _align_candidates(
+                        candidate_items, language, audio_data, align_session)
+                    chosen = candidates[0]
+                    alignment_info = chosen.get("alignment")
+                    line_alignments = chosen.get("line_alignment") or []
+                    reference_dict = reference.reference_from_candidate(chosen)
+                    reference_line_count = _reference_line_count(
+                        reference_dict, language)
+                    aligner_info["seconds"] = _seconds(started)
+                    report["stages"]["alignment"] = aligner_info
+                    built = cues.build_aligned_lines(
+                        reference_dict, line_alignments, duration,
+                        audio_data, language)
+                    text_source = reference_dict.get(
+                        "text_source", "lrclib-plain")
+                    timing_source = "forced-alignment"
+                    log.info("  forced alignment: chosen id=%s coverage=%.1f%% "
+                             "mean_score=%.3f",
+                             (chosen.get("record") or {}).get("id"),
+                             float(alignment_info.get("word_coverage", 0.0)) * 100,
+                             float(alignment_info.get("mean_score", 0.0)))
+                finally:
+                    align_session.close()
+            else:
+                legacy_records = None
+                if english_compat:
+                    legacy_records = reference.load_legacy_search(
+                        cache_dir, artist, title)
+                if english_compat and legacy_records:
+                    chosen, candidates = reference.choose_legacy_candidate(
+                        legacy_records, language, duration, local)
+                    log.info("  English compatibility: %d legacy candidate(s)",
+                             len(candidates))
+                else:
+                    chosen, candidates = reference.choose_candidate(
+                        lookup.records, language, duration, audio_data, local=local,
+                        fetch_full=client.fetch_by_id)
+                if chosen:
+                    reference_dict = reference.reference_from_candidate(chosen)
+                    reference_dict["local"] = local
+                    cues.align_reference_words(reference_dict, local, duration, language)
+                    cues.drop_duplicate_unmatched_lines(reference_dict, language)
+                    _reject_suspect_reference_offset(reference_dict, report)
+                    reference_line_count = _reference_line_count(
+                        reference_dict, language)
+                    built = cues.build_lyric_lines(
+                        reference_dict, duration, audio_data, language)
+                    text_source = reference_dict.get("text_source", "lrclib-plain")
+                    timing_source = "asr"
+                else:
+                    built = cues.build_from_transcript(
+                        transcript, duration, language)
+                    text_source = "asr"
+                    timing_source = "asr"
         else:
-            built = cues.build_from_transcript(transcript, duration, language)
-            text_source = "asr"
-            timing_source = "asr"
+            if transcript is None:
+                raise RuntimeError("no lyric source and no ASR transcript")
+            asr_lines = cues.build_from_transcript(transcript, duration, language)
+            if not asr_lines:
+                raise RuntimeError("ASR produced no lyric lines")
+            tokens = cues.flat_lrc_tokens(asr_lines, language)
+            align_session = align.AlignSession()
+            try:
+                started = time.perf_counter()
+                result = align_session.align_audio_candidate(
+                    audio_data, asr_lines, tokens, language)
+                alignment_info = result.summary
+                line_alignments = result.lines
+                aligner_info = {
+                    "model": align_session.model_name,
+                    "device": align_session.device,
+                    "dtype": str(align_session.dtype),
+                    "load_seconds": round(align_session.load_seconds, 2),
+                    "seconds": _seconds(started),
+                }
+                report["stages"]["alignment"] = aligner_info
+                built = cues.build_aligned_asr_lines(
+                    asr_lines, line_alignments, duration, audio_data, language)
+                text_source = "asr"
+                timing_source = "forced-alignment"
+            finally:
+                align_session.close()
 
         if not built:
             raise RuntimeError("no lyric lines were produced")
@@ -456,6 +736,17 @@ def process_song(stem: str, original: Path, karaoke: Path, cache_dir: Path,
             qa_result["review_reasons"].append(
                 f"reference timing offset {offset_reset:+.1f}s was rejected; "
                 "line timings use LRCLIB/onset fallback")
+        line_timing_sources = _timing_source_summary(final_cues)
+        if line_timing_sources["asr_fallback_lines"]:
+            qa_result["needs_review"] = True
+            qa_result["review_reasons"].append(
+                f"{len(line_timing_sources['asr_fallback_lines'])} line(s) use "
+                "Whisper word timing because forced alignment failed")
+        if alignment_info and not reference_dict:
+            if not line_timing_sources["counts"].get("forced-alignment"):
+                timing_source = "asr"
+        elif alignment_info:
+            timing_source = "forced-alignment"
 
         chosen_id = None
         if chosen and chosen.get("record"):
@@ -485,12 +776,22 @@ def process_song(stem: str, original: Path, karaoke: Path, cache_dir: Path,
             "reference_lines_present": qa_result["retention"]["reference_lines_present"],
             "line_retention": qa_result["retention"]["line_retention"],
             "line_level": qa_result["alignment"]["line_level"],
+            "line_timing_sources": line_timing_sources,
             "alignment": {
                 "coverage": round(qa_result["alignment"]["coverage"], 4),
                 "inferred_words": qa_result["alignment"]["inferred_words"],
                 "inferred_rate": round(qa_result["alignment"]["inferred_rate"], 4),
                 "line_level_lines": qa_result["alignment"]["line_level_lines"],
                 "line_level_rate": round(qa_result["alignment"]["line_level_rate"], 4),
+                "forced": alignment_info is not None,
+                "candidate": alignment_info,
+                "reference_lines": (_alignment_lines_summary(line_alignments)
+                                    if line_alignments else []),
+            },
+            "asr": {
+                "used": asr_used,
+                "reason": asr_reason,
+                "stage": report["stages"].get("asr"),
             },
             "script": qa_result["script"],
             "sanity": qa_result["sanity"],
@@ -502,7 +803,7 @@ def process_song(stem: str, original: Path, karaoke: Path, cache_dir: Path,
             }] if offset_reset is not None else []),
             "vocal_stem": stem_info["path"],
             "vocal_stem_sha256": cache.sha256_file(vocals),
-            "models": model_info,
+            "models": {**model_info, "aligner": aligner_info},
             "stage_seconds": report["stages"],
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "output_sha256": publish.lines_sha256(final_cues),
@@ -576,6 +877,8 @@ def main() -> int:
                         help="re-run Demucs and Whisper even when cached")
     parser.add_argument("--overwrite-edited", action="store_true",
                         help="replace lyric files that were edited outside the pipeline")
+    parser.add_argument("--align-english", action="store_true",
+                        help="use forced alignment for English songs instead of ASR timing")
     parser.add_argument("--missing", action="store_true",
                         help="only process songs that do not have an .srt yet")
     parser.add_argument("--verbose", action="store_true")
@@ -604,7 +907,10 @@ def main() -> int:
     cache_dir = args.cache_dir.resolve()
     cache_dir.mkdir(parents=True, exist_ok=True)
     reports_dir = cache_dir / "reports"
-    backups_dir = cache_dir / "backups"
+    if output_dir.resolve() == LYRICS_DIR.resolve():
+        backups_dir = cache_dir / "backups"
+    else:
+        backups_dir = output_dir / "backups"
     log.info("processing %d song(s); cache: %s; output: %s",
              len(songs), cache_dir, output_dir)
 
@@ -618,7 +924,7 @@ def main() -> int:
                 use_online=not args.no_online, force=args.force,
                 output_dir=output_dir, overwrite_edited=args.overwrite_edited,
                 reports_dir=reports_dir, backups_dir=backups_dir,
-                source_dir=SOURCE_DIR)
+                source_dir=SOURCE_DIR, align_english=args.align_english)
             if report.get("status") == "skipped":
                 skipped += 1
             elif report.get("status") == "blocked":

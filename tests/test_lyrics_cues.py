@@ -1,8 +1,16 @@
 """Cue-building tests for line-level fallback and inferred gap timing."""
 from __future__ import annotations
 
-from tools.generate_lyrics import _reject_suspect_reference_offset
+from tools.generate_lyrics import _needs_full_asr, _reject_suspect_reference_offset
 from tools.lyrics import cues
+
+
+def test_needs_full_asr_language_paths():
+    assert _needs_full_asr("tl", True, False)[0] is False
+    assert _needs_full_asr("en", True, False)[0] is True
+    assert _needs_full_asr("en", True, True)[0] is False
+    assert _needs_full_asr("ja", True, False)[0] is True
+    assert _needs_full_asr("en", False, False)[0] is True
 
 
 def _reference():
@@ -69,6 +77,52 @@ def test_distribute_words_is_always_marked_inferred():
     words = cues.distribute_words(
         [{"text": "a", "norm": "a"}, {"text": "bb", "norm": "bb"}], 0.0, 2.0)
     assert all(word["inferred"] is True for word in words)
+
+
+def test_trim_leading_alignment_gap_only_moves_silent_leading_words(monkeypatch):
+    monkeypatch.setattr(cues, "max_window_rms", lambda *args, **kwargs: 0.001)
+    words = [
+        {"start": 10.0, "end": 30.0},
+        {"start": 30.0, "end": 30.5},
+    ]
+    cues._trim_leading_alignment_gap(words, 29.0, audio=object())
+    assert words[0]["start"] == 29.0
+
+    held = [
+        {"start": 10.0, "end": 30.0},
+        {"start": 30.0, "end": 30.5},
+    ]
+    monkeypatch.setattr(cues, "max_window_rms", lambda *args, **kwargs: 0.5)
+    cues._trim_leading_alignment_gap(held, 29.0, audio=object())
+    assert held[0]["start"] == 10.0
+
+
+def test_build_aligned_asr_lines_uses_whisper_only_for_failed_line():
+    asr_lines = [{
+        "start": 0.0,
+        "end": 2.0,
+        "text": "hello world",
+        "words": [
+            {"text": "hello", "start": 0.0, "end": 1.0},
+            {"text": "world", "start": 1.0, "end": 2.0},
+        ],
+    }]
+    failed = cues.build_aligned_asr_lines(
+        asr_lines, [{"coverage": 0.0, "words": []}], 10.0,
+        audio=None, language="en")
+    assert len(failed) == 1
+    assert failed[0]["timing_source"] == "asr"
+    assert failed[0]["line_fallback_reason"]
+    assert [word["text"] for word in failed[0]["words"]] == ["hello", "world"]
+
+    aligned = cues.build_aligned_asr_lines(
+        asr_lines, [{"coverage": 1.0, "words": [
+            {"token": 0, "aligned": True, "start": 0.0, "end": 0.5},
+            {"token": 1, "aligned": True, "start": 0.5, "end": 1.0},
+        ]}], 10.0, audio=None, language="en")
+    assert len(aligned) == 1
+    assert aligned[0]["timing_source"] == "forced-alignment"
+    assert [word["text"] for word in aligned[0]["words"]] == ["hello", "world"]
 
 
 def test_build_from_transcript_text_matches_word_texts():

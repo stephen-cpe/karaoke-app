@@ -9,6 +9,7 @@ from tools.lyrics import reference
 
 
 def test_parse_lyricsfile_reads_line_and_word_times():
+    pytest.importorskip("yaml")
     payload = """
 version: "1.0"
 metadata:
@@ -120,6 +121,7 @@ def test_user_override_language_only(tmp_path):
 
 
 def test_choose_candidate_rejects_wrong_duration_and_prefers_word_sync():
+    pytest.importorskip("yaml")
     good = {
         "id": 2,
         "trackName": "Test",
@@ -151,6 +153,46 @@ lines:
     assert chosen["record"]["id"] == 2
     assert chosen["word_sync"] is True
     assert scored[0]["record"]["id"] == 2
+
+
+def test_legacy_search_cache_and_text_choice(tmp_path):
+    matching = {
+        "id": 1,
+        "trackName": "Test",
+        "artistName": "Artist",
+        "duration": 10.0,
+        "syncedLyrics": "[00:01.00]Hello world\n[00:02.00]Goodbye now\n",
+    }
+    wrong = {
+        "id": 2,
+        "trackName": "Test",
+        "artistName": "Artist",
+        "duration": 10.0,
+        "syncedLyrics": "[00:01.00]Completely different\n[00:02.00]Words here\n",
+    }
+    cache_dir = tmp_path / "lrclib"
+    cache_dir.mkdir()
+    (cache_dir / "artist_test.json").write_text(
+        json.dumps([wrong, matching]), encoding="utf-8")
+
+    loaded = reference.load_legacy_search(tmp_path, "Artist", "Test")
+    assert loaded == [wrong, matching]
+    assert reference.load_legacy_search(tmp_path, "Artist", "Missing") is None
+
+    local = [
+        {"text": "hello", "norm": "hello", "start": 1.0, "end": 1.5},
+        {"text": "world", "norm": "world", "start": 1.5, "end": 2.0},
+        {"text": "goodbye", "norm": "goodbye", "start": 2.0, "end": 2.5},
+        {"text": "now", "norm": "now", "start": 2.5, "end": 3.0},
+    ]
+    chosen, scored = reference.choose_legacy_candidate(
+        [wrong, matching], "en", 10.0, local)
+    assert chosen is not None
+    assert chosen["record"]["id"] == 1
+    assert chosen["form_name"] == "synced"
+    assert scored[0]["record"]["id"] == 1
+    assert len(scored) == 1
+    assert scored[0]["coverage"] == 1.0
 
 
 def test_script_compatibility():

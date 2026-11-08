@@ -1,6 +1,7 @@
 """faster-whisper wrapper: language ID windows, content-keyed transcription."""
 from __future__ import annotations
 
+import json
 import logging
 import os
 import site
@@ -368,6 +369,38 @@ def transcribe_cached(stem: str, vocals: Path, original_hash: str, language: str
                   "seconds": round(seconds, 2)}
 
 
+def load_legacy_transcript(cache_dir: Path, stem: str, duration: float,
+                           language: str = "en"
+                           ) -> tuple[dict[str, Any] | None, str | None]:
+    """Load the pre-Phase-1 ``<stem>.json`` transcript cache when it matches.
+
+    English compatibility keeps the old ASR-based timing, so reusing the same
+    transcript avoids both a fresh Whisper pass and small timing changes that
+    would make the English regression comparison noisy.
+    """
+    path = cache_dir / "transcripts" / f"{stem}.json"
+    if not path.is_file():
+        return None, None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None, None
+    if not isinstance(data, dict) or data.get("transcriber") != "chunked-v2":
+        return None, None
+    info = data.get("info") or {}
+    if str(info.get("language") or "").lower() != language:
+        return None, None
+    try:
+        cached_duration = float(info.get("duration") or 0.0)
+    except (TypeError, ValueError):
+        return None, None
+    if abs(cached_duration - float(duration)) > 1.0:
+        return None, None
+    if not data.get("segments"):
+        return None, None
+    return data, str(path)
+
+
 def strip_hallucinations(transcript: dict) -> dict:
     """Remove boilerplate Whisper invents at the end of video-sourced audio."""
     phrases = (
@@ -455,7 +488,13 @@ def local_words(transcript: dict, language: str = "en") -> list[dict[str, Any]]:
 
 def build_prompt(title: str, artist: str, language: str,
                  reference_text: str | None = None) -> str:
-    """Keep the prompt short and in the song's language/script."""
+    """Build a short, neutral prompt.
+
+    Reference lyric lines are deliberately not used: feeding the answer to
+    Whisper inflates apparent agreement, especially for JA/KO. ``reference_text``
+    is accepted for call-site compatibility but ignored.
+    """
+    del reference_text
     if language in ("en", "tl"):
         prompt = f"{artist} - {title}" if artist else title
         return prompt.strip()[:120]
@@ -468,11 +507,6 @@ def build_prompt(title: str, artist: str, language: str,
             return any("\uac00" <= char <= "\ud7af" for char in value)
         return False
 
-    if reference_text:
-        for line in reference_text.splitlines():
-            line = line.strip()
-            if line and target(line):
-                return line[:120]
     candidate = f"{artist} {title}".strip()
     if candidate and target(candidate):
         return candidate[:120]

@@ -218,7 +218,7 @@ def evaluate_song(stem: str, lyrics_dir: Path, cache_dir: Path,
             line_long += 1
             if vocal_audio is not None:
                 rms = max_window_rms(
-                    vocal_audio, SAMPLE_RATE,
+                    vocal_audio,
                     float(word.get("start", 0.0)), float(word.get("end", 0.0)))
                 if rms >= HELD_NOTE_RMS:
                     long_words_supported += 1

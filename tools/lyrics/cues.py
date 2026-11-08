@@ -9,6 +9,7 @@ from . import textnorm
 from .audio import (
     PHRASE_LINGER,
     STRONG_ONSET_RMS,
+    max_window_rms,
     vocal_onset,
     vocal_phrase_end,
     window_rms,
@@ -19,6 +20,9 @@ log = logging.getLogger("lyrics")
 INSTRUMENTAL_GAP = 3.0
 MIN_LINE_LEVEL_TOKENS = 1
 MIN_WORD_LENGTH = 0.12
+LINE_COVERAGE_TARGET = 0.80
+LEADING_GAP_SECONDS = 12.0
+LEADING_GAP_RMS = 0.02
 
 
 def srt_time(seconds: float) -> str:
@@ -316,6 +320,69 @@ def align_reference_words(reference: dict, local: list[dict], duration: float,
     offsets = sorted(anchors[index] - lines[index]["start"] for index in anchors)
     if offsets:
         reference["offset"] = offsets[len(offsets) // 2]
+
+
+def drop_duplicate_unmatched_lines(reference: dict, language: str = "en") -> None:
+    """Remove a repeated LRC line that has no audio match of its own.
+
+    LRCLIB sometimes lists the same line twice while Whisper merges both
+    repetitions into one phrase. Keeping the second line creates a squeezed
+    duplicate cue that highlights the first line's words again.
+    """
+    lines = reference["lines"]
+    tokens = reference["tokens"]
+    token_local = reference.get("token_local", {})
+    tokens_by_line: dict[int, list[int]] = {
+        index: [] for index in range(len(lines))}
+    for token_index, token in enumerate(tokens):
+        tokens_by_line[token["line"]].append(token_index)
+
+    def line_norm(text: str) -> str:
+        return " ".join(
+            token["norm"]
+            for token in textnorm.split_display_tokens(text, language))
+
+    skip: set[int] = set()
+    for line_index in range(1, len(lines)):
+        if line_norm(str(lines[line_index].get("text") or "")) != line_norm(
+                str(lines[line_index - 1].get("text") or "")):
+            continue
+        if any(index in token_local for index in tokens_by_line[line_index]):
+            continue
+        skip.add(line_index)
+    if not skip:
+        return
+
+    line_map: dict[int, int] = {}
+    new_lines = []
+    for line_index, line in enumerate(lines):
+        if line_index in skip:
+            continue
+        line_map[line_index] = len(new_lines)
+        new_lines.append(line)
+
+    token_map: dict[int, int] = {}
+    new_tokens = []
+    for token_index, token in enumerate(tokens):
+        if token["line"] in skip:
+            continue
+        token_map[token_index] = len(new_tokens)
+        token = dict(token)
+        token["line"] = line_map[token["line"]]
+        new_tokens.append(token)
+
+    reference["lines"] = new_lines
+    reference["tokens"] = new_tokens
+    reference["anchors"] = {
+        line_map[line_index]: value
+        for line_index, value in reference.get("anchors", {}).items()
+        if line_index in line_map
+    }
+    reference["token_local"] = {
+        token_map[token_index]: local_index
+        for token_index, local_index in token_local.items()
+        if token_index in token_map
+    }
 
 
 def _line_max_duration(token_count: int) -> float:
@@ -640,3 +707,341 @@ def flat_lrc_tokens(lines: list[dict], language: str = "en") -> list[dict]:
                 "line_start": line["start"],
             })
     return tokens
+
+
+def _word_value(word, name: str, default=None):
+    if isinstance(word, dict):
+        return word.get(name, default)
+    return getattr(word, name, default)
+
+
+def _aligned_word_map(line_alignment: dict) -> dict[int, object]:
+    mapping = {}
+    for word in line_alignment.get("words") or []:
+        token_index = _word_value(word, "token")
+        if isinstance(token_index, int):
+            mapping[token_index] = word
+    return mapping
+
+
+def _interpolate_aligned(tokens: list[dict], word_map: dict[int, object],
+                         line_start: float, line_end: float):
+    """Return measured/inferred word timings, or None for a large gap."""
+    words: list[dict | None] = [None] * len(tokens)
+    for index, word in word_map.items():
+        if not 0 <= index < len(tokens):
+            continue
+        if not _word_value(word, "aligned", False):
+            continue
+        start = float(_word_value(word, "start", 0.0))
+        end = float(_word_value(word, "end", 0.0))
+        if end <= start:
+            continue
+        words[index] = {
+            "text": tokens[index]["text"],
+            "start": max(line_start, start),
+            "end": min(line_end, end),
+        }
+
+    index = 0
+    while index < len(tokens):
+        if words[index] is not None:
+            index += 1
+            continue
+        run_start = index
+        while index < len(tokens) and words[index] is None:
+            index += 1
+        run_end = index
+        run_length = run_end - run_start
+        if run_length != 1 or run_start == 0 or run_end == len(tokens):
+            return None
+        previous = words[run_start - 1]
+        following = words[run_end]
+        if previous is None or following is None:
+            return None
+        gap_start = previous["end"]
+        gap_end = following["start"]
+        if gap_end <= gap_start:
+            return None
+        words[run_start] = {
+            "text": tokens[run_start]["text"],
+            "start": gap_start,
+            "end": gap_end,
+            "inferred": True,
+        }
+
+    result = []
+    previous_end = line_start
+    for word in words:
+        if word is None:
+            return None
+        start = max(line_start, previous_end, word["start"])
+        end = min(line_end, max(start + MIN_WORD_LENGTH, word["end"]))
+        item = {"text": word["text"], "start": round(start, 3),
+                "end": round(end, 3)}
+        if word.get("inferred"):
+            item["inferred"] = True
+        result.append(item)
+        previous_end = end
+    return result
+
+
+def _line_level_timing(line: dict, next_start: float | None, duration: float,
+                       audio) -> tuple[float, float, str | None]:
+    start = line.get("start")
+    reason = "forced-alignment coverage below the 80% threshold"
+    if start is None:
+        start = 0.0
+        reason = "no reliable reference timestamp"
+    start = float(start)
+    if audio is not None:
+        onset = vocal_onset(audio, max(0.0, start - 0.5), min(duration, start + 4.0))
+        if onset is not None:
+            start = onset
+    start = max(0.0, min(start, max(0.0, duration - 0.3)))
+    limit = next_start if next_start is not None else duration
+    end = min(duration, max(start + 0.8, min(limit - 0.05, start + 8.0)))
+    if audio is not None:
+        phrase_end = vocal_phrase_end(audio, start, end)
+        if phrase_end is not None:
+            end = min(end, max(start + 0.6, phrase_end + PHRASE_LINGER))
+    end = min(duration, max(start + 0.3, end))
+    return start, end, reason
+
+
+def _trim_leading_alignment_gap(words: list[dict], line_start: float | None,
+                                audio) -> None:
+    """Move a line's first word out of a long, silent instrumental gap.
+
+    CTC alignment can stretch the first word of a line across a long
+    instrumental break when the reference timestamp is on the far side of it.
+    Only do this when the word's opening seconds are effectively silent; a
+    genuinely held note (e.g. a sustained "Oh") keeps its full duration.
+    """
+    if len(words) < 2 or audio is None:
+        return
+    first = words[0]
+    second = words[1]
+    first_duration = float(first["end"]) - float(first["start"])
+    gap_to_second = float(second["start"]) - float(first["start"])
+    if first_duration <= LEADING_GAP_SECONDS or gap_to_second <= LEADING_GAP_SECONDS:
+        return
+    early_end = min(float(first["end"]), float(first["start"]) + 2.0)
+    if max_window_rms(audio, float(first["start"]), early_end) >= LEADING_GAP_RMS:
+        return
+    shift = None
+    if (line_start is not None
+            and float(first["start"]) < float(line_start) < float(second["start"])):
+        shift = float(line_start)
+    else:
+        onset = vocal_onset(audio, float(first["start"]) + 1.0,
+                            float(second["start"]))
+        if onset is not None and onset > float(first["start"]) + 1.0:
+            shift = onset
+    if shift is not None:
+        first["start"] = round(
+            min(shift, float(second["start"]) - MIN_WORD_LENGTH), 3)
+
+
+def _cue_with_words(tokens: list[dict], words: list[dict], start: float,
+                    end: float, line_index: int, duration: float) -> dict:
+    start = max(0.0, start)
+    end = min(duration, max(start + 0.3, end))
+    return {
+        "start": round(start, 3),
+        "end": round(end, 3),
+        "text": textnorm.join_tokens(tokens),
+        "words": words,
+        "instrumental": False,
+        "reference_index": line_index,
+        "timing_source": "forced-alignment",
+    }
+
+
+def _trim_cue_overlaps(cues: list[dict], duration: float) -> list[dict]:
+    """Trim the previous cue's linger instead of throwing away aligned words."""
+    for index in range(len(cues) - 1):
+        previous = cues[index]
+        current = cues[index + 1]
+        if current["start"] >= previous["end"] - 0.001:
+            continue
+        last_word_end = max(
+            (float(word.get("end", previous["start"]))
+             for word in previous.get("words") or []),
+            default=float(previous["start"]))
+        if current["start"] <= last_word_end + 0.001:
+            if (previous.get("words")
+                    and last_word_end - float(current["start"]) <= 0.05):
+                last_word = previous["words"][-1]
+                last_word["end"] = round(
+                    min(float(last_word["end"]), float(current["start"])), 3)
+                if last_word["end"] > last_word["start"]:
+                    previous["end"] = round(float(current["start"]), 3)
+                    continue
+            current["words"] = []
+            current["timing_source"] = "none"
+            current["line_level_reason"] = (
+                "cue overlapped the previous aligned line")
+            current["start"] = round(min(max(0.0, duration - 0.3),
+                                         float(previous["end"]) + 0.01), 3)
+            current["end"] = round(max(current["start"] + 0.3,
+                                       min(duration, float(current["end"]))), 3)
+            continue
+        new_end = max(float(previous["start"]) + MIN_WORD_LENGTH,
+                      min(float(previous["end"]), float(current["start"]) - 0.05),
+                      last_word_end + 0.001)
+        previous["end"] = round(min(duration, new_end), 3)
+    return cues
+
+
+def build_aligned_lines(reference: dict, line_alignments: list[dict],
+                        duration: float, audio=None,
+                        language: str = "en") -> list[dict]:
+    """Build cues from forced-alignment word timings, with line-level fallback."""
+    lines = reference.get("lines") or []
+    built = []
+    previous_end = 0.0
+    for line_index, line in enumerate(lines):
+        tokens = textnorm.split_display_tokens(
+            str(line.get("text") or ""), language)
+        if not tokens:
+            continue
+        alignment = (line_alignments[line_index]
+                     if line_index < len(line_alignments) else {})
+        word_map = _aligned_word_map(alignment)
+        coverage = float(alignment.get("coverage") or 0.0)
+        next_start = None
+        for later in lines[line_index + 1:]:
+            if later.get("start") is not None:
+                next_start = float(later["start"])
+                break
+
+        words = None
+        if coverage >= LINE_COVERAGE_TARGET:
+            candidate_start = min(
+                (float(_word_value(word, "start", 0.0))
+                 for word in word_map.values()
+                 if _word_value(word, "aligned", False)),
+                default=float(line.get("start") or previous_end))
+            candidate_end = max(
+                (float(_word_value(word, "end", candidate_start))
+                 for word in word_map.values()
+                 if _word_value(word, "aligned", False)),
+                default=candidate_start + 0.3)
+            candidate_end = min(duration, candidate_end + PHRASE_LINGER)
+            words = _interpolate_aligned(tokens, word_map, candidate_start,
+                                          candidate_end)
+            if words:
+                _trim_leading_alignment_gap(words, line.get("start"), audio)
+                start = words[0]["start"]
+                end = max(words[-1]["end"], candidate_end)
+                if audio is not None:
+                    phrase_end = vocal_phrase_end(audio, start, end)
+                    if phrase_end is not None:
+                        end = max(words[-1]["end"], min(
+                            end, phrase_end + PHRASE_LINGER))
+                end = min(duration, max(start + 0.3, end))
+                if start >= duration - 0.05:
+                    words = None
+                else:
+                    cue = _cue_with_words(
+                        tokens, words, start, end, line_index, duration)
+                    built.append(cue)
+                    previous_end = cue["end"]
+                    continue
+
+        start, end, reason = _line_level_timing(
+            line, next_start, duration, audio)
+        if start >= duration - 0.05:
+            continue
+        end = min(duration, max(start + 0.3, end))
+        built.append({
+            "start": round(start, 3),
+            "end": round(end, 3),
+            "text": textnorm.join_tokens(tokens),
+            "words": [],
+            "instrumental": False,
+            "reference_index": line_index,
+            "timing_source": "none",
+            "line_level_reason": reason,
+        })
+        previous_end = end
+    return _trim_cue_overlaps(built, duration)
+
+
+def build_aligned_asr_lines(asr_lines: list[dict], line_alignments: list[dict],
+                            duration: float, audio=None,
+                            language: str = "en") -> list[dict]:
+    """Use forced alignment for ASR lines; fall back to Whisper word timings."""
+    built = []
+    previous_end = 0.0
+    for line_index, line in enumerate(asr_lines):
+        tokens = textnorm.split_display_tokens(
+            str(line.get("text") or ""), language)
+        if not tokens:
+            continue
+        alignment = (line_alignments[line_index]
+                     if line_index < len(line_alignments) else {})
+        word_map = _aligned_word_map(alignment)
+        coverage = float(alignment.get("coverage") or 0.0)
+        words = None
+        if coverage >= LINE_COVERAGE_TARGET:
+            candidate_start = min(
+                (float(_word_value(word, "start", 0.0))
+                 for word in word_map.values()
+                 if _word_value(word, "aligned", False)),
+                default=float(line.get("start") or previous_end))
+            candidate_end = max(
+                (float(_word_value(word, "end", candidate_start))
+                 for word in word_map.values()
+                 if _word_value(word, "aligned", False)),
+                default=candidate_start + 0.5)
+            candidate_end = min(duration, candidate_end + PHRASE_LINGER)
+            words = _interpolate_aligned(tokens, word_map, candidate_start,
+                                          candidate_end)
+        if words:
+            _trim_leading_alignment_gap(words, None, audio)
+            start = words[0]["start"]
+            end = min(duration, max(words[-1]["end"], start + 0.3))
+            if start >= duration - 0.05:
+                words = None
+            else:
+                if audio is not None:
+                    phrase_end = vocal_phrase_end(audio, start, end)
+                    if phrase_end is not None:
+                        end = max(words[-1]["end"],
+                                  min(end, phrase_end + PHRASE_LINGER))
+                cue = _cue_with_words(
+                    tokens, words, start, end, line_index, duration)
+                cue["reference_index"] = None
+                built.append(cue)
+                previous_end = cue["end"]
+                continue
+
+        asr_words = [dict(word) for word in line.get("words") or []]
+        if not asr_words:
+            continue
+        start = float(asr_words[0].get("start", 0.0))
+        if start >= duration - 0.05:
+            continue
+        end = min(duration, max(float(asr_words[-1].get("end", start + 0.3)),
+                                start + 0.3))
+        for word in asr_words:
+            word["start"] = round(max(start, float(word.get("start", start))), 3)
+            word["end"] = round(min(end, max(word["start"] + MIN_WORD_LENGTH,
+                                             float(word.get("end", word["start"])))), 3)
+        words_text = " ".join(str(word.get("text", "")) for word in asr_words)
+        built.append({
+            "start": round(start, 3),
+            "end": round(end, 3),
+            "text": textnorm.clean_text(words_text, language=language),
+            "words": asr_words,
+            "instrumental": False,
+            "reference_index": None,
+            "timing_source": "asr",
+            "line_fallback_reason": (
+                f"forced-alignment coverage {coverage:.1%} below 80%; "
+                "using Whisper word timings"),
+        })
+        previous_end = end
+    return _trim_cue_overlaps(built, duration)

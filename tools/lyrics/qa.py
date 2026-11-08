@@ -165,10 +165,15 @@ def line_start_deviation(cues: list[dict[str, Any]],
             continue
         deviations.append(float(cue["start"]) - (float(start) + offset))
     if not deviations:
-        return {"median": None, "p90": None, "count": 0}
+        return {"median": None, "p90": None, "offset_corrected_p90": None,
+                "count": 0}
+    median = statistics.median(deviations)
+    corrected = [value - median for value in deviations]
     return {
-        "median": round(statistics.median(deviations), 3),
+        "median": round(median, 3),
         "p90": round(_percentile([abs(value) for value in deviations], 0.9), 3),
+        "offset_corrected_p90": round(
+            _percentile([abs(value) for value in corrected], 0.9), 3),
         "count": len(deviations),
     }
 
@@ -248,6 +253,22 @@ def evaluate(*, cues: list[dict[str, Any]], language: str, audio,
     if reference and alignment["inferred_rate"] > 0.05:
         reasons.append(
             f"inferred-word rate is {alignment['inferred_rate']:.1%} (target 5%)")
+    if reference and deviation.get("count"):
+        median = deviation.get("median")
+        p90 = deviation.get("p90")
+        corrected = deviation.get("offset_corrected_p90")
+        if ((median is not None and abs(float(median)) > 0.30)
+                or (p90 is not None and float(p90) > 0.80)):
+            median_text = (f"{float(median):+.2f}"
+                           if median is not None else "n/a")
+            p90_text = f"{float(p90):.2f}" if p90 is not None else "n/a"
+            corrected_text = (f"{float(corrected):.2f}"
+                              if corrected is not None else "n/a")
+            reasons.append(
+                "line-start deviation vs LRCLIB is "
+                f"median {median_text}s, p90 {p90_text}s "
+                f"(offset-corrected p90 {corrected_text}s; "
+                "target 0.30/0.80); the reference timestamps may be offset")
 
     return {
         "alignment": alignment,

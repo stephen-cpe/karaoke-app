@@ -445,6 +445,153 @@ def choose_candidate(records: list[dict[str, Any]], language: str, duration: flo
     return best, preliminary
 
 
+def legacy_search_path(cache_dir: Path, artist: str, title: str) -> Path:
+    """Path of the pre-Phase-1 LRCLIB search cache for one song."""
+    key = re.sub(r"[^a-z0-9]+", "_", f"{artist}_{title}".lower()).strip("_")
+    return cache_dir / "lrclib" / f"{key}.json"
+
+
+def load_legacy_search(cache_dir: Path, artist: str, title: str
+                       ) -> list[dict[str, Any]] | None:
+    """Load the old artist/title search cache used by the English pipeline.
+
+    Phase 1 switched to the LRCLIB /api/get endpoint, whose records can carry
+    a different ``lyricsfile`` form. English output must keep the old synced
+    text, so the compatibility path reads the same cache the old code used.
+    """
+    path = legacy_search_path(cache_dir, artist, title)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, list) or not data:
+        return None
+    return [record for record in data if isinstance(record, dict)]
+
+
+def _token_match(local: list[dict[str, Any]],
+                 tokens: list[dict[str, Any]]) -> tuple[int, dict[int, int]]:
+    if not local or not tokens:
+        return 0, {}
+    matcher = difflib.SequenceMatcher(
+        None, [word["norm"] for word in local],
+        [token["norm"] for token in tokens], autojunk=False)
+    blocks = [block for block in matcher.get_matching_blocks() if block.size]
+    matched = sum(block.size for block in blocks)
+    token_local: dict[int, int] = {}
+    for block in blocks:
+        for offset in range(block.size):
+            token_local[block.b + offset] = block.a + offset
+    return matched, token_local
+
+
+def _robust_line_anchors(lines: list[dict[str, Any]],
+                         tokens: list[dict[str, Any]],
+                         token_local: dict[int, int],
+                         local: list[dict[str, Any]]
+                         ) -> tuple[dict[int, float], dict[str, float]]:
+    """Keep line anchors that agree with the song's overall text offset."""
+    starts_by_line: dict[int, list[float]] = {}
+    first_token: dict[int, int] = {}
+    for token_index, token in enumerate(tokens):
+        first_token.setdefault(token["line"], token_index)
+    for token_index, local_index in token_local.items():
+        line_index = tokens[token_index]["line"]
+        if token_index != first_token[line_index]:
+            continue
+        starts_by_line.setdefault(line_index, []).append(
+            local[local_index]["start"])
+    if not starts_by_line:
+        return {}, {}
+
+    offsets = sorted(min(starts) - float(lines[line_index]["start"])
+                     for line_index, starts in starts_by_line.items())
+    median = offsets[len(offsets) // 2]
+    mad = sorted(abs(offset - median) for offset in offsets)[len(offsets) // 2]
+    tolerance = max(1.25, min(3.0, 5.0 * mad))
+
+    anchors = {}
+    for line_index, starts in starts_by_line.items():
+        start = min(starts)
+        if abs(start - float(lines[line_index]["start"]) - median) <= tolerance:
+            anchors[line_index] = start
+
+    monotonic = {}
+    last_start = None
+    for line_index in sorted(anchors):
+        if last_start is not None and anchors[line_index] <= last_start:
+            continue
+        monotonic[line_index] = anchors[line_index]
+        last_start = anchors[line_index]
+    return monotonic, {"median_offset": median, "mad": mad,
+                       "tolerance": tolerance}
+
+
+def choose_legacy_candidate(records: list[dict[str, Any]], language: str,
+                            duration: float, local: list[dict[str, Any]]
+                            ) -> tuple[dict[str, Any] | None,
+                                       list[dict[str, Any]]]:
+    """Score old-cache synced lyrics against Whisper words like Phase 0 did."""
+    if not records or not local:
+        return None, []
+    scored_items = []
+    for record in records:
+        lines = parse_lrc(record.get("syncedLyrics") or "", language)
+        if not lines:
+            continue
+        tokens = flatten_tokens(lines, language)
+        if not tokens:
+            continue
+        matched, token_local = _token_match(local, tokens)
+        if not matched:
+            continue
+        anchors, anchor_stats = _robust_line_anchors(
+            lines, tokens, token_local, local)
+        if not anchors:
+            continue
+        offset = anchor_stats["median_offset"]
+        coverage = matched / len(tokens)
+        local_coverage = matched / len(local)
+        penalty = version_penalty(record, duration)
+        score = 8 * coverage + 4 * local_coverage - 0.05 * abs(offset) - penalty
+        text = _form_text(lines)
+        scored_items.append({
+            "record": record,
+            "forms": {},
+            "form": {
+                "name": "synced",
+                "lines": lines,
+                "text": text,
+                "line_count": len(lines),
+                "has_timestamps": True,
+                "word_sync": False,
+                "script": langdetect.script_summary(text),
+                "tagalog": langdetect.tagalog_lexicon(text),
+            },
+            "lines": lines,
+            "tokens": tokens,
+            "language": language,
+            "score": score,
+            "duration_error": (
+                abs(float(record.get("duration")) - duration)
+                if record.get("duration") is not None else 999.0),
+            "compatibility": langdetect.script_compatibility(language, text),
+            "energy_score": 0.0,
+            "penalty": penalty,
+            "coverage": coverage,
+            "local_coverage": local_coverage,
+            "offset": offset,
+            "word_sync": False,
+            "form_name": "synced",
+            "token_local": token_local,
+            "anchors": anchors,
+            "anchor_mad": anchor_stats["mad"],
+            "anchor_tolerance": anchor_stats["tolerance"],
+        })
+    scored_items.sort(key=lambda item: item["score"], reverse=True)
+    return (scored_items[0] if scored_items else None), scored_items
+
+
 def user_override(source_dir: Path, stem: str) -> dict[str, Any] | None:
     """Load lyrics/source/<stem>.lrc, .txt, or .json when present."""
     if not source_dir.is_dir():

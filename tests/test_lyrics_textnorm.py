@@ -72,6 +72,7 @@ def test_norm_token_auto_keeps_cjk_and_hangul():
 
 
 def test_japanese_tokenization_keeps_script_and_spacing():
+    pytest.importorskip("fugashi")
     tokens = textnorm.split_display_tokens("君の名前は, 東京!", "ja")
     assert tokens
     assert all(token["norm"] for token in tokens)
@@ -92,5 +93,7 @@ def test_korean_tokenization_keeps_eojeol():
     ("사랑해 안녕하세요", "ko"),
 ])
 def test_line_text_round_trip(text, language):
+    if language == "ja":
+        pytest.importorskip("fugashi")
     tokens = textnorm.split_display_tokens(text, language)
     assert textnorm.join_tokens(tokens) == textnorm.line_text(text, language)
