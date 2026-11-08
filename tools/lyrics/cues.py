@@ -7,6 +7,7 @@ import re
 
 from . import textnorm
 from .audio import (
+    ONSET_RMS,
     PHRASE_LINGER,
     STRONG_ONSET_RMS,
     max_window_rms,
@@ -566,9 +567,24 @@ def build_lyric_lines(reference: dict, duration: float, audio=None,
     return built
 
 
+def _gap_is_vocal(audio, gap_start: float, gap_end: float) -> bool:
+    """True when a gap contains sustained vocal activity, not just bleed."""
+    if audio is None or gap_end <= gap_start:
+        return False
+    _, values = window_rms(audio, gap_start, gap_end, window=1.0, hop=1.0)
+    if not len(values):
+        return False
+    active = sum(1 for value in values if value >= ONSET_RMS)
+    fraction = active / len(values)
+    mean = float(values.mean())
+    return fraction >= 0.25 or mean >= 0.03
+
+
 def add_instrumental_cues(lines: list[dict], duration: float, audio=None) -> list[dict]:
     cues = [dict(line) for line in lines]
     cues.sort(key=lambda cue: cue["start"])
+    use_vocal_extension = any(
+        cue.get("timing_source") == "forced-alignment" for cue in cues)
 
     def make_gap(gap_start: float, gap_end: float):
         if gap_end - gap_start <= 0.8:
@@ -591,10 +607,17 @@ def add_instrumental_cues(lines: list[dict], duration: float, audio=None) -> lis
     previous_end = 0.0
     for cue in cues:
         if cue["start"] - previous_end > INSTRUMENTAL_GAP:
-            gap = make_gap(previous_end + (0.2 if with_gaps else 0.4),
-                           cue["start"] - 0.2)
-            if gap:
-                with_gaps.append(gap)
+            gap_start = previous_end + (0.2 if with_gaps else 0.4)
+            gap_end = cue["start"] - 0.2
+            at_song_end = gap_end >= duration - 1.0
+            if (use_vocal_extension and not at_song_end and with_gaps
+                    and _gap_is_vocal(audio, gap_start, gap_end)):
+                with_gaps[-1]["end"] = max(
+                    float(with_gaps[-1]["end"]), round(gap_end, 3))
+            else:
+                gap = make_gap(gap_start, gap_end)
+                if gap:
+                    with_gaps.append(gap)
         with_gaps.append(cue)
         previous_end = max(previous_end, cue["end"])
 

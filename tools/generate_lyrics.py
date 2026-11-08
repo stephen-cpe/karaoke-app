@@ -311,7 +311,8 @@ def _align_candidates(candidates: list[dict[str, Any]], language: str,
     total_align_seconds = 0.0
     for item in candidates:
         result = session.align_candidate(
-            emissions, stride, item["lines"], item["tokens"], language)
+            emissions, stride, item["lines"], item["tokens"], language,
+            audio_data=audio_data, snap_repeated=True)
         item["alignment"] = result.summary
         item["line_alignment"] = result.lines
         total_align_seconds += float(result.summary.get("seconds") or 0.0)
@@ -335,6 +336,8 @@ def _alignment_lines_summary(line_alignments: list[dict[str, Any]]
         "coverage": round(float(line.get("coverage") or 0.0), 4),
         "aligned_words": int(line.get("aligned_words") or 0),
         "total_words": int(line.get("total_words") or 0),
+        "mean_score": line.get("mean_score"),
+        "min_score": line.get("min_score"),
     } for index, line in enumerate(line_alignments)]
 
 
@@ -518,6 +521,7 @@ def process_song(stem: str, original: Path, karaoke: Path, cache_dir: Path,
                     report["stages"]["asr"] = {
                         "used": True,
                         "legacy_transcript": True,
+                        "transcript_cache": "legacy",
                         "cache_hit": True,
                         "path": legacy_path,
                         "seconds": 0.0,
@@ -536,6 +540,7 @@ def process_song(stem: str, original: Path, karaoke: Path, cache_dir: Path,
                         cache_dir, force=force, session=session)
                     report["stages"]["asr"] = {
                         **cache_info,
+                        "transcript_cache": "content-keyed",
                         "seconds": cache_info.get("seconds", _seconds(started)),
                         "language": language,
                         "prompt_chars": len(prompt),
@@ -554,6 +559,7 @@ def process_song(stem: str, original: Path, karaoke: Path, cache_dir: Path,
             else:
                 report["stages"]["asr"] = {
                     "used": False,
+                    "transcript_cache": "none",
                     "reason": asr_reason,
                     "seconds": 0.0,
                     "language": language,
@@ -602,7 +608,8 @@ def process_song(stem: str, original: Path, karaoke: Path, cache_dir: Path,
                     started = time.perf_counter()
                     result = align_session.align_audio_candidate(
                         audio_data, reference_dict["lines"],
-                        reference_dict["tokens"], language)
+                        reference_dict["tokens"], language, duration,
+                        snap_repeated=True)
                     alignment_info = result.summary
                     line_alignments = result.lines
                     aligner_info = {
@@ -695,7 +702,9 @@ def process_song(stem: str, original: Path, karaoke: Path, cache_dir: Path,
             try:
                 started = time.perf_counter()
                 result = align_session.align_audio_candidate(
-                    audio_data, asr_lines, tokens, language)
+                    audio_data, asr_lines, tokens, language, duration,
+                    windowed=True, window_mode="line", star_frequency="edges",
+                    min_word_score=align.MIN_WORD_SCORE)
                 alignment_info = result.summary
                 line_alignments = result.lines
                 aligner_info = {
@@ -742,6 +751,16 @@ def process_song(stem: str, original: Path, karaoke: Path, cache_dir: Path,
             qa_result["review_reasons"].append(
                 f"{len(line_timing_sources['asr_fallback_lines'])} line(s) use "
                 "Whisper word timing because forced alignment failed")
+        low_confidence_lines = (
+            alignment_info.get("low_confidence_lines") if alignment_info else [])
+        if low_confidence_lines:
+            threshold = (alignment_info.get("score_threshold")
+                         if alignment_info else None)
+            qa_result["needs_review"] = True
+            qa_result["review_reasons"].append(
+                f"{len(low_confidence_lines)} line(s) fell below the forced-alignment "
+                f"confidence threshold (score < {threshold}): "
+                + ", ".join(str(index + 1) for index in low_confidence_lines))
         if alignment_info and not reference_dict:
             if not line_timing_sources["counts"].get("forced-alignment"):
                 timing_source = "asr"
@@ -785,12 +804,25 @@ def process_song(stem: str, original: Path, karaoke: Path, cache_dir: Path,
                 "line_level_rate": round(qa_result["alignment"]["line_level_rate"], 4),
                 "forced": alignment_info is not None,
                 "candidate": alignment_info,
+                "low_confidence_lines": (
+                    alignment_info.get("low_confidence_lines")
+                    if alignment_info else []),
+                "score_stats": ({
+                    "threshold": alignment_info.get("score_threshold"),
+                    "min": alignment_info.get("score_min"),
+                    "p10": alignment_info.get("score_p10"),
+                    "median": alignment_info.get("score_median"),
+                    "mean": alignment_info.get("mean_score"),
+                    "low_score_words": alignment_info.get("low_score_words"),
+                } if alignment_info else None),
                 "reference_lines": (_alignment_lines_summary(line_alignments)
                                     if line_alignments else []),
             },
             "asr": {
                 "used": asr_used,
                 "reason": asr_reason,
+                "transcript_cache": (
+                    report["stages"].get("asr") or {}).get("transcript_cache"),
                 "stage": report["stages"].get("asr"),
             },
             "script": qa_result["script"],

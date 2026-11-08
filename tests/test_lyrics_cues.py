@@ -1,6 +1,8 @@
 """Cue-building tests for line-level fallback and inferred gap timing."""
 from __future__ import annotations
 
+import pytest
+
 from tools.generate_lyrics import _needs_full_asr, _reject_suspect_reference_offset
 from tools.lyrics import cues
 
@@ -123,6 +125,49 @@ def test_build_aligned_asr_lines_uses_whisper_only_for_failed_line():
     assert len(aligned) == 1
     assert aligned[0]["timing_source"] == "forced-alignment"
     assert [word["text"] for word in aligned[0]["words"]] == ["hello", "world"]
+
+
+def test_per_line_windows_cover_each_timed_line():
+    from tools.lyrics import align
+
+    lines = [
+        {"start": 10.0, "end": 12.0, "text": "one"},
+        {"start": 12.5, "end": 14.0, "text": "two"},
+    ]
+    windows = align.build_per_line_windows(lines, 20.0, audio=None)
+    assert len(windows) == 2
+    assert windows[0][2] == [0]
+    assert windows[1][2] == [1]
+    assert windows[0][0] < 10.0
+    assert windows[0][1] > 12.0
+
+
+def test_instrumental_gap_with_vocals_extends_previous_cue(monkeypatch):
+    cues_list = [
+        {"start": 0.0, "end": 2.0, "text": "hello", "words": [],
+         "timing_source": "forced-alignment"},
+        {"start": 8.0, "end": 10.0, "text": "world", "words": [],
+         "timing_source": "forced-alignment"},
+    ]
+    monkeypatch.setattr(cues, "_gap_is_vocal", lambda *args: True)
+    built = cues.add_instrumental_cues(cues_list, 10.0, audio=object())
+    assert [cue["text"] for cue in built] == ["hello", "world"]
+    assert built[0]["end"] == 7.8
+
+
+def test_gap_is_vocal_ignores_sparse_bleed(monkeypatch):
+    np = pytest.importorskip("numpy")
+    monkeypatch.setattr(
+        cues, "window_rms",
+        lambda *args, **kwargs: (
+            np.array([0, 1, 2, 3, 4]),
+            np.array([0.1, 0.001, 0.001, 0.001, 0.001])))
+    assert cues._gap_is_vocal(object(), 0.0, 5.0) is False
+    monkeypatch.setattr(
+        cues, "window_rms",
+        lambda *args, **kwargs: (
+            np.array([0, 1, 2, 3]), np.array([0.1, 0.1, 0.1, 0.001])))
+    assert cues._gap_is_vocal(object(), 0.0, 4.0) is True
 
 
 def test_build_from_transcript_text_matches_word_texts():
