@@ -1,8 +1,6 @@
 """Cue-building tests for line-level fallback and inferred gap timing."""
 from __future__ import annotations
 
-import pytest
-
 from tools.generate_lyrics import _needs_full_asr, _reject_suspect_reference_offset
 from tools.lyrics import cues
 
@@ -142,32 +140,66 @@ def test_per_line_windows_cover_each_timed_line():
     assert windows[0][1] > 12.0
 
 
-def test_instrumental_gap_with_vocals_extends_previous_cue(monkeypatch):
-    cues_list = [
-        {"start": 0.0, "end": 2.0, "text": "hello", "words": [],
-         "timing_source": "forced-alignment"},
-        {"start": 8.0, "end": 10.0, "text": "world", "words": [],
-         "timing_source": "forced-alignment"},
+def test_cap_lyric_tails_caps_short_word(monkeypatch):
+    cue = {
+        "start": 0.0,
+        "end": 8.0,
+        "text": "hello",
+        "words": [{"text": "hello", "start": 1.0, "end": 2.0}],
+    }
+    monkeypatch.setattr(cues, "_contiguous_note_end", lambda *args: None)
+    cues._cap_lyric_tails([cue], 20.0, object())
+    assert cue["end"] == 4.0
+
+
+def test_cap_lyric_tails_allows_contiguous_long_note(monkeypatch):
+    cue = {
+        "start": 0.0,
+        "end": 12.0,
+        "text": "oh",
+        "words": [{"text": "oh", "start": 1.0, "end": 5.0}],
+    }
+    monkeypatch.setattr(cues, "_contiguous_note_end", lambda *args: 9.0)
+    cues._cap_lyric_tails([cue], 20.0, object())
+    assert cue["end"] == 9.6
+
+
+def test_snap_repeated_lines_uses_offset_and_refuses_overlap(monkeypatch):
+    from tools.lyrics import align
+
+    def word(line, start, end):
+        return align.WordTiming(
+            index=0, line=line, token=0, text="oh", start=start, end=end,
+            score=-0.1, aligned=True)
+
+    lines = [
+        {"start": 10.0, "end": 12.0, "text": "oh"},
+        {"start": 30.0, "end": 32.0, "text": "unique"},
+        {"start": 50.0, "end": 52.0, "text": "oh"},
     ]
-    monkeypatch.setattr(cues, "_gap_is_vocal", lambda *args: True)
-    built = cues.add_instrumental_cues(cues_list, 10.0, audio=object())
-    assert [cue["text"] for cue in built] == ["hello", "world"]
-    assert built[0]["end"] == 7.8
+    result = align.AlignmentResult(
+        words=[word(0, 10.2, 11.0), word(1, 30.2, 31.0),
+               word(2, 60.0, 61.0)],
+        total_words=3, aligned_words=3, coverage=1.0,
+        mean_score=-0.1, low_score_words=0)
+    monkeypatch.setattr(align, "max_window_rms", lambda *args: 1.0)
+    session = align.AlignSession()
+    snapped = session._snap_repeated_lines(
+        lines, result, object(), offset=0.5)
+    assert snapped == [2]
+    assert result.words[2].start == 50.5
 
-
-def test_gap_is_vocal_ignores_sparse_bleed(monkeypatch):
-    np = pytest.importorskip("numpy")
-    monkeypatch.setattr(
-        cues, "window_rms",
-        lambda *args, **kwargs: (
-            np.array([0, 1, 2, 3, 4]),
-            np.array([0.1, 0.001, 0.001, 0.001, 0.001])))
-    assert cues._gap_is_vocal(object(), 0.0, 5.0) is False
-    monkeypatch.setattr(
-        cues, "window_rms",
-        lambda *args, **kwargs: (
-            np.array([0, 1, 2, 3]), np.array([0.1, 0.1, 0.1, 0.001])))
-    assert cues._gap_is_vocal(object(), 0.0, 4.0) is True
+    lines.append({"start": 50.2, "end": 51.2, "text": "next"})
+    result.words.append(word(3, 50.3, 51.2))
+    result.total_words = 4
+    result.aligned_words = 4
+    result2 = align.AlignmentResult(
+        words=[word(0, 10.2, 11.0), word(1, 30.2, 31.0),
+               word(2, 60.0, 61.0), word(3, 50.3, 51.2)],
+        total_words=4, aligned_words=4, coverage=1.0,
+        mean_score=-0.1, low_score_words=0)
+    assert session._snap_repeated_lines(
+        lines, result2, object(), offset=0.5) == []
 
 
 def test_build_from_transcript_text_matches_word_texts():

@@ -567,30 +567,92 @@ def build_lyric_lines(reference: dict, duration: float, audio=None,
     return built
 
 
-def _gap_is_vocal(audio, gap_start: float, gap_end: float) -> bool:
-    """True when a gap contains sustained vocal activity, not just bleed."""
-    if audio is None or gap_end <= gap_start:
-        return False
-    _, values = window_rms(audio, gap_start, gap_end, window=1.0, hop=1.0)
+def _contiguous_note_end(audio, word: dict, limit: float) -> float | None:
+    """Return the end of energy continuing from a held word, or None.
+
+    A short word followed by unrelated energy somewhere in the gap is not a
+    held note. Only a word that is itself long (>= about 2 s) may justify a
+    longer tail, and the energy must continue from the word end with no break
+    of more than 0.35 s.
+    """
+    if audio is None:
+        return None
+    start = float(word["end"])
+    if start >= limit:
+        return None
+    if start - float(word["start"]) < 2.0:
+        return None
+    word_peak = max_window_rms(audio, float(word["start"]), float(word["end"]))
+    if word_peak < ONSET_RMS:
+        return None
+    threshold = max(ONSET_RMS, 0.35 * word_peak)
+    times, values = window_rms(audio, start, limit, window=0.05, hop=0.025)
     if not len(values):
-        return False
-    active = sum(1 for value in values if value >= ONSET_RMS)
-    fraction = active / len(values)
-    mean = float(values.mean())
-    return fraction >= 0.25 or mean >= 0.03
+        return None
+    initial = [value for moment, value in zip(times, values)
+               if moment - start <= 0.20]
+    if not initial or max(initial) < threshold:
+        return None
+    silent_start = None
+    for moment, value in zip(times, values):
+        if value < threshold:
+            if silent_start is None:
+                silent_start = moment
+            elif moment - silent_start >= 0.35:
+                return float(silent_start)
+        else:
+            silent_start = None
+    return float(times[-1]) + 0.05
 
 
-def add_instrumental_cues(lines: list[dict], duration: float, audio=None) -> list[dict]:
+def _cap_lyric_tails(cues: list[dict], duration: float, audio) -> None:
+    """Do not leave a short lyric line on screen through an instrumental gap."""
+    for cue in cues:
+        if cue.get("instrumental"):
+            continue
+        words = cue.get("words") or []
+        if not words:
+            continue
+        last_word = max(words, key=lambda word: float(word.get("end", 0.0)))
+        last_end = float(last_word["end"])
+        limit = min(duration, float(cue["end"]))
+        if limit <= last_end + 2.0:
+            continue
+        held_end = _contiguous_note_end(audio, last_word, limit)
+        if held_end is not None:
+            cue["end"] = round(min(limit, held_end + PHRASE_LINGER), 3)
+        else:
+            cue["end"] = round(min(limit, last_end + 2.0), 3)
+
+
+def add_instrumental_cues(lines: list[dict], duration: float, audio=None,
+                          music_audio=None) -> list[dict]:
     cues = [dict(line) for line in lines]
     cues.sort(key=lambda cue: cue["start"])
-    use_vocal_extension = any(
+    use_alignment_policy = any(
         cue.get("timing_source") == "forced-alignment" for cue in cues)
+    if use_alignment_policy:
+        _cap_lyric_tails(cues, duration, audio)
 
     def make_gap(gap_start: float, gap_end: float):
         if gap_end - gap_start <= 0.8:
             return None
-        if audio is not None and gap_end - gap_start < 4.5:
-            _, values = window_rms(audio, gap_start, gap_end, sample_rate=16000)
+        if use_alignment_policy and audio is not None and music_audio is not None:
+            _, vocal_values = window_rms(
+                audio, gap_start, gap_end, window=1.0, hop=1.0)
+            _, music_values = window_rms(
+                music_audio, gap_start, gap_end, window=1.0, hop=1.0)
+            if len(vocal_values) and len(music_values):
+                vocal_mean = float(vocal_values.mean())
+                music_mean = float(music_values.mean())
+                if music_mean > 1e-6 and vocal_mean / music_mean >= 0.6:
+                    # Vocals/ad-libs remain in the gap; do not call it
+                    # instrumental. The previous lyric was already capped.
+                    return None
+        elif not use_alignment_policy and audio is not None \
+                and gap_end - gap_start < 4.5:
+            _, values = window_rms(audio, gap_start, gap_end,
+                                   sample_rate=16000)
             if len(values) and float(values.max()) >= 0.12:
                 return None
         return {
@@ -607,17 +669,10 @@ def add_instrumental_cues(lines: list[dict], duration: float, audio=None) -> lis
     previous_end = 0.0
     for cue in cues:
         if cue["start"] - previous_end > INSTRUMENTAL_GAP:
-            gap_start = previous_end + (0.2 if with_gaps else 0.4)
-            gap_end = cue["start"] - 0.2
-            at_song_end = gap_end >= duration - 1.0
-            if (use_vocal_extension and not at_song_end and with_gaps
-                    and _gap_is_vocal(audio, gap_start, gap_end)):
-                with_gaps[-1]["end"] = max(
-                    float(with_gaps[-1]["end"]), round(gap_end, 3))
-            else:
-                gap = make_gap(gap_start, gap_end)
-                if gap:
-                    with_gaps.append(gap)
+            gap = make_gap(previous_end + (0.2 if with_gaps else 0.4),
+                           cue["start"] - 0.2)
+            if gap:
+                with_gaps.append(gap)
         with_gaps.append(cue)
         previous_end = max(previous_end, cue["end"])
 

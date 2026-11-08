@@ -401,7 +401,8 @@ def load_legacy_transcript(cache_dir: Path, stem: str, duration: float,
     return data, str(path)
 
 
-def strip_hallucinations(transcript: dict) -> dict:
+def strip_hallucinations(transcript: dict,
+                         dropped: list[dict[str, Any]] | None = None) -> dict:
     """Remove boilerplate Whisper invents at the end of video-sourced audio."""
     phrases = (
         "thank you for watching",
@@ -419,6 +420,14 @@ def strip_hallucinations(transcript: dict) -> dict:
             parts = [textnorm.legacy_norm_token(part) for part in phrase.split()]
             if len(norms) < len(parts) or norms[-len(parts):] != parts:
                 continue
+            if dropped is not None:
+                for word in words[-len(parts):]:
+                    dropped.append({
+                        "text": str(word.get("word") or "").strip(),
+                        "start": float(word.get("start", 0.0)),
+                        "end": float(word.get("end", 0.0)),
+                        "reason": "Whisper boilerplate phrase",
+                    })
             removed += len(parts)
             words = words[:-len(parts)]
             norms = norms[:-len(parts)]
@@ -436,14 +445,15 @@ def strip_hallucinations(transcript: dict) -> dict:
     return transcript
 
 
-def filter_silent_words(transcript: dict, vocals: Path, audio=None) -> dict:
+def filter_silent_words(transcript: dict, vocals: Path, audio=None,
+                        dropped: list[dict[str, Any]] | None = None) -> dict:
     """Drop words Whisper invented in silent parts of the vocal stem."""
     if audio is None:
         audio = load_vocal_audio(vocals)
     if audio is None:
         log.warning("  could not analyse vocal energy; keeping all transcript words")
         return transcript
-    dropped = 0
+    dropped_count = 0
     segments = []
     for segment in transcript.get("segments", []):
         kept = []
@@ -451,7 +461,14 @@ def filter_silent_words(transcript: dict, vocals: Path, audio=None) -> dict:
             rms = max_window_rms(audio, float(word.get("start", 0.0)),
                                  float(word.get("end", 0.0)))
             if rms < SILENCE_RMS:
-                dropped += 1
+                dropped_count += 1
+                if dropped is not None:
+                    dropped.append({
+                        "text": str(word.get("word") or "").strip(),
+                        "start": float(word.get("start", 0.0)),
+                        "end": float(word.get("end", 0.0)),
+                        "reason": f"no vocal energy (rms {rms:.5f})",
+                    })
                 continue
             kept.append(word)
         if not kept:
@@ -462,8 +479,8 @@ def filter_silent_words(transcript: dict, vocals: Path, audio=None) -> dict:
         segment["text"] = " ".join(word.get("word", "") for word in kept).strip()
         segments.append(segment)
     transcript["segments"] = segments
-    if dropped:
-        log.info("  removed %d hallucinated word(s) from silence", dropped)
+    if dropped_count:
+        log.info("  removed %d hallucinated word(s) from silence", dropped_count)
     return transcript
 
 

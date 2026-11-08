@@ -22,6 +22,7 @@ MIN_WORD_SCORE = -2.0
 MIN_WORD_SECONDS = 0.02
 LINE_COVERAGE_TARGET = 0.80
 STAR_FREQUENCY = "line"
+ALIGNMENT_TIME_SHIFT = -0.20
 WINDOW_GAP_SECONDS = 2.5
 WINDOW_MAX_SECONDS = 30.0
 WINDOW_PAD_SECONDS = 1.5
@@ -371,8 +372,13 @@ class AlignSession:
                             len(results), len(align_indices))
             for result, local_index in zip(results, align_indices):
                 word = words[token_indices[local_index]]
-                word.start = round(window_offset + float(result.get("start", 0.0)), 3)
-                word.end = round(window_offset + float(result.get("end", 0.0)), 3)
+                word.start = round(max(
+                    0.0, window_offset + float(result.get("start", 0.0))
+                    + ALIGNMENT_TIME_SHIFT), 3)
+                word.end = round(max(
+                    word.start + MIN_WORD_SECONDS,
+                    window_offset + float(result.get("end", 0.0))
+                    + ALIGNMENT_TIME_SHIFT), 3)
                 word.score = round(float(result.get("score", -999.0)), 4)
                 word.aligned = (
                     word.end > word.start + MIN_WORD_SECONDS
@@ -429,19 +435,30 @@ class AlignSession:
         return self.align_tokens(emissions, stride, tokens, language, offset)
 
     def _snap_repeated_lines(self, lines: list[dict[str, Any]],
-                             result: AlignmentResult, audio_data) -> list[int]:
-        """Move a repeated line back to its own LRCLIB occurrence.
+                             result: AlignmentResult, audio_data,
+                             offset: float = 0.0) -> list[int]:
+        """Move a repeated line back to its own offset-corrected occurrence.
 
         The CTC path can attach a repeated chorus/ad-lib to a later occurrence.
-        When the line text repeats, the reference timestamp is the only way to
-        tell the occurrences apart; snap only when the reference start has
-        vocal energy and the aligned start is more than two seconds away.
+        When the line text repeats, the offset-corrected reference timestamp is
+        the only way to tell the occurrences apart. Refuse a snap that would
+        overlap the neighbouring aligned line.
         """
         if audio_data is None:
             return []
         words_by_line: dict[int, list[WordTiming]] = {}
         for word in result.words:
             words_by_line.setdefault(word.line, []).append(word)
+        bounds: dict[int, tuple[float, float]] = {}
+        for index, line in enumerate(lines):
+            words = [word for word in words_by_line.get(index, [])
+                     if word.aligned]
+            if words:
+                bounds[index] = (min(word.start for word in words),
+                                 max(word.end for word in words))
+            elif line.get("start") is not None:
+                start = float(line["start"]) + offset
+                bounds[index] = (start, float(line.get("end") or start))
         counts: dict[str, int] = {}
         for line in lines:
             key = " ".join(
@@ -459,7 +476,7 @@ class AlignSession:
                      if word.aligned]
             if not words:
                 continue
-            reference_start = float(line["start"])
+            reference_start = float(line["start"]) + offset
             delta = reference_start - words[0].start
             if abs(delta) < 2.0:
                 continue
@@ -467,13 +484,21 @@ class AlignSession:
                     audio_data, reference_start,
                     reference_start + 1.5) < ONSET_RMS:
                 continue
-            shifted = [(word.start + delta, word.end + delta)
-                       for word in words]
-            if shifted[0][0] < 0.0:
+            new_start = words[0].start + delta
+            new_end = words[-1].end + delta
+            if new_start < 0.0:
                 continue
-            for word, (start, end) in zip(words, shifted):
-                word.start = round(start, 3)
-                word.end = round(end, 3)
+            previous = [value for key_index, value in bounds.items()
+                        if key_index < index]
+            following = [value for key_index, value in bounds.items()
+                         if key_index > index]
+            if previous and new_start < previous[-1][1] - 0.05:
+                continue
+            if following and new_end > following[0][0] + 0.05:
+                continue
+            for word in words:
+                word.start = round(word.start + delta, 3)
+                word.end = round(word.end + delta, 3)
             snapped.append(index)
         return snapped
 
@@ -504,8 +529,21 @@ class AlignSession:
         result = self.align_tokens(
             emissions, stride, tokens, language, windows=windows,
             star_frequency=star_frequency, min_word_score=threshold)
-        snapped_lines = (self._snap_repeated_lines(lines, result, audio_data)
-                         if snap_repeated else [])
+        by_line_for_offset: dict[int, list[WordTiming]] = {}
+        for word in result.words:
+            by_line_for_offset.setdefault(word.line, []).append(word)
+        offsets = []
+        for index, line in enumerate(lines):
+            words = [word for word in by_line_for_offset.get(index, [])
+                     if word.aligned]
+            if words and line.get("start") is not None:
+                offsets.append(words[0].start - float(line["start"]))
+        offsets.sort()
+        reference_offset = offsets[len(offsets) // 2] if offsets else 0.0
+        snapped_lines = (
+            self._snap_repeated_lines(
+                lines, result, audio_data, offset=reference_offset)
+            if snap_repeated else [])
         by_line: dict[int, list[WordTiming]] = {index: [] for index in range(len(lines))}
         for word in result.words:
             if 0 <= word.line < len(lines):
@@ -563,6 +601,8 @@ class AlignSession:
                           if score_values else None),
             "score_median": (round(_quantile(score_values, 0.50), 4)
                              if score_values else None),
+            "time_shift": ALIGNMENT_TIME_SHIFT,
+            "reference_offset": round(reference_offset, 4),
             "low_confidence_lines": low_confidence_lines,
             "snapped_repeated_lines": snapped_lines,
             "seconds": round(result.seconds, 3),

@@ -52,6 +52,7 @@ class LookupResult:
     cached: bool = False
     error: str | None = None
     requests: int = 0
+    artist_fuzzy_match: dict[str, str] | None = None
 
 
 def _marker_line(text: str) -> bool:
@@ -628,6 +629,69 @@ def user_override(source_dir: Path, stem: str) -> dict[str, Any] | None:
     return None
 
 
+def _normalize_artist(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value).casefold())
+
+
+def _edit_distance(left: str, right: str) -> int:
+    if left == right:
+        return 0
+    if not left:
+        return len(right)
+    if not right:
+        return len(left)
+    previous = list(range(len(right) + 1))
+    for row, left_char in enumerate(left, 1):
+        current = [row]
+        for column, right_char in enumerate(right, 1):
+            current.append(min(
+                current[-1] + 1,
+                previous[column] + 1,
+                previous[column - 1] + (left_char != right_char),
+            ))
+        previous = current
+    return previous[-1]
+
+
+def artist_name_close(query: str, matched: str, max_edits: int = 2) -> bool:
+    """True when two artist names are within a small typo distance."""
+    left = _normalize_artist(query)
+    right = _normalize_artist(matched)
+    if not left or not right:
+        return False
+    if left == right:
+        return True
+    if abs(len(left) - len(right)) > max_edits:
+        return False
+    return _edit_distance(left, right) <= max_edits
+
+
+def fuzzy_artist_candidates(records: list[dict[str, Any]], artist: str,
+                            duration: float,
+                            max_edits: int = 2) -> list[dict[str, Any]]:
+    """Title-search hits whose artist is a typo and whose duration is close."""
+    matches = []
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        matched = str(record.get("artistName") or "")
+        if not artist_name_close(artist, matched, max_edits=max_edits):
+            continue
+        try:
+            candidate_duration = float(record.get("duration"))
+        except (TypeError, ValueError):
+            continue
+        if abs(candidate_duration - float(duration)) > LRCLIB_DURATION_TOLERANCE:
+            continue
+        matches.append(record)
+    matches.sort(key=lambda record: (
+        _edit_distance(_normalize_artist(artist),
+                       _normalize_artist(str(record.get("artistName") or ""))),
+        abs(float(record.get("duration") or 0.0) - float(duration)),
+    ))
+    return matches
+
+
 def _retry_after_seconds(headers: Any) -> float | None:
     value = None
     try:
@@ -732,10 +796,52 @@ class LRCLIBClient:
         if status == "ok" and age <= LRCLIB_OK_TTL:
             records = payload.get("records")
             if isinstance(records, list):
-                return LookupResult("ok", records, cached=True)
+                fuzzy = payload.get("artist_fuzzy_match")
+                return LookupResult(
+                    "ok", records, cached=True,
+                    artist_fuzzy_match=fuzzy if isinstance(fuzzy, dict) else None)
         if status == "not_found" and age <= LRCLIB_NOT_FOUND_TTL:
             return LookupResult("not_found", [], cached=True)
         return None
+
+    def search_title(self, track_name: str) -> list[dict[str, Any]]:
+        """Title-only LRCLIB search, cached separately from artist+title."""
+        material = json.dumps({"q": track_name, "track_name": track_name},
+                              sort_keys=True, separators=(",", ":"))
+        path = cache.lrclib_cache_path(self.cache_dir, "title", material)
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            payload = None
+        if isinstance(payload, dict):
+            age = time.time() - float(payload.get("fetched_at") or 0.0)
+            status = payload.get("status")
+            if status == "ok" and age <= LRCLIB_OK_TTL:
+                records = payload.get("records")
+                if isinstance(records, list):
+                    return records
+            if status == "not_found" and age <= LRCLIB_NOT_FOUND_TTL:
+                return []
+        search = self._request("/api/search", {
+            "q": track_name,
+            "track_name": track_name,
+        })
+        records = [record for record in (search or [])
+                   if isinstance(record, dict) and record.get("id") is not None]
+        if records:
+            cache.atomic_write_json(path, {
+                "status": "ok",
+                "fetched_at": time.time(),
+                "track_name": track_name,
+                "records": records,
+            })
+        else:
+            cache.atomic_write_json(path, {
+                "status": "not_found",
+                "fetched_at": time.time(),
+                "track_name": track_name,
+            })
+        return records
 
     def lookup(self, track_name: str, artist_name: str, duration: float) -> LookupResult:
         material = json.dumps({
@@ -790,6 +896,35 @@ class LRCLIBClient:
                                 requests=self.requests)
 
         if not records:
+            title_records: list[dict[str, Any]] = []
+            try:
+                title_records = self.search_title(track_name)
+            except LRCLIBUnavailable as exc:
+                unavailable.append(str(exc))
+                log.warning("  LRCLIB title search unavailable: %s", exc)
+            matches = fuzzy_artist_candidates(
+                title_records, artist_name, duration)
+            if matches:
+                matched_artist = str(matches[0].get("artistName") or "")
+                fuzzy = {"query": artist_name, "matched": matched_artist}
+                cache.atomic_write_json(path, {
+                    "status": "ok",
+                    "fetched_at": time.time(),
+                    "track_name": track_name,
+                    "artist_name": artist_name,
+                    "duration": round(float(duration), 3),
+                    "records": matches,
+                    "artist_fuzzy_match": fuzzy,
+                })
+                log.info("  LRCLIB title fallback: %r matched artist %r",
+                         artist_name, matched_artist)
+                return LookupResult(
+                    "ok", matches, requests=self.requests,
+                    artist_fuzzy_match=fuzzy)
+            if unavailable:
+                return LookupResult(
+                    "unreachable", [], error="; ".join(unavailable),
+                    requests=self.requests)
             cache.atomic_write_json(path, {
                 "status": "not_found",
                 "fetched_at": time.time(),

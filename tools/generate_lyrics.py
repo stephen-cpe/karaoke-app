@@ -312,6 +312,11 @@ def _align_candidates(candidates: list[dict[str, Any]], language: str,
     for item in candidates:
         result = session.align_candidate(
             emissions, stride, item["lines"], item["tokens"], language,
+            windowed=float(item.get("duration_error") or 0.0) > 1.5,
+            window_mode="line",
+            star_frequency=("edges"
+                            if float(item.get("duration_error") or 0.0) > 1.5
+                            else "line"),
             audio_data=audio_data, snap_repeated=True)
         item["alignment"] = result.summary
         item["line_alignment"] = result.lines
@@ -360,6 +365,70 @@ def _timing_source_summary(final_cues: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _clean_asr_lines(asr_lines: list[dict[str, Any]],
+                     line_alignments: list[dict[str, Any]],
+                     audio_data, duration: float, language: str,
+                     threshold: float) -> tuple[list[dict[str, Any]],
+                                                list[dict[str, Any]]]:
+    """Remove ASR words with no vocal energy or low aligner confidence."""
+    first_strong = None
+    if audio_data is not None:
+        first_strong = audio.vocal_onset(
+            audio_data, 0.0, duration, threshold=audio.STRONG_ONSET_RMS)
+    cleaned = []
+    dropped = []
+    for line_index, line in enumerate(asr_lines):
+        alignment = (line_alignments[line_index]
+                     if line_index < len(line_alignments) else {})
+        by_token = {
+            int(word.token): word for word in alignment.get("words") or []
+            if getattr(word, "token", None) is not None
+        }
+        kept = []
+        for token_index, word in enumerate(line.get("words") or []):
+            start = float(word.get("start", 0.0))
+            end = float(word.get("end", start + 0.15))
+            timing = by_token.get(token_index)
+            rms = (audio.max_window_rms(audio_data, start, end)
+                   if audio_data is not None else 0.0)
+            reason = None
+            if timing is not None and timing.score < threshold:
+                reason = (f"aligner score {timing.score:.3f} "
+                          f"< {threshold:.2f}")
+            elif audio_data is not None and rms < audio.ONSET_RMS:
+                reason = f"no vocal energy (rms {rms:.5f})"
+            elif (audio_data is not None and first_strong is not None
+                  and end <= first_strong + 0.05
+                  and rms < audio.STRONG_ONSET_RMS):
+                reason = f"before first vocal onset ({first_strong:.2f}s)"
+            if reason:
+                dropped.append({
+                    "line": line_index + 1,
+                    "text": str(word.get("text") or "").strip(),
+                    "start": round(start, 3),
+                    "end": round(end, 3),
+                    "score": (round(timing.score, 4)
+                              if timing is not None else None),
+                    "reason": reason,
+                })
+                continue
+            kept.append(word)
+        if not kept:
+            continue
+        text = textnorm.clean_text(
+            " ".join(str(word.get("text") or "") for word in kept),
+            language=language)
+        if not text:
+            continue
+        row = dict(line)
+        row["start"] = round(float(kept[0]["start"]), 3)
+        row["end"] = round(min(duration, float(kept[-1]["end"]) + 0.35), 3)
+        row["text"] = text
+        row["words"] = kept
+        cleaned.append(row)
+    return cleaned, dropped
+
+
 def process_song(stem: str, original: Path, karaoke: Path, cache_dir: Path,
                  *, use_online: bool, force: bool, output_dir: Path,
                  overwrite_edited: bool, reports_dir: Path,
@@ -402,6 +471,12 @@ def process_song(stem: str, original: Path, karaoke: Path, cache_dir: Path,
         audio_data = audio.load_vocal_audio(vocals)
         if audio_data is None:
             report["errors"].append("vocal stem could not be decoded for energy checks")
+        music_path = vocals.with_name("no_vocals.wav")
+        music_data = (audio.load_vocal_audio(music_path)
+                      if music_path.is_file() else None)
+        if music_data is None:
+            report["errors"].append(
+                "instrumental stem could not be decoded for gap classification")
 
         override = reference.user_override(source_dir, stem)
         if override:
@@ -428,6 +503,7 @@ def process_song(stem: str, original: Path, karaoke: Path, cache_dir: Path,
                 "candidates": len(lookup.records),
                 "requests": lookup.requests,
                 "error": lookup.error,
+                "artist_fuzzy_match": lookup.artist_fuzzy_match,
             }
             if lookup.status == "ok":
                 log.info("  LRCLIB: %d candidate(s)%s", len(lookup.records),
@@ -441,6 +517,7 @@ def process_song(stem: str, original: Path, karaoke: Path, cache_dir: Path,
         lid_results: list[dict[str, Any]] = []
         model_info: dict[str, Any] = {}
         transcript: dict[str, Any] | None = None
+        dropped_asr_words: list[dict[str, Any]] = []
         local: list[dict[str, Any]] = []
         asr_used = False
         asr_reason = ""
@@ -569,10 +646,13 @@ def process_song(stem: str, original: Path, karaoke: Path, cache_dir: Path,
             session.close()
 
         if transcript is not None:
-            transcript = asr.strip_hallucinations(transcript)
-            transcript = asr.filter_silent_words(transcript, vocals, audio_data)
+            transcript = asr.strip_hallucinations(
+                transcript, dropped=dropped_asr_words)
+            transcript = asr.filter_silent_words(
+                transcript, vocals, audio_data, dropped=dropped_asr_words)
             local = asr.local_words(transcript, language)
             report["stages"]["asr"]["local_words"] = len(local)
+            report["stages"]["asr"]["dropped_words"] = len(dropped_asr_words)
 
         chosen = None
         candidates: list[dict[str, Any]] = []
@@ -705,6 +785,23 @@ def process_song(stem: str, original: Path, karaoke: Path, cache_dir: Path,
                     audio_data, asr_lines, tokens, language, duration,
                     windowed=True, window_mode="line", star_frequency="edges",
                     min_word_score=align.MIN_WORD_SCORE)
+                cleaned_lines, cleanup_dropped = _clean_asr_lines(
+                    asr_lines, result.lines, audio_data, duration, language,
+                    align.MIN_WORD_SCORE)
+                if cleanup_dropped:
+                    dropped_asr_words.extend(cleanup_dropped)
+                    report["stages"]["asr"]["dropped_words"] = len(
+                        dropped_asr_words)
+                    log.info("  dropped %d low-confidence/no-energy ASR word(s)",
+                             len(cleanup_dropped))
+                if cleaned_lines:
+                    asr_lines = cleaned_lines
+                    tokens = cues.flat_lrc_tokens(asr_lines, language)
+                    result = align_session.align_audio_candidate(
+                        audio_data, asr_lines, tokens, language, duration,
+                        windowed=True, window_mode="line",
+                        star_frequency="edges",
+                        min_word_score=align.MIN_WORD_SCORE)
                 alignment_info = result.summary
                 line_alignments = result.lines
                 aligner_info = {
@@ -725,7 +822,8 @@ def process_song(stem: str, original: Path, karaoke: Path, cache_dir: Path,
         if not built:
             raise RuntimeError("no lyric lines were produced")
 
-        final_cues = cues.add_instrumental_cues(built, duration, audio_data)
+        final_cues = cues.add_instrumental_cues(
+            built, duration, audio_data, music_audio=music_data)
         qa_result = qa.evaluate(
             cues=final_cues,
             language=language,
@@ -761,6 +859,25 @@ def process_song(stem: str, original: Path, karaoke: Path, cache_dir: Path,
                 f"{len(low_confidence_lines)} line(s) fell below the forced-alignment "
                 f"confidence threshold (score < {threshold}): "
                 + ", ".join(str(index + 1) for index in low_confidence_lines))
+        snapped_lines = (
+            alignment_info.get("snapped_repeated_lines") if alignment_info else [])
+        if snapped_lines:
+            qa_result["needs_review"] = True
+            qa_result["review_reasons"].append(
+                f"{len(snapped_lines)} repeated line(s) were snapped to their "
+                "offset-corrected LRCLIB occurrence: "
+                + ", ".join(str(index + 1) for index in snapped_lines))
+        fuzzy = lookup.artist_fuzzy_match if lookup else None
+        if fuzzy:
+            qa_result["needs_review"] = True
+            qa_result["review_reasons"].append(
+                "LRCLIB artist name was fuzzy-matched by title-only search: "
+                f"{fuzzy.get('query')!r} -> {fuzzy.get('matched')!r}")
+        if text_source == "asr" and dropped_asr_words:
+            qa_result["needs_review"] = True
+            qa_result["review_reasons"].append(
+                f"{len(dropped_asr_words)} ASR word(s) were dropped for "
+                "no vocal energy, low aligner confidence, or intro hallucination")
         if alignment_info and not reference_dict:
             if not line_timing_sources["counts"].get("forced-alignment"):
                 timing_source = "asr"
@@ -789,6 +906,8 @@ def process_song(stem: str, original: Path, karaoke: Path, cache_dir: Path,
                 "record_id": chosen_id,
                 "candidate_count": len(lookup.records) if lookup else 0,
                 "requests": client.requests,
+                "artist_fuzzy_match": (
+                    lookup.artist_fuzzy_match if lookup else None),
                 "candidate_scores": [_candidate_summary(item) for item in candidates],
             },
             "reference_lines": qa_result["retention"]["reference_lines"],
@@ -823,6 +942,7 @@ def process_song(stem: str, original: Path, karaoke: Path, cache_dir: Path,
                 "reason": asr_reason,
                 "transcript_cache": (
                     report["stages"].get("asr") or {}).get("transcript_cache"),
+                "dropped_words": dropped_asr_words,
                 "stage": report["stages"].get("asr"),
             },
             "script": qa_result["script"],

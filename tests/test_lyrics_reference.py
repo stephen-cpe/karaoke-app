@@ -46,8 +46,9 @@ def test_lrclib_404_is_retried_once_per_endpoint_then_cached(tmp_path, monkeypat
     result = client.lookup("Test", "Artist", 100)
     assert result.status == "not_found"
     assert not result.cached
-    # /api/get is attempted twice (initial + one retry) and /api/search twice.
-    assert len(calls) == 4
+    # /api/get is attempted twice (initial + one retry), /api/search twice,
+    # and the title-only fallback search twice.
+    assert len(calls) == 6
 
     cache_files = list((tmp_path / "lrclib-v2").glob("lookup-*.json"))
     assert len(cache_files) == 1
@@ -193,6 +194,48 @@ def test_legacy_search_cache_and_text_choice(tmp_path):
     assert scored[0]["record"]["id"] == 1
     assert len(scored) == 1
     assert scored[0]["coverage"] == 1.0
+
+
+def test_artist_name_close_accepts_spong_cola_typo():
+    assert reference.artist_name_close("Spong Cola", "Sponge Cola")
+    assert reference.artist_name_close("sponge cola", "Sponge Cola")
+    assert not reference.artist_name_close("Spong Cola", "Wolf Hotel")
+
+
+def test_fuzzy_artist_candidates_requires_close_artist_and_duration():
+    records = [
+        {"id": 1, "artistName": "Sponge Cola", "duration": 216.0},
+        {"id": 2, "artistName": "Wolf Hotel", "duration": 213.7},
+        {"id": 3, "artistName": "Sponge Cola", "duration": 240.0},
+    ]
+    matches = reference.fuzzy_artist_candidates(records, "Spong Cola", 213.7)
+    assert [record["id"] for record in matches] == [1]
+
+
+def test_lrclib_title_fallback_accepts_artist_typo(tmp_path, monkeypatch):
+    candidate = {
+        "id": 7,
+        "trackName": "Tambay",
+        "artistName": "Sponge Cola",
+        "duration": 216.0,
+        "syncedLyrics": "[00:01.00]Makikisilong lang\n",
+    }
+
+    def fake_http(url, params):
+        if "api/get" in url:
+            return 404, None, {}
+        if params and params.get("q") == "Tambay":
+            return 200, [candidate], {}
+        return 200, [], {}
+
+    monkeypatch.setattr(reference.time, "sleep", lambda _seconds: None)
+    client = reference.LRCLIBClient(tmp_path, min_interval=0,
+                                    http_json=fake_http)
+    result = client.lookup("Tambay", "Spong Cola", 213.7)
+    assert result.status == "ok"
+    assert [record["id"] for record in result.records] == [7]
+    assert result.artist_fuzzy_match == {
+        "query": "Spong Cola", "matched": "Sponge Cola"}
 
 
 def test_script_compatibility():
