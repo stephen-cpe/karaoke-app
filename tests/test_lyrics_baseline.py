@@ -1,9 +1,7 @@
-"""Regression guards for the legacy lyric text/timing path.
+"""Regression guards for the lyric text/timing path.
 
-These tests pin the behavior that the multilingual rewrite must preserve for
-English and document the two known defects that Phase 1/2 fix. The xfail
-markers are strict so removing the defect without removing the marker fails
-the suite.
+These tests pin the English behavior that must stay stable and the Phase 1
+fixes for non-Latin normalization and inferred-timing provenance.
 """
 import pytest
 
@@ -120,17 +118,14 @@ def test_distribute_words_legacy_character_proportional():
     assert [round(word["end"], 3) for word in words] == [1.0, 3.0, 6.0]
 
 
-@pytest.mark.xfail(strict=True, reason="defect 2: ASCII-only norm_token drops Japanese")
 def test_norm_token_keeps_japanese():
     assert norm_token("君の名前") != ""
 
 
-@pytest.mark.xfail(strict=True, reason="defect 2: ASCII-only norm_token drops Korean")
 def test_norm_token_keeps_korean():
     assert norm_token("사랑해") != ""
 
 
-@pytest.mark.xfail(strict=True, reason="defect 2: transcript builder drops non-Latin words")
 def test_build_from_transcript_keeps_non_latin():
     transcript = {
         "segments": [{
@@ -141,12 +136,11 @@ def test_build_from_transcript_keeps_non_latin():
             }],
         }],
     }
-    lines = build_from_transcript(transcript, 2.0)
+    lines = build_from_transcript(transcript, 2.0, language="ja")
     assert len(lines) == 1
     assert lines[0]["text"] != ""
 
 
-@pytest.mark.xfail(strict=True, reason="defect 3: fabricated timing is not marked inferred")
 def test_distribute_words_marks_fabricated_timing():
     tokens = [
         {"text": "hello", "norm": "hello"},

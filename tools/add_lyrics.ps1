@@ -18,7 +18,9 @@ Existing SRTs are never overwritten unless -Song is given explicitly.
 param(
     [string]$Song = "",
     [switch]$Force,
-    [string]$Python = "python"
+    [string]$Python = "python",
+    [string]$OutputDir = "",
+    [switch]$OverwriteEdited
 )
 
 $ErrorActionPreference = "Stop"
@@ -44,6 +46,12 @@ if ($Song) {
 }
 if ($Force) {
     $genArgs += "--force"
+}
+if ($OutputDir) {
+    $genArgs += @("--output-dir", $OutputDir)
+}
+if ($OverwriteEdited) {
+    $genArgs += "--overwrite-edited"
 }
 
 Push-Location $root
@@ -72,6 +80,9 @@ try {
     $checkArgs = @("tools\check_lyrics.py", "--energy")
     if ($Song) {
         $checkArgs += @("--song", $Song)
+    }
+    if ($OutputDir) {
+        $checkArgs += @("--lyrics-dir", $OutputDir)
     }
     $check = & $Python @checkArgs 2>&1
     $checkCode = $LASTEXITCODE

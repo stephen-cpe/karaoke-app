@@ -25,7 +25,8 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from tools.check_lyrics import check_sidecar  # noqa: E402
-from tools.generate_lyrics import _max_window_rms, load_vocal_audio  # noqa: E402
+from tools.lyrics import textnorm  # noqa: E402
+from tools.lyrics.audio import load_vocal_audio, max_window_rms  # noqa: E402
 
 DEFAULT_LYRICS_DIR = ROOT / "lyrics"
 DEFAULT_CACHE_DIR = ROOT / "tools" / ".cache"
@@ -55,13 +56,15 @@ def sanitize_problem(problem: str) -> str:
 
 
 def character_proportional_words(words: list[dict[str, Any]],
-                                 start: float, end: float) -> list[dict[str, float]]:
+                                 start: float, end: float,
+                                 language: str = "en") -> list[dict[str, float]]:
     """Reproduce the old distribute_words() output for detector comparisons."""
     if not words:
         return []
     if end <= start:
         end = start + 0.5
-    weights = [max(1, len(legacy_norm_token(str(word.get("text", ""))))) for word in words]
+    weights = [max(1, len(textnorm.norm_token(
+        str(word.get("text", "")), language))) for word in words]
     total = sum(weights)
     cursor = start
     result = []
@@ -131,7 +134,25 @@ def evaluate_song(stem: str, lyrics_dir: Path, cache_dir: Path,
         check_sidecar(stem, lyrics_dir))
     pipeline = data.get("pipeline") if isinstance(data.get("pipeline"), dict) else {}
     language = pipeline.get("language") if isinstance(pipeline.get("language"), str) else None
+    detect_synthetic = pipeline.get("text_source") != "asr"
     report = read_report(reports_dir, stem)
+    line_level_entries = pipeline.get("line_level")
+    reasons_by_index: dict[int, str] = {}
+    if isinstance(line_level_entries, list):
+        for entry in line_level_entries:
+            if isinstance(entry, dict):
+                index = entry.get("index")
+                reason = entry.get("reason")
+                if isinstance(index, int) and not isinstance(index, bool) and index > 0:
+                    reasons_by_index[index] = str(reason or "").strip()
+    elif isinstance(line_level_entries, dict):
+        for key, value in line_level_entries.items():
+            try:
+                index = int(key)
+            except (TypeError, ValueError):
+                continue
+            if index > 0:
+                reasons_by_index[index] = str(value or "").strip()
 
     total_tokens = 0
     aligned_tokens = 0
@@ -196,17 +217,20 @@ def evaluate_song(stem: str, lyrics_dir: Path, cache_dir: Path,
             long_words += 1
             line_long += 1
             if vocal_audio is not None:
-                rms = _max_window_rms(
+                rms = max_window_rms(
                     vocal_audio, SAMPLE_RATE,
                     float(word.get("start", 0.0)), float(word.get("end", 0.0)))
                 if rms >= HELD_NOTE_RMS:
                     long_words_supported += 1
 
         is_synthetic = False
-        if len(words) >= MIN_SYNTHETIC_WORDS and all(
-                legacy_norm_token(str(word.get("text", ""))) for word in words):
+        detection_language = language or "en"
+        if detect_synthetic and len(words) >= MIN_SYNTHETIC_WORDS and all(
+                textnorm.norm_token(str(word.get("text", "")), detection_language)
+                for word in words):
             spread = character_proportional_words(
-                words, float(line["start"]), float(line["end"]))
+                words, float(line["start"]), float(line["end"]),
+                detection_language)
             if len(spread) == len(words) and all(
                     abs((float(word["end"]) - float(word["start"]))
                         - (item["end"] - item["start"])) <= SYNTHETIC_TOLERANCE
@@ -233,6 +257,22 @@ def evaluate_song(stem: str, lyrics_dir: Path, cache_dir: Path,
 
     coverage = aligned_tokens / total_tokens if total_tokens else 0.0
     inferred_rate = inferred_words / word_count if word_count else 0.0
+    line_level_indexes = [detail["index"] for detail in line_details
+                          if detail.get("line_level")]
+    line_level_explained = sum(
+        1 for index in line_level_indexes if reasons_by_index.get(index))
+    line_level_unexplained = len(line_level_indexes) - line_level_explained
+    reference_lines = pipeline.get("reference_lines")
+    reference_lines_present = pipeline.get("reference_lines_present")
+    line_retention = pipeline.get("line_retention")
+    if not isinstance(reference_lines, int) or isinstance(reference_lines, bool):
+        reference_lines = None
+    if (not isinstance(reference_lines_present, int)
+            or isinstance(reference_lines_present, bool)):
+        reference_lines_present = None
+    if not isinstance(line_retention, (int, float)) or isinstance(line_retention, bool):
+        line_retention = None
+
 
     deviation = report.get("qa", {}).get("line_start_deviation", {})
     if not isinstance(deviation, dict):
@@ -255,6 +295,11 @@ def evaluate_song(stem: str, lyrics_dir: Path, cache_dir: Path,
         "aligned_tokens": aligned_tokens,
         "total_tokens": total_tokens,
         "line_level_lines": line_level_lines,
+        "line_level_explained": line_level_explained,
+        "line_level_unexplained": line_level_unexplained,
+        "reference_lines": reference_lines,
+        "reference_lines_present": reference_lines_present,
+        "line_retention": line_retention,
         "coverage": coverage,
         "inferred_words": inferred_words,
         "inferred_rate": inferred_rate,
@@ -341,6 +386,18 @@ def aggregate_group(songs: list[dict[str, Any]]) -> dict[str, Any]:
         "lyric_lines": sum(song.get("lyric_lines", 0) for song in values),
         "words": total_words,
         "line_level_lines": sum(song.get("line_level_lines", 0) for song in values),
+        "line_level_explained": sum(
+            song.get("line_level_explained", 0) for song in values),
+        "line_level_unexplained": sum(
+            song.get("line_level_unexplained", 0) for song in values),
+        "reference_lines": sum(
+            song.get("reference_lines") or 0 for song in values),
+        "reference_lines_present": sum(
+            song.get("reference_lines_present") or 0 for song in values),
+        "line_retention": (
+            sum(song.get("reference_lines_present") or 0 for song in values)
+            / sum(song.get("reference_lines") or 0 for song in values)
+            if sum(song.get("reference_lines") or 0 for song in values) else None),
         "line_level_rate": (
             sum(song.get("line_level_lines", 0) for song in values)
             / sum(song.get("lyric_lines", 0) for song in values)
@@ -368,21 +425,32 @@ def aggregate_group(songs: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def print_table(songs: list[dict[str, Any]]) -> None:
-    header = ("stem", "lang", "lines", "lyr", "instr", "words", "line-lvl",
-              "cov%", "inf%", "synth", "script", "<40ms", ">3s", "review")
+    header = ("stem", "lang", "ref", "kept", "retain", "lyr", "words",
+              "line-lvl(E/U)", "cov%", "inf%", "synth", "script", "<40ms",
+              ">3s", "review")
     print(" | ".join(header))
     for song in songs:
         if song.get("error"):
             print(f"{song['stem']} | ERROR: {song['error']}")
             continue
+        reference = (str(song["reference_lines"])
+                     if song.get("reference_lines") is not None else "-")
+        kept = (str(song["reference_lines_present"])
+                if song.get("reference_lines_present") is not None else "-")
+        retention = (f"{song['line_retention'] * 100:.1f}"
+                     if song.get("line_retention") is not None else "-")
+        line_level = (f"{song['line_level_lines']} "
+                      f"({song.get('line_level_explained', 0)}/"
+                      f"{song.get('line_level_unexplained', 0)})")
         print(" | ".join([
             song["stem"],
             song.get("language") or "?",
-            str(song["lines"]),
+            reference,
+            kept,
+            retention,
             str(song["lyric_lines"]),
-            str(song["instrumental_lines"]),
             str(song["words"]),
-            str(song["line_level_lines"]),
+            line_level,
             f"{song['coverage'] * 100:.1f}",
             f"{song['inferred_rate'] * 100:.1f}",
             str(song["synthetic_lines"]),
@@ -457,12 +525,16 @@ def main(argv: list[str] | None = None) -> int:
     print_table(songs)
     print("\nper language:")
     for language, values in languages.items():
+        retention = (f"{values['line_retention'] * 100:.1f}%"
+                     if values['line_retention'] is not None else "n/a")
         print(f"  {language}: {values['songs']} song(s), "
               f"{values['lyric_lines']} lyric lines, {values['words']} words, "
               f"coverage {values['coverage'] * 100:.1f}%, "
               f"inferred {values['inferred_rate'] * 100:.1f}%, "
-              f"line-level {values['line_level_lines']}, "
-              f"synthetic {values['synthetic_lines']}, "
+              f"line-level {values['line_level_lines']} "
+              f"({values['line_level_explained']} explained/"
+              f"{values['line_level_unexplained']} unexplained), "
+              f"retention {retention}, synthetic {values['synthetic_lines']}, "
               f"needs-review {values['needs_review']}")
     if "comparison" in payload:
         comparison = payload["comparison"]

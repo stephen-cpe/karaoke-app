@@ -205,19 +205,35 @@ def _rms_windows(audio, start: float, end: float):
     return np.sqrt(np.maximum(energies, 0.0))
 
 
-def check_energy(stem: str, lines: list[dict], cache_dir: Path = DEFAULT_CACHE_DIR) -> list[str]:
+def resolve_vocal_stem(stem: str, cache_dir: Path = DEFAULT_CACHE_DIR,
+                       pipeline: dict | None = None) -> Path | None:
+    """Resolve the vocal stem from provenance, then legacy/new cache layouts."""
+    recorded = None
+    if isinstance(pipeline, dict):
+        recorded = pipeline.get("vocal_stem")
+    if isinstance(recorded, str) and recorded:
+        path = Path(recorded)
+        if not path.is_absolute():
+            path = ROOT / path
+        if path.is_file():
+            return path
+    legacy = cache_dir / "stems" / "htdemucs" / stem / "vocals.wav"
+    if legacy.is_file():
+        return legacy
+    matches = list((cache_dir / "stems").glob(f"*/htdemucs/{stem}/vocals.wav"))
+    return matches[0] if matches else None
+
+
+def check_energy(stem: str, lines: list[dict], cache_dir: Path = DEFAULT_CACHE_DIR,
+                 pipeline: dict | None = None) -> list[str]:
     try:
         import numpy as np
     except ImportError:
         return ["numpy is not installed; energy check skipped"]
 
-    vocal_path = cache_dir / "stems" / "htdemucs" / stem / "vocals.wav"
-    if not vocal_path.exists():
-        try:
-            display_path = vocal_path.relative_to(ROOT)
-        except ValueError:
-            display_path = vocal_path
-        return [f"no cached vocal stem: {display_path}"]
+    vocal_path = resolve_vocal_stem(stem, cache_dir, pipeline)
+    if vocal_path is None:
+        return [f"no cached vocal stem for {stem}"]
 
     proc = subprocess.run(
         ["ffmpeg", "-v", "error", "-i", str(vocal_path), "-ac", "1",
@@ -259,6 +275,40 @@ def check_energy(stem: str, lines: list[dict], cache_dir: Path = DEFAULT_CACHE_D
     return warnings
 
 
+def load_sidecar_data(stem: str, lyrics_dir: Path) -> dict:
+    path = lyrics_dir / f"{stem}.words.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def line_level_reasons(data: dict) -> dict[int, str]:
+    pipeline = data.get("pipeline")
+    if not isinstance(pipeline, dict):
+        return {}
+    entries = pipeline.get("line_level")
+    reasons: dict[int, str] = {}
+    if isinstance(entries, list):
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            index = entry.get("index")
+            reason = entry.get("reason")
+            if isinstance(index, int) and not isinstance(index, bool) and index > 0:
+                reasons[index] = str(reason or "").strip()
+    elif isinstance(entries, dict):
+        for key, value in entries.items():
+            try:
+                index = int(key)
+            except (TypeError, ValueError):
+                continue
+            if index > 0:
+                reasons[index] = str(value or "").strip()
+    return reasons
+
+
 def main(argv: list[str] | None = None) -> int:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -269,23 +319,26 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--energy", action="store_true",
                         help="inspect cached vocal stems for quiet/late cues")
     parser.add_argument("--strict", action="store_true",
-                        help="treat line-level lyric cues without word timings as problems")
+                        help="treat unexplained line-level lyric cues without word timings as problems")
+    parser.add_argument("--lyrics-dir", type=Path, default=None,
+                        help=f"lyrics directory (default: {LYRICS_DIR})")
     parser.add_argument("--verbose", action="store_true",
                         help="show the first and last three cues")
     parser.add_argument("--cache-dir", type=Path, default=DEFAULT_CACHE_DIR,
                         help=f"tool cache directory (default: {DEFAULT_CACHE_DIR})")
     args = parser.parse_args(argv)
+    lyrics_dir = (args.lyrics_dir or LYRICS_DIR).resolve()
 
     sidecars = {path.name.removesuffix(".words.json")
-                for path in LYRICS_DIR.glob("*.words.json")}
+                for path in lyrics_dir.glob("*.words.json")}
     srt_stems = {path.name.removesuffix(".srt")
-                 for path in LYRICS_DIR.glob("*.srt")}
+                 for path in lyrics_dir.glob("*.srt")}
     stems = sorted(sidecars | srt_stems)
     if args.song:
         stems = [stem for stem in stems
                  if any(query.lower() in stem.lower() for query in args.song)]
     if not stems:
-        print("no matching lyrics/*.srt or lyrics/*.words.json files")
+        print(f"no matching lyrics/*.srt or lyrics/*.words.json files in {lyrics_dir}")
         return 1
 
     total_problems = 0
@@ -296,17 +349,24 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{stem}: SRT-only (no .words.json sidecar)")
             continue
         problems, lines, lyric_count, instrumental_count, word_count = (
-            check_sidecar(stem, LYRICS_DIR))
+            check_sidecar(stem, lyrics_dir))
+        data = load_sidecar_data(stem, lyrics_dir)
+        pipeline = data.get("pipeline") if isinstance(data.get("pipeline"), dict) else {}
+        explained_reasons = line_level_reasons(data)
         line_level_indexes = [
             index for index, line in enumerate(lines, 1)
             if isinstance(line, dict)
             and not line.get("instrumental")
             and not line.get("words")
         ]
+        explained_indexes = [index for index in line_level_indexes
+                             if explained_reasons.get(index)]
+        unexplained_indexes = [index for index in line_level_indexes
+                               if not explained_reasons.get(index)]
         if args.strict:
             problems.extend(
                 f"cue {index}: lyric cue has no word timings"
-                for index in line_level_indexes
+                for index in unexplained_indexes
             )
         total_problems += len(problems)
         print(
@@ -314,16 +374,18 @@ def main(argv: list[str] | None = None) -> int:
             f"({lyric_count} lyric, {instrumental_count} instrumental), "
             f"{word_count} words, {len(problems)} structural problem(s)"
         )
-        if line_level_indexes and not args.strict:
+        if line_level_indexes:
             print(f"  note: {len(line_level_indexes)} line-level lyric cue(s); "
-                  "use --strict to flag them")
+                  f"{len(explained_indexes)} explained by pipeline provenance, "
+                  f"{len(unexplained_indexes)} unexplained"
+                  + ("" if args.strict else "; use --strict to flag unexplained"))
         for problem in problems[:20]:
             print(f"  PROBLEM: {problem}")
         if len(problems) > 20:
             print(f"  ... {len(problems) - 20} more problem(s)")
 
         if args.energy and lines and not problems:
-            warnings = check_energy(stem, lines, args.cache_dir)
+            warnings = check_energy(stem, lines, args.cache_dir, pipeline)
             print(f"  energy: {len(warnings)} warning(s)")
             for warning in warnings[:8]:
                 print(f"    {warning}")
