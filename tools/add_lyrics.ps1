@@ -22,6 +22,15 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+# Native Python output and the captured log must both use UTF-8. Without this,
+# PowerShell decodes the child process with the OEM code page (437 here) and
+# Japanese/Korean text is mangled before Set-Content ever sees it.
+$env:PYTHONIOENCODING = "utf-8"
+$env:PYTHONUTF8 = "1"
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$OutputEncoding = [System.Text.Encoding]::UTF8
+
 $root = Split-Path -Parent $PSScriptRoot
 $cacheDir = Join-Path $root "tools\.cache"
 $log = Join-Path $cacheDir "last_run.log"
