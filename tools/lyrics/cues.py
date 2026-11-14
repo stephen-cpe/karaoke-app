@@ -21,7 +21,12 @@ log = logging.getLogger("lyrics")
 INSTRUMENTAL_GAP = 3.0
 MIN_LINE_LEVEL_TOKENS = 1
 MIN_WORD_LENGTH = 0.12
+MIN_FINAL_WORD_SECONDS = 0.05
+WEAK_WORD_SCORE = -5.0
+WEAK_WORD_MIN_SECONDS = 0.04
+MIN_LYRIC_LINE_SECONDS = 1.0
 LINE_COVERAGE_TARGET = 0.80
+LINE_COVERAGE_TARGET_JAKO = 0.75
 LEADING_GAP_SECONDS = 12.0
 LEADING_GAP_RMS = 0.02
 
@@ -177,43 +182,6 @@ def local_timing_is_reasonable(tokens: list[dict], known: dict[int, tuple[float,
             return False
         previous_end = word_end
     return True
-
-
-def robust_line_anchors(lines: list[dict], tokens: list[dict],
-                        token_local: dict[int, int],
-                        local: list[dict]) -> tuple[dict[int, float], dict]:
-    starts_by_line: dict[int, list[float]] = {}
-    first_token: dict[int, int] = {}
-    for token_index, token in enumerate(tokens):
-        first_token.setdefault(token["line"], token_index)
-    for token_index, local_index in token_local.items():
-        line_index = tokens[token_index]["line"]
-        if token_index != first_token[line_index]:
-            continue
-        starts_by_line.setdefault(line_index, []).append(local[local_index]["start"])
-    if not starts_by_line:
-        return {}, {}
-
-    offsets = sorted(min(starts) - lines[line_index]["start"]
-                     for line_index, starts in starts_by_line.items())
-    median = offsets[len(offsets) // 2]
-    mad = sorted(abs(offset - median) for offset in offsets)[len(offsets) // 2]
-    tolerance = max(1.25, min(3.0, 5.0 * mad))
-    anchors = {}
-    for line_index, starts in starts_by_line.items():
-        start = min(starts)
-        if abs(start - lines[line_index]["start"] - median) <= tolerance:
-            anchors[line_index] = start
-
-    monotonic = {}
-    last_start = None
-    for line_index in sorted(anchors):
-        if last_start is not None and anchors[line_index] <= last_start:
-            continue
-        monotonic[line_index] = anchors[line_index]
-        last_start = anchors[line_index]
-    return monotonic, {"median_offset": median, "mad": mad,
-                       "tolerance": tolerance}
 
 
 def mapped_line_windows(lines: list[dict], anchors: dict[int, float],
@@ -828,6 +796,27 @@ def _interpolate_aligned(tokens: list[dict], word_map: dict[int, object],
             "end": min(line_end, end),
         }
 
+    # A word just below the score threshold still carries a placed timestamp.
+    # Use it as a weak (inferred) timing instead of dropping the whole line.
+    for index, word in word_map.items():
+        if not 0 <= index < len(tokens) or words[index] is not None:
+            continue
+        score = _word_value(word, "score", -999.0)
+        start = float(_word_value(word, "start", 0.0))
+        end = float(_word_value(word, "end", 0.0))
+        if (score < WEAK_WORD_SCORE or end <= start
+                or end - start < WEAK_WORD_MIN_SECONDS):
+            continue
+        if end <= line_start or start >= line_end:
+            continue
+        words[index] = {
+            "text": tokens[index]["text"],
+            "start": max(line_start, start),
+            "end": min(line_end, end),
+            "inferred": True,
+            "weak": True,
+        }
+
     index = 0
     while index < len(tokens):
         if words[index] is not None:
@@ -875,11 +864,14 @@ def _interpolate_aligned(tokens: list[dict], word_map: dict[int, object],
         if word is None:
             return None
         start = max(line_start, previous_end, word["start"])
-        end = min(line_end, max(start + MIN_WORD_LENGTH, word["end"]))
+        end = max(start + MIN_WORD_LENGTH,
+                  min(line_end, word["end"]))
         item = {"text": word["text"], "start": round(start, 3),
                 "end": round(end, 3)}
         if word.get("inferred"):
             item["inferred"] = True
+        if word.get("weak"):
+            item["weak"] = True
         result.append(item)
         previous_end = end
     return result
@@ -888,7 +880,7 @@ def _interpolate_aligned(tokens: list[dict], word_map: dict[int, object],
 def _line_level_timing(line: dict, next_start: float | None, duration: float,
                        audio) -> tuple[float, float, str | None]:
     start = line.get("start")
-    reason = "forced-alignment coverage below the 80% threshold"
+    reason = "forced-alignment coverage below the line target"
     if start is None:
         start = 0.0
         reason = "no reliable reference timestamp"
@@ -957,14 +949,131 @@ def _cue_with_words(tokens: list[dict], words: list[dict], start: float,
     }
 
 
+def _enforce_min_cue_duration(cues: list[dict], duration: float,
+                              min_seconds: float = MIN_LYRIC_LINE_SECONDS
+                              ) -> list[dict]:
+    """Give short lyric cues room by borrowing from a neighbour's tail/gap."""
+    for index, cue in enumerate(cues):
+        if cue.get("instrumental"):
+            continue
+        if float(cue["end"]) - float(cue["start"]) >= min_seconds:
+            continue
+        need = min_seconds - (float(cue["end"]) - float(cue["start"]))
+        if index > 0:
+            previous = cues[index - 1]
+            room = max(0.0, float(cue["start"])
+                       - (float(previous["start"]) + min_seconds))
+            shift = min(need, room)
+            if shift > 0:
+                boundary = float(cue["start"]) - shift - 0.02
+                previous_words = previous.get("words") or []
+                can_trim = True
+                if previous_words:
+                    last = previous_words[-1]
+                    if (float(last.get("end", previous["start"])) > boundary
+                            and boundary
+                            < float(last.get("start", previous["start"]))
+                            + MIN_FINAL_WORD_SECONDS):
+                        can_trim = False
+                if can_trim:
+                    if previous_words:
+                        last = previous_words[-1]
+                        if float(last.get("end", previous["start"])) > boundary:
+                            last["end"] = round(boundary, 3)
+                    previous["end"] = round(boundary, 3)
+                    cue["start"] = round(float(cue["start"]) - shift, 3)
+                    if cue.get("words"):
+                        first = cue["words"][0]
+                        if float(first["start"]) > float(cue["start"]):
+                            first["start"] = round(float(cue["start"]), 3)
+        if float(cue["end"]) - float(cue["start"]) >= min_seconds:
+            continue
+        next_start = (float(cues[index + 1]["start"])
+                      if index + 1 < len(cues) else duration)
+        room = max(0.0, next_start - 0.02 - float(cue["end"]))
+        need = min_seconds - (float(cue["end"]) - float(cue["start"]))
+        shift = min(need, room)
+        if shift > 0:
+            cue["end"] = round(float(cue["end"]) + shift, 3)
+            if cue.get("words"):
+                last = cue["words"][-1]
+                if float(last.get("end", cue["end"])) > float(cue["end"]):
+                    last["end"] = round(float(cue["end"]), 3)
+    return cues
+
+
 def _trim_cue_overlaps(cues: list[dict], duration: float, *,
                        allow_tail_trim: bool = False) -> list[dict]:
-    """Trim the previous cue's linger instead of throwing away aligned words."""
+    """Resolve overlaps without collapsing the later lyric line.
+
+    For Japanese/Korean known lyrics, the later line keeps its own start and
+    words; the earlier line's tail is split at that boundary. If the earlier
+    line's last word cannot be shortened, its word timings are dropped (the
+    line remains visible at line level) rather than destroying the later line.
+    """
     for index in range(len(cues) - 1):
         previous = cues[index]
         current = cues[index + 1]
         if current["start"] >= previous["end"] - 0.001:
             continue
+        if allow_tail_trim:
+            boundary = float(current["start"]) - 0.02
+            if (boundary > float(previous["start"])
+                    and boundary - float(previous["start"])
+                    >= MIN_LYRIC_LINE_SECONDS):
+                previous["end"] = round(min(
+                    float(previous["end"]), boundary), 3)
+                previous_words = previous.get("words") or []
+                if previous_words:
+                    last = previous_words[-1]
+                    last_end = float(last.get("end", previous["start"]))
+                    last_start = float(last.get("start", previous["start"]))
+                    if last_end > float(previous["end"]) + 0.001:
+                        if (float(previous["end"])
+                                >= last_start + MIN_FINAL_WORD_SECONDS):
+                            last["end"] = round(float(previous["end"]), 3)
+                        else:
+                            previous_word_end = (
+                                float(previous_words[-2].get("end",
+                                                            previous["start"]))
+                                if len(previous_words) > 1
+                                else float(previous["start"]))
+                            new_start = max(
+                                previous_word_end,
+                                float(previous["end"]) - MIN_FINAL_WORD_SECONDS)
+                            if (float(previous["end"]) - new_start
+                                    >= MIN_FINAL_WORD_SECONDS - 1e-9):
+                                last["start"] = round(new_start, 3)
+                                last["end"] = round(float(previous["end"]), 3)
+                            else:
+                                shift_to = last_end + 0.01
+                                first_word = ((current.get("words") or [None])[0])
+                                can_shift = (
+                                    shift_to < float(current["end"])
+                                    - MIN_LYRIC_LINE_SECONDS)
+                                if can_shift and first_word is not None:
+                                    second = ((current.get("words") or [None, None])[1]
+                                              if len(current.get("words") or []) > 1
+                                              else None)
+                                    can_shift = (
+                                        shift_to
+                                        < float(first_word["end"])
+                                        - MIN_FINAL_WORD_SECONDS
+                                        and (second is None
+                                             or shift_to
+                                             < float(second["start"])))
+                                if can_shift:
+                                    if first_word is not None:
+                                        first_word["start"] = round(shift_to, 3)
+                                    current["start"] = round(shift_to, 3)
+                                    previous["end"] = round(last_end, 3)
+                                    continue
+                                previous["words"] = []
+                                previous["timing_source"] = "none"
+                                previous["line_level_reason"] = (
+                                    "trimmed at the next lyric line boundary")
+                if float(previous["end"]) <= float(current["start"]):
+                    continue
         if (allow_tail_trim and current.get("words")
                 and previous.get("words")):
             last = previous["words"][-1]
@@ -1035,6 +1144,8 @@ def build_aligned_lines(reference: dict, line_alignments: list[dict],
         allow_edges = language in ("ja", "ko")
     else:
         allow_edges = bool(allow_edge_inference)
+    coverage_target = (LINE_COVERAGE_TARGET_JAKO
+                       if allow_edges else LINE_COVERAGE_TARGET)
     reference_offset = (_line_alignment_offset(lines, line_alignments)
                         if allow_edges else 0.0)
     built = []
@@ -1055,7 +1166,7 @@ def build_aligned_lines(reference: dict, line_alignments: list[dict],
                 break
 
         words = None
-        if coverage >= LINE_COVERAGE_TARGET:
+        if coverage >= coverage_target:
             candidate_start = min(
                 (float(_word_value(word, "start", 0.0))
                  for word in word_map.values()
@@ -1143,8 +1254,148 @@ def build_aligned_lines(reference: dict, line_alignments: list[dict],
             "line_level_reason": reason,
         })
         previous_end = end
-    return _trim_cue_overlaps(
+    trimmed = _trim_cue_overlaps(
         built, duration, allow_tail_trim=allow_edges)
+    if allow_edges:
+        return _enforce_min_cue_duration(trimmed, duration)
+    return trimmed
+
+
+def build_word_sync_lines(reference: dict, duration: float,
+                          language: str = "en") -> list[dict]:
+    """Turn LRCLIB word-level timings into display-token alignments.
+
+    LRCLIB usually groups a Japanese phrase into one word block. The block is
+    split across the romanized display tokens and its interval is shared
+    proportionally, so the player still highlights the words it shows.
+    """
+    lines = reference.get("lines") or []
+    results = []
+    for line_index, line in enumerate(lines):
+        tokens = textnorm.split_display_tokens(
+            str(line.get("text") or ""), language)
+        blocks = line.get("word_sync_blocks") or []
+        if not tokens or not blocks:
+            results.append({
+                "index": line_index, "coverage": 0.0, "words": [],
+                "start": line.get("start"), "end": line.get("end"),
+            })
+            continue
+        assigned: list[dict | None] = [None] * len(tokens)
+        norms = [textnorm.norm_token(token["text"], "en") for token in tokens]
+        position = 0
+        for block in blocks:
+            block_tokens = textnorm.split_display_tokens(
+                str(block.get("romanized") or ""), language)
+            if not block_tokens or position >= len(tokens):
+                continue
+            block_norms = [textnorm.norm_token(token["text"], "en")
+                           for token in block_tokens]
+            count = min(len(block_norms), len(tokens) - position)
+            start = position
+            if norms[position:position + count] != block_norms[:count]:
+                for candidate in range(position, len(tokens) - count + 1):
+                    if norms[candidate:candidate + count] == block_norms[:count]:
+                        start = candidate
+                        break
+                else:
+                    start = position
+            end = min(len(tokens), start + count)
+            if end <= start:
+                continue
+            block_start = block.get("start")
+            block_end = block.get("end")
+            if block_start is None or block_end is None:
+                position = end
+                continue
+            block_start = float(block_start)
+            block_end = float(block_end)
+            if block_end <= block_start:
+                position = end
+                continue
+            widths = [max(1, len(tokens[index]["text"]))
+                      for index in range(start, end)]
+            total_width = sum(widths)
+            cursor = block_start
+            for offset, index in enumerate(range(start, end)):
+                if offset + 1 == len(widths):
+                    token_end = block_end
+                else:
+                    token_end = cursor + (
+                        (block_end - block_start) * widths[offset]
+                        / total_width)
+                assigned[index] = {
+                    "text": tokens[index]["text"],
+                    "start": round(cursor, 3),
+                    "end": round(max(cursor + 0.02, token_end), 3),
+                }
+                cursor = token_end
+            position = end
+
+        line_start = line.get("start")
+        line_end = line.get("end")
+        if line_start is None:
+            line_start = min(
+                (word["start"] for word in assigned if word is not None),
+                default=0.0)
+        if line_end is None:
+            line_end = max(
+                (word["end"] for word in assigned if word is not None),
+                default=float(line_start) + 4.0)
+        line_start = float(line_start)
+        line_end = max(float(line_end), line_start + 0.3)
+
+        index = 0
+        while index < len(assigned):
+            if assigned[index] is not None:
+                index += 1
+                continue
+            run_start = index
+            while index < len(assigned) and assigned[index] is None:
+                index += 1
+            run_end = index
+            lower = (assigned[run_start - 1]["end"]
+                     if run_start > 0 else line_start)
+            upper = (assigned[run_end]["start"]
+                     if run_end < len(assigned) else line_end)
+            if upper <= lower:
+                upper = lower + 0.02 * (run_end - run_start)
+            step = (upper - lower) / (run_end - run_start)
+            for offset, token_index in enumerate(range(run_start, run_end)):
+                assigned[token_index] = {
+                    "text": tokens[token_index]["text"],
+                    "start": round(lower + step * offset, 3),
+                    "end": round(lower + step * (offset + 1), 3),
+                }
+
+        words = []
+        previous_end = line_start
+        for token_index, word in enumerate(assigned):
+            if word is None:
+                continue
+            start = max(float(word["start"]), previous_end)
+            end = max(start + 0.02, float(word["end"]))
+            words.append({
+                "token": token_index,
+                "text": tokens[token_index]["text"],
+                "start": round(start, 3),
+                "end": round(end, 3),
+                "aligned": True,
+                "score": 0.0,
+            })
+            previous_end = end
+        results.append({
+            "index": line_index,
+            "coverage": len(words) / len(tokens) if tokens else 0.0,
+            "aligned_words": len(words),
+            "total_words": len(tokens),
+            "mean_score": 0.0,
+            "min_score": 0.0,
+            "start": line.get("start"),
+            "end": line.get("end"),
+            "words": words,
+        })
+    return results
 
 
 def build_aligned_asr_lines(asr_lines: list[dict], line_alignments: list[dict],

@@ -121,6 +121,22 @@ def test_user_override_language_only(tmp_path):
     assert override["lines"] == []
 
 
+def test_user_override_reads_replacements(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "song.json").write_text(
+        json.dumps({
+            "language": "ko",
+            "replacements": {"O-ppan gangnamseuta-il": "Oppan Gangnam style"},
+        }),
+        encoding="utf-8")
+    override = reference.user_override(source, "song")
+    assert override is not None
+    assert override["language"] == "ko"
+    assert override["replacements"] == {
+        "O-ppan gangnamseuta-il": "Oppan Gangnam style"}
+
+
 def test_choose_candidate_rejects_wrong_duration_and_prefers_word_sync():
     pytest.importorskip("yaml")
     good = {

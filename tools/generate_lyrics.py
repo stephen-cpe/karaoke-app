@@ -70,8 +70,6 @@ split_display_tokens = textnorm.split_display_tokens
 parse_lrc = reference.parse_lrc
 chunk_ranges = asr.chunk_ranges
 load_vocal_audio = audio.load_vocal_audio
-_window_rms = audio.window_rms
-_max_window_rms = audio.max_window_rms
 vocal_onset = audio.vocal_onset
 vocal_phrase_end = audio.vocal_phrase_end
 distribute_words = cues.distribute_words
@@ -82,7 +80,6 @@ add_instrumental_cues = cues.add_instrumental_cues
 build_from_transcript = cues.build_from_transcript
 flat_lrc_tokens = cues.flat_lrc_tokens
 map_lrc_time = cues.map_lrc_time
-robust_line_anchors = cues.robust_line_anchors
 align_reference_words = cues.align_reference_words
 tokens_similar = cues.tokens_similar
 duration_of = audio.duration_of
@@ -271,7 +268,50 @@ def _needs_full_asr(language: str, has_reference: bool,
     return True, "no forced-alignment path for this language"
 
 
-def _romanize_candidate(item: dict[str, Any], language: str) -> None:
+def _apply_text_replacements(lines: list[dict[str, Any]],
+                             replacements: dict[str, str] | None
+                             ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Apply display-spelling replacements before alignment.
+
+    Replacements are matched against the romanized line text. The line's
+    token list is rebuilt from the replaced text so the timings belong to the
+    words the singer actually sees.
+    """
+    if not replacements:
+        return lines, []
+    cleaned = {
+        str(source): str(target)
+        for source, target in replacements.items()
+        if str(source) and str(target)
+    }
+    if not cleaned:
+        return lines, []
+    result = []
+    applied = []
+    for index, line in enumerate(lines):
+        row = dict(line)
+        text = str(row.get("text") or "")
+        row_applied = []
+        for source, target in cleaned.items():
+            if source in text:
+                count = text.count(source)
+                text = text.replace(source, target)
+                row_applied.append({
+                    "line": index + 1,
+                    "from": source,
+                    "to": target,
+                    "count": count,
+                })
+        if row_applied:
+            row["text"] = text
+            row["words"] = []
+            applied.extend(row_applied)
+        result.append(row)
+    return result, applied
+
+
+def _romanize_candidate(item: dict[str, Any], language: str,
+                        replacements: dict[str, str] | None = None) -> None:
     """Replace native-script reference text with the display romanization."""
     lines = item.get("lines") or []
     texts = [str(line.get("text") or "") for line in lines]
@@ -280,9 +320,26 @@ def _romanize_candidate(item: dict[str, Any], language: str) -> None:
         and not any(textnorm.has_japanese(text) for text in texts))
     romanized_lines, readings = romanize.romanize_lines(
         lines, language, pre_romanized=pre_romanized)
-    item["lines"] = romanized_lines
-    item["tokens"] = reference.flatten_tokens(romanized_lines, "en")
+    for row in romanized_lines:
+        blocks = []
+        for word in row.get("words") or []:
+            result = romanize.romanize_line(
+                str(word.get("text") or ""), language,
+                pre_romanized=pre_romanized)
+            block_text = result.text
+            if replacements:
+                block_lines, _ = _apply_text_replacements(
+                    [{"text": block_text}], replacements)
+                block_text = str(block_lines[0].get("text") or "")
+            if block_text:
+                blocks.append({**word, "romanized": block_text})
+        row["word_sync_blocks"] = blocks
+    replaced_lines, applied = _apply_text_replacements(
+        romanized_lines, replacements)
+    item["lines"] = replaced_lines
+    item["tokens"] = reference.flatten_tokens(replaced_lines, "en")
     item["romanized_readings"] = readings
+    item["replacements_applied"] = applied
     item["romanization"] = {
         "language": language,
         "pre_romanized": pre_romanized,
@@ -290,6 +347,7 @@ def _romanize_candidate(item: dict[str, Any], language: str) -> None:
                    if pre_romanized else
                    "korean-academic" if language == "ko"
                    else "japanese-fugashi"),
+        "replacements": applied,
     }
 
 
@@ -338,7 +396,8 @@ def _script_gate(cues: list[dict[str, Any]], language: str) -> dict[str, Any]:
 
 
 def _prepare_alignment_candidates(records: list[dict[str, Any]], language: str,
-                                  duration: float, audio_data, client
+                                  duration: float, audio_data, client,
+                                  replacements: dict[str, str] | None = None
                                   ) -> list[dict[str, Any]]:
     prepared = []
     for record in records:
@@ -377,7 +436,7 @@ def _prepare_alignment_candidates(records: list[dict[str, Any]], language: str,
                 if rescored["duration_error"] <= reference.LRCLIB_DURATION_TOLERANCE:
                     item = rescored
         if language in ("ja", "ko"):
-            _romanize_candidate(item, language)
+            _romanize_candidate(item, language, replacements)
         full.append(item)
     return full
 
@@ -389,6 +448,100 @@ def _alignment_choice_key(summary: dict[str, Any]) -> tuple:
         float(summary.get("word_coverage") or 0.0),
         float(summary.get("mean_score") or -999.0),
     )
+
+
+def _local_word_onset(audio_data, start: float, end: float):
+    times, values = audio.window_rms(
+        audio_data, max(0.0, start - 0.75), min(end + 0.05, start + 0.25),
+        window=0.05, hop=0.025)
+    if not len(values):
+        return None
+    peak = float(values.max())
+    threshold = max(audio.ONSET_RMS, 0.2 * peak)
+    active = [bool(value >= threshold) for value in values]
+    transition = None
+    for index in range(1, len(active)):
+        if (not active[index - 1] and active[index]
+                and times[index] <= start + 0.10):
+            transition = float(times[index])
+    return transition
+
+
+def _timing_agreement(built: list[dict[str, Any]], audio_data,
+                      max_words: int = 300) -> dict[str, Any]:
+    if audio_data is None:
+        return {"n": 0, "within_0_2": 0.0, "p90_abs": 9.99,
+                "median": 0.0}
+    word_intervals = []
+    for cue in built:
+        if cue.get("instrumental"):
+            continue
+        for word in cue.get("words") or []:
+            word_intervals.append((float(word["start"]), float(word["end"])))
+    if not word_intervals:
+        return {"n": 0, "within_0_2": 0.0, "p90_abs": 9.99,
+                "median": 0.0}
+    if len(word_intervals) > max_words:
+        step = len(word_intervals) / float(max_words)
+        word_intervals = [word_intervals[int(index * step)]
+                          for index in range(max_words)]
+    diffs = []
+    for start, end in word_intervals:
+        onset = _local_word_onset(audio_data, start, end)
+        if onset is not None:
+            diffs.append(start - onset)
+    if not diffs:
+        return {"n": 0, "within_0_2": 0.0, "p90_abs": 9.99,
+                "median": 0.0}
+    abs_values = sorted(abs(value) for value in diffs)
+    p90 = abs_values[min(len(abs_values) - 1, round(0.9 * (len(abs_values) - 1)))]
+    diffs.sort()
+    median = diffs[len(diffs) // 2]
+    return {
+        "n": len(diffs),
+        "within_0_2": round(
+            sum(1 for value in diffs if abs(value) <= 0.2) / len(diffs), 4),
+        "p90_abs": round(p90, 3),
+        "median": round(median, 3),
+    }
+
+
+def _built_quality(built: list[dict[str, Any]], audio_data,
+                   total_tokens: int, max_words: int = 60
+                   ) -> dict[str, Any]:
+    lyric_lines = sum(1 for cue in built if not cue.get("instrumental"))
+    line_level = sum(1 for cue in built
+                     if not cue.get("instrumental") and not cue.get("words"))
+    words = sum(len(cue.get("words") or []) for cue in built)
+    agreement = _timing_agreement(built, audio_data, max_words=max_words)
+    coverage = words / total_tokens if total_tokens else 0.0
+    line_level_rate = line_level / lyric_lines if lyric_lines else 0.0
+    first_start = None
+    for cue in built:
+        if cue.get("instrumental") or not cue.get("words"):
+            continue
+        first_start = float(cue["words"][0]["start"])
+        break
+    first_rms = None
+    if first_start is not None and audio_data is not None:
+        first_rms = audio.max_window_rms(
+            audio_data, max(0.0, first_start - 0.2), first_start + 0.5)
+    silent_first = (first_rms is not None
+                    and first_rms < audio.ONSET_RMS)
+    score = (coverage - line_level_rate
+             + agreement["within_0_2"] - agreement["p90_abs"] * 0.5
+             - (0.75 if silent_first else 0.0))
+    return {
+        "lyric_lines": lyric_lines,
+        "line_level_lines": line_level,
+        "line_level_rate": round(line_level_rate, 4),
+        "coverage": round(coverage, 4),
+        "agreement": agreement,
+        "first_word_rms": (round(first_rms, 5)
+                           if first_rms is not None else None),
+        "silent_first_word": silent_first,
+        "score": round(score, 4),
+    }
 
 
 def _align_candidates(candidates: list[dict[str, Any]], language: str,
@@ -423,29 +576,63 @@ def _align_candidates(candidates: list[dict[str, Any]], language: str,
                 if (_alignment_choice_key(refined.summary)
                         > base_key):
                     result = refined
-        allow_edges = (known_jako
-                       and bool((result.summary or {}).get("windowed")))
+        allow_edges = known_jako
         built = cues.build_aligned_lines(
             item, result.lines, duration, audio_data, language,
             allow_edge_inference=allow_edges)
-        lyric_lines = sum(1 for cue in built if not cue.get("instrumental"))
-        line_level = sum(1 for cue in built
-                         if not cue.get("instrumental")
-                         and not cue.get("words"))
-        built_words = sum(len(cue.get("words") or []) for cue in built)
-        item["build_quality"] = {
-            "lyric_lines": lyric_lines,
-            "line_level_lines": line_level,
-            "line_level_rate": round(
-                line_level / lyric_lines if lyric_lines else 0.0, 4),
-            "coverage": round(
-                built_words / len(item["tokens"]) if item["tokens"] else 0.0,
-                4),
-        }
+        forced_quality = _built_quality(
+            built, audio_data, len(item["tokens"]))
+        item["forced_built"] = built
+        item["forced_quality"] = forced_quality
+        item["build_quality"] = forced_quality
+        item["word_sync"] = None
+        if any(line.get("word_sync_blocks") for line in item["lines"]):
+            word_alignments = cues.build_word_sync_lines(
+                item, duration, language)
+            word_built = cues.build_aligned_lines(
+                item, word_alignments, duration, audio_data, language,
+                allow_edge_inference=known_jako)
+            for cue in word_built:
+                if not cue.get("instrumental") and cue.get("words"):
+                    cue["timing_source"] = "lrclib-word-sync"
+            item["word_sync"] = {
+                "line_alignment": word_alignments,
+                "built": word_built,
+                "quality": _built_quality(
+                    word_built, audio_data, len(item["tokens"])),
+            }
         item["alignment"] = result.summary
         item["line_alignment"] = result.lines
         total_align_seconds += float(result.summary.get("seconds") or 0.0)
     candidates.sort(key=align.candidate_rank_key, reverse=True)
+    word_sync_info = {"evaluated": 0, "won": False}
+    word_candidates = [item for item in candidates
+                       if item.get("word_sync")]
+    if word_candidates:
+        word_best = max(
+            word_candidates,
+            key=lambda item: item["word_sync"]["quality"]["score"])
+        forced_best = candidates[0]
+        forced_quality = forced_best.get("forced_quality") or {}
+        word_quality = word_best["word_sync"]["quality"]
+        word_sync_info.update({
+            "evaluated": len(word_candidates),
+            "candidate": (word_best.get("record") or {}).get("id"),
+            "forced_score": forced_quality.get("score"),
+            "word_sync_score": word_quality.get("score"),
+            "forced_agreement": forced_quality.get("agreement"),
+            "word_sync_agreement": word_quality.get("agreement"),
+        })
+        if (word_quality["score"]
+                > float(forced_quality.get("score") or -999.0) + 0.02):
+            candidates.remove(word_best)
+            candidates.insert(0, word_best)
+            word_best["chosen_tier"] = "word-sync"
+            word_sync_info["won"] = True
+        else:
+            forced_best["chosen_tier"] = "forced-alignment"
+    if candidates and not candidates[0].get("chosen_tier"):
+        candidates[0]["chosen_tier"] = "forced-alignment"
     info = {
         "model": session.model_name,
         "device": session.device,
@@ -454,6 +641,7 @@ def _align_candidates(candidates: list[dict[str, Any]], language: str,
         "emissions_seconds": round(emissions_seconds, 2),
         "candidate_seconds": round(total_align_seconds, 2),
         "candidates_aligned": len(candidates),
+        "word_sync": word_sync_info,
     }
     return candidates, info
 
@@ -603,9 +791,14 @@ def process_song(stem: str, original: Path, karaoke: Path, cache_dir: Path,
                 "instrumental stem could not be decoded for gap classification")
 
         override = reference.user_override(source_dir, stem)
+        replacements = (override.get("replacements")
+                        if override and isinstance(override.get("replacements"), dict)
+                        else None)
         if override:
             log.info("  user override: %s", override.get("path"))
             report["user_override"] = override.get("path")
+            if replacements:
+                log.info("  text replacements: %d phrase(s)", len(replacements))
 
         client = reference.LRCLIBClient(cache_dir)
         lookup = None
@@ -808,7 +1001,7 @@ def process_song(stem: str, original: Path, karaoke: Path, cache_dir: Path,
                 reference_dict = reference.reference_from_override(
                     override, language, duration, [])
                 reference_line_count = _reference_line_count(reference_dict, language)
-                align_session = align.AlignSession()
+                align_session = align.shared_session()
                 try:
                     started = time.perf_counter()
                     known_jako = language in ("ja", "ko")
@@ -839,9 +1032,7 @@ def process_song(stem: str, original: Path, karaoke: Path, cache_dir: Path,
                     built = cues.build_aligned_lines(
                         reference_dict, line_alignments, duration,
                         audio_data, language,
-                        allow_edge_inference=(
-                            language in ("ja", "ko")
-                            and bool((alignment_info or {}).get("windowed"))))
+                        allow_edge_inference=language in ("ja", "ko"))
                     text_source = "user"
                     timing_source = "forced-alignment"
                 finally:
@@ -849,38 +1040,70 @@ def process_song(stem: str, original: Path, karaoke: Path, cache_dir: Path,
         elif lookup and lookup.records:
             if not full_asr_needed:
                 candidate_items = _prepare_alignment_candidates(
-                    lookup.records, language, duration, audio_data, client)
+                    lookup.records, language, duration, audio_data, client,
+                    replacements=replacements)
                 if not candidate_items:
                     raise RuntimeError(
                         "no LRCLIB candidate could be prepared for forced alignment")
-                align_session = align.AlignSession()
+                align_session = align.shared_session()
                 try:
                     started = time.perf_counter()
                     candidates, aligner_info = _align_candidates(
                         candidate_items, language, audio_data, align_session,
                         duration)
                     chosen = candidates[0]
-                    alignment_info = chosen.get("alignment")
-                    line_alignments = chosen.get("line_alignment") or []
                     reference_dict = reference.reference_from_candidate(chosen)
                     reference_line_count = _reference_line_count(
                         reference_dict, language)
                     aligner_info["seconds"] = _seconds(started)
                     report["stages"]["alignment"] = aligner_info
-                    built = cues.build_aligned_lines(
-                        reference_dict, line_alignments, duration,
-                        audio_data, language,
-                        allow_edge_inference=(
-                            language in ("ja", "ko")
-                            and bool((alignment_info or {}).get("windowed"))))
+                    if chosen.get("chosen_tier") == "word-sync":
+                        word_sync = chosen["word_sync"]
+                        quality = word_sync["quality"]
+                        alignment_info = {
+                            "word_coverage": quality["coverage"],
+                            "line_coverage": round(
+                                1.0 - quality["line_level_rate"], 4),
+                            "mean_score": 0.0,
+                            "lines": len(reference_dict.get("lines") or []),
+                            "windowed": False,
+                            "word_sync": {
+                                **(aligner_info.get("word_sync") or {}),
+                                "chosen": True,
+                                "quality": quality,
+                            },
+                            "timing_agreement": quality["agreement"],
+                            "build_quality": quality,
+                        }
+                        line_alignments = word_sync["line_alignment"]
+                        built = word_sync["built"]
+                        timing_source = "lrclib-word-sync"
+                        log.info(
+                            "  word-sync tier: chosen id=%s coverage=%.1f%% "
+                            "line-level=%d agreement=%s",
+                            (chosen.get("record") or {}).get("id"),
+                            float(quality.get("coverage") or 0.0) * 100,
+                            int(quality.get("line_level_lines") or 0),
+                            quality.get("agreement"))
+                    else:
+                        alignment_info = chosen.get("alignment")
+                        if aligner_info.get("word_sync"):
+                            alignment_info["word_sync"] = aligner_info[
+                                "word_sync"]
+                        line_alignments = chosen.get("line_alignment") or []
+                        built = cues.build_aligned_lines(
+                            reference_dict, line_alignments, duration,
+                            audio_data, language,
+                            allow_edge_inference=language in ("ja", "ko"))
+                        timing_source = "forced-alignment"
+                        log.info(
+                            "  forced alignment: chosen id=%s coverage=%.1f%% "
+                            "mean_score=%.3f",
+                            (chosen.get("record") or {}).get("id"),
+                            float(alignment_info.get("word_coverage", 0.0)) * 100,
+                            float(alignment_info.get("mean_score", 0.0)))
                     text_source = reference_dict.get(
                         "text_source", "lrclib-plain")
-                    timing_source = "forced-alignment"
-                    log.info("  forced alignment: chosen id=%s coverage=%.1f%% "
-                             "mean_score=%.3f",
-                             (chosen.get("record") or {}).get("id"),
-                             float(alignment_info.get("word_coverage", 0.0)) * 100,
-                             float(alignment_info.get("mean_score", 0.0)))
                 finally:
                     align_session.close()
             else:
@@ -931,7 +1154,7 @@ def process_song(stem: str, original: Path, karaoke: Path, cache_dir: Path,
                     "readings": asr_readings,
                 }
             tokens = cues.flat_lrc_tokens(asr_lines, "en")
-            align_session = align.AlignSession()
+            align_session = align.shared_session()
             try:
                 started = time.perf_counter()
                 result = align_session.align_audio_candidate(
@@ -980,6 +1203,10 @@ def process_song(stem: str, original: Path, karaoke: Path, cache_dir: Path,
                 romanization_info = {
                     **reference_dict["romanization"],
                     "readings": reference_dict.get("romanized_readings") or [],
+                    "replacements": (
+                        reference_dict.get("replacements_applied")
+                        or reference_dict["romanization"].get("replacements")
+                        or []),
                 }
 
         if not built:
@@ -1045,7 +1272,10 @@ def process_song(stem: str, original: Path, karaoke: Path, cache_dir: Path,
             if not line_timing_sources["counts"].get("forced-alignment"):
                 timing_source = "asr"
         elif alignment_info:
-            timing_source = "forced-alignment"
+            if line_timing_sources["counts"].get("lrclib-word-sync"):
+                timing_source = "lrclib-word-sync"
+            else:
+                timing_source = "forced-alignment"
 
         chosen_id = None
         if chosen and chosen.get("record"):

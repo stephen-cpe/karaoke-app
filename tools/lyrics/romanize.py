@@ -14,10 +14,10 @@ from typing import Any
 from . import textnorm
 
 _DIACRITICS = str.maketrans({
-    "ā": "a", "ī": "i", "ū": "u", "ē": "e", "ō": "o",
-    "Ā": "A", "Ī": "I", "Ū": "U", "Ē": "E", "Ō": "O",
-    "â": "a", "ê": "e", "î": "i", "ô": "o", "û": "u",
-    "Â": "A", "Ê": "E", "Î": "I", "Ô": "O", "Û": "U",
+    "ā": "aa", "ī": "ii", "ū": "uu", "ē": "ee", "ō": "ou",
+    "â": "aa", "ê": "ee", "î": "ii", "ô": "ou", "û": "uu",
+    "Ā": "Aa", "Ī": "Ii", "Ū": "Uu", "Ē": "Ee", "Ō": "Ou",
+    "Â": "Aa", "Ê": "Ee", "Î": "Ii", "Ô": "Ou", "Û": "Uu",
 })
 _JAPANESE = re.compile(r"[\u3040-\u30ff\u3400-\u9fff]")
 _HANGUL = re.compile(r"[\uac00-\ud7af\u1100-\u11ff\u3130-\u318f]")

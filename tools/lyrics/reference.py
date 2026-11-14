@@ -598,12 +598,21 @@ def user_override(source_dir: Path, stem: str) -> dict[str, Any] | None:
     if not source_dir.is_dir():
         return None
     language = None
+    replacements: dict[str, str] = {}
     language_path = source_dir / f"{stem}.json"
     if language_path.is_file():
         try:
             payload = json.loads(language_path.read_text(encoding="utf-8"))
-            if isinstance(payload, dict) and isinstance(payload.get("language"), str):
-                language = payload["language"].strip().lower() or None
+            if isinstance(payload, dict):
+                if isinstance(payload.get("language"), str):
+                    language = payload["language"].strip().lower() or None
+                raw_replacements = payload.get("replacements")
+                if isinstance(raw_replacements, dict):
+                    replacements = {
+                        str(source).strip(): str(target).strip()
+                        for source, target in raw_replacements.items()
+                        if str(source).strip() and str(target).strip()
+                    }
         except (OSError, json.JSONDecodeError) as exc:
             log.warning("  user language override is unreadable: %s", exc)
     for suffix in (".lrc", ".txt"):
@@ -621,11 +630,17 @@ def user_override(source_dir: Path, stem: str) -> dict[str, Any] | None:
             rows = [{"start": None, "end": None, "text": line.strip(), "words": []}
                     for line in text.splitlines() if line.strip()]
         if rows:
-            return {"path": str(path), "lines": rows, "language": language,
-                    "text_source": "user"}
-    if language:
-        return {"path": str(language_path), "lines": [], "language": language,
-                "text_source": "user"}
+            result = {"path": str(path), "lines": rows, "language": language,
+                      "text_source": "user"}
+            if replacements:
+                result["replacements"] = replacements
+            return result
+    if language or replacements:
+        result = {"path": str(language_path), "lines": [], "language": language,
+                  "text_source": "user"}
+        if replacements:
+            result["replacements"] = replacements
+        return result
     return None
 
 

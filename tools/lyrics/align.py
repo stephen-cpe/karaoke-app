@@ -21,6 +21,9 @@ DEFAULT_MODEL = "MahmoudAshraf/mms-300m-1130-forced-aligner"
 MIN_WORD_SCORE = -2.0
 MIN_WORD_SECONDS = 0.02
 LINE_COVERAGE_TARGET = 0.80
+REALIGN_COVERAGE_TARGET = 0.75
+REALIGN_PAD_SECONDS = 0.4
+REALIGN_OVERLAP_SECONDS = 0.05
 STAR_FREQUENCY = "line"
 ALIGNMENT_TIME_SHIFT = -0.20
 WINDOW_GAP_SECONDS = 2.5
@@ -292,6 +295,7 @@ class AlignSession:
         self.char_vocab: set[str] = set()
         self.load_seconds = 0.0
         self.seconds = 0.0
+        self.shared = False
         self._torch = None
 
     def load(self):
@@ -323,6 +327,8 @@ class AlignSession:
                  self.model_name, device.upper(), self.load_seconds)
 
     def close(self):
+        if self.shared:
+            return
         self.model = None
         self.tokenizer = None
         self.device = None
@@ -575,6 +581,91 @@ class AlignSession:
             snapped.append(index)
         return snapped
 
+    def _refresh_result(self, result: AlignmentResult,
+                        threshold: float) -> AlignmentResult:
+        aligned = sum(1 for word in result.words if word.aligned)
+        scores = [word.score for word in result.words if word.score > -900]
+        result.aligned_words = aligned
+        result.coverage = (aligned / result.total_words
+                           if result.total_words else 0.0)
+        result.mean_score = (sum(scores) / len(scores)
+                             if scores else -999.0)
+        result.low_score_words = sum(
+            1 for word in result.words if word.score < threshold)
+        return result
+
+    def _realign_overlaps(self, emissions, stride: float,
+                          lines: list[dict[str, Any]],
+                          tokens: list[dict[str, Any]],
+                          result: AlignmentResult, language: str,
+                          duration: float, threshold: float,
+                          shift: float) -> AlignmentResult:
+        """Re-align two adjacent lines together when their words overlap.
+
+        A joint window with line stars lets the CTC path choose the boundary
+        between the two sung lines instead of forcing either line's start.
+        """
+        by_line: dict[int, list[WordTiming]] = {}
+        positions: dict[tuple[int, int], int] = {}
+        for position, word in enumerate(result.words):
+            by_line.setdefault(word.line, []).append(word)
+            positions[(word.line, word.token)] = position
+        for index in range(len(lines) - 1):
+            first = [word for word in by_line.get(index, []) if word.aligned]
+            second = [word for word in by_line.get(index + 1, [])
+                      if word.aligned]
+            if not first or not second:
+                continue
+            first_start = min(word.start for word in first)
+            first_end = max(word.end for word in first)
+            second_start = min(word.start for word in second)
+            second_end = max(word.end for word in second)
+            if second_start >= first_end - REALIGN_OVERLAP_SECONDS:
+                continue
+            window = (
+                max(0.0, min(first_start, second_start) - REALIGN_PAD_SECONDS),
+                min(duration,
+                    max(first_end, second_end) + REALIGN_PAD_SECONDS),
+                [index, index + 1],
+            )
+            subset = [token for token in tokens
+                      if int(token.get("line", 0)) in (index, index + 1)]
+            if not subset:
+                continue
+            joint = self.align_tokens(
+                emissions, stride, subset, language, windows=[window],
+                star_frequency="line", min_word_score=threshold,
+                time_shift=shift)
+            result.seconds += joint.seconds
+            joint_by_line: dict[int, list[WordTiming]] = {}
+            for word in joint.words:
+                joint_by_line.setdefault(word.line, []).append(word)
+            coverages = []
+            for line_index in (index, index + 1):
+                line_words = joint_by_line.get(line_index, [])
+                aligned = sum(1 for word in line_words if word.aligned)
+                coverages.append(aligned / len(line_words)
+                                 if line_words else 0.0)
+            if min(coverages) < REALIGN_COVERAGE_TARGET:
+                continue
+            first_words = [word for word in joint_by_line.get(index, [])
+                           if word.aligned]
+            second_words = [word for word in joint_by_line.get(index + 1, [])
+                            if word.aligned]
+            if not first_words or not second_words:
+                continue
+            if (max(word.end for word in first_words)
+                    > min(word.start for word in second_words)
+                    + REALIGN_OVERLAP_SECONDS):
+                continue
+            for word in joint.words:
+                position = positions.get((word.line, word.token))
+                if position is not None:
+                    result.words[position] = word
+            by_line[index] = joint_by_line.get(index, [])
+            by_line[index + 1] = joint_by_line.get(index + 1, [])
+        return self._refresh_result(result, threshold)
+
     def _retry_low_coverage_lines(self, emissions, stride: float,
                                   lines: list[dict[str, Any]],
                                   tokens: list[dict[str, Any]],
@@ -687,6 +778,10 @@ class AlignSession:
             result = self._retry_low_coverage_lines(
                 emissions, stride, lines, tokens, result, language,
                 duration, threshold, shift)
+        if merge_passes:
+            result = self._realign_overlaps(
+                emissions, stride, lines, tokens, result, language,
+                duration, threshold, shift)
         by_line_for_offset: dict[int, list[WordTiming]] = {}
         for word in result.words:
             by_line_for_offset.setdefault(word.line, []).append(word)
@@ -791,6 +886,26 @@ class AlignSession:
             merge_passes=merge_passes,
             retry_low_coverage=retry_low_coverage,
             start_pad=start_pad, end_pad=end_pad)
+
+
+_SHARED_SESSION: AlignSession | None = None
+
+
+def shared_session() -> AlignSession:
+    """Reuse one loaded aligner across a batch of songs."""
+    global _SHARED_SESSION
+    if _SHARED_SESSION is None:
+        _SHARED_SESSION = AlignSession()
+        _SHARED_SESSION.shared = True
+    return _SHARED_SESSION
+
+
+def close_shared_session() -> None:
+    global _SHARED_SESSION
+    if _SHARED_SESSION is not None:
+        _SHARED_SESSION.shared = False
+        _SHARED_SESSION.close()
+        _SHARED_SESSION = None
 
 
 def candidate_rank_key(candidate: dict[str, Any]) -> tuple:

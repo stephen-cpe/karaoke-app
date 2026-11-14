@@ -27,8 +27,10 @@
 - `requirements*.txt` — core, dev/test, media-helper, lyric-pipeline, and optional
   CUDA dependency groups.
 - `THIRD_PARTY_NOTICES.md` — dependency, asset, and license notes.
-- `static/scripts.js` — host-only audio engine and shared-session client.
-- `static/background.js` — host-only procedural WebGL star/nebula/galaxy background.
+- `static/scripts.js` - host-only audio engine and shared-session client.
+- `static/lyrics_display.js` - shared lyric presentation rules (word wipe vs
+  full-line sung style), also loaded by Node unit tests.
+- `static/background.js` - host-only procedural WebGL star/nebula/galaxy background.
 - `static/remote.js`, `static/remote.css`, `templates/remote.html` — controls-only
   phone remote. It must not create audio/video elements or play media.
 - `templates/index.html` — host player page, including the Lyrics Editor link and
@@ -50,8 +52,14 @@
   helper scripts.
 - `lyrics/` — generated active `.srt` files plus `.words.json` word-timing sidecars.
   `lyrics/drafts/` holds ignored editor drafts and is never served to the player.
-- `tools/generate_lyrics.py` — Demucs + Whisper + LRCLIB timing pipeline.
-- `tools/check_lyrics.py` — structural and vocal-energy validator.
+- `tools/generate_lyrics.py` - Demucs + LRCLIB/override/ASR lyric sourcing,
+  language routing, JA/KO romanization, forced alignment, word-sync selection,
+  QA, and publish.
+- `tools/lyrics/` - the lyric pipeline modules: aligner adapter, cue builder,
+  romanization, reference lookup, language detection, audio helpers, QA, and
+  publish safety.
+- `tools/check_lyrics.py` - structural and vocal-energy validator.
+- `tools/eval_lyrics.py` - metrics and shadow/active comparison.
 
 ## Shared player / phone remote
 
@@ -97,17 +105,22 @@
   node --check static\background.js
   node --check static\scripts.js
   node --check static\remote.js
+  node --check static\lyrics_display.js
   node --check static\lyric_reconcile.js
   node --check static\sync_editor.js
   node --check static\confirm-dialog.js
   node --check static\sw.js
-  node --test tests\js\reconcile.test.js
+  node --test tests\js
   ```
 
 - Browser/UI tests use Playwright and skip when no Chromium-based browser is
   available. Install one with `.\venv\Scripts\python -m playwright install chromium`
   if Edge or Chrome is not present.
-- Do not modify the lyric timing pipeline during app/UI work.
+- The lyric timing pipeline lives under `tools/lyrics/`. App/UI changes should
+  not alter its timing policy without a lyric-specific task. The flow is:
+  Demucs vocals -> user override / LRCLIB / ASR text -> language routing ->
+  JA/KO romanization -> forced alignment or ASR timing -> LRCLIB word-sync
+  comparison -> cue building -> hard script gate -> publish.
 
 ## Windows desktop packaging
 
@@ -134,7 +147,7 @@
     -r packaging\requirements-desktop.txt `
     -r packaging\requirements-build.txt pytest ruff
   .\.venv-build\Scripts\python -m pytest -m "not browser"
-  node --test tests\js\reconcile.test.js
+  node --test tests\js
   .\.venv-build\Scripts\python -m ruff check .
   .\packaging\build.ps1 -Version 0.0.2 `
     -Python .\.venv-build\Scripts\python.exe
@@ -173,8 +186,93 @@
 
 ## Adding lyrics for new songs
 
-The timing pipeline is already built and tuned. Do not modify or reimplement it
-as part of adding lyrics; the job is to run it and validate the output.
+The pipeline is maintained under `tools/lyrics/` and is meant to be run, not
+reimplemented per song. Here is what it does now:
+
+1. **Separate vocals.** Demucs caches the vocal stem by the original file hash.
+2. **Choose text.** A `lyrics/source/<stem>.lrc` or `.txt` override wins. Otherwise
+   LRCLIB is queried. If there is no usable reference, faster-whisper supplies the
+   text. A `lyrics/source/<stem>.json` can set `language` and display-spelling
+   `replacements` even when the lyrics still come from LRCLIB.
+3. **Route the language.** Script and Whisper LID choose `en`, `tl`, `ja`, or `ko`.
+4. **Time it.**
+   - English keeps ASR timing by default; `--align-english` opts into forced
+     alignment.
+   - Tagalog known lyrics are force-aligned.
+   - Japanese/Korean known lyrics are romanized first and force-aligned on the
+     display text. The pipeline uses LRCLIB line windows, line `<star>`
+     separation, a confidence threshold, and line-level fallback. Japanese uses
+     fugashi/unidic-lite readings plus rule-based long vowels, particles, sokuon,
+     `n'`, katakana-as-sung, Latin pass-through, and line-start capitalization.
+     Korean uses `hangul-romanize` academic output and is **provisional** pending
+     native-speaker feedback.
+   - When LRCLIB has word-level timings, the pipeline compares them with forced
+     alignment word by word against vocal onsets and keeps the source that agrees
+     better with the audio. The chosen tier is in
+     `pipeline.alignment.candidate.word_sync` and `timing_source`.
+   - No-reference songs use Whisper word timings; they can contain ASR text errors.
+5. **Build cues.** Long instrumental gaps become `[Instrumental]`; held notes keep
+   their line; overlapping lyric lines are split at the next line or re-aligned as
+   a pair, and a short cue is never left at 0.1-0.6 s when LRCLIB gives it more.
+   Lines that remain below the confidence target are line-level, not hidden. The
+   player shows a line-level cue fully in the sung style for its whole cue.
+6. **Gate and publish.** A hard script gate rejects any active Japanese/Korean
+   display text that still contains kana, kanji, or Hangul. The song is not
+   written; existing files are left alone. Provenance includes the chosen LRCLIB
+   record, alignment summary, timing agreement, script gate, romanization readings,
+   and applied replacements.
+
+### Flags
+
+```powershell
+python tools\generate_lyrics.py                    # all songs with an original
+python tools\generate_lyrics.py --missing          # only songs without an SRT
+python tools\generate_lyrics.py --song "Innocent"  # one song (title or stem)
+python tools\generate_lyrics.py --no-online        # local transcript only
+python tools\generate_lyrics.py --force            # ignore cached vocals/transcripts
+python tools\generate_lyrics.py --output-dir tools\.cache\shadow
+python tools\generate_lyrics.py --align-english    # force-align English too
+python tools\generate_lyrics.py --overwrite-edited # replace edited active files
+```
+
+`--missing` keeps its meaning: it only processes songs without an SRT and never
+overwrites existing files. A normal run replaces pipeline-generated files, but it
+refuses to replace a pair that was edited outside the pipeline unless
+`--overwrite-edited` is passed. Previous pairs are backed up under
+`tools/.cache/backups/`. In a batch, the aligner model is loaded once and reused.
+
+### Override file and replacements
+
+`lyrics/source/<stem>.json` is optional. It can set the language and can add
+case-sensitive display-spelling replacements:
+
+```json
+{
+  "language": "ko",
+  "replacements": {
+    "O-ppan gangnamseuta-il": "Oppan Gangnam style"
+  }
+}
+```
+
+Replacements are applied to the romanized text **before** alignment, and the
+tokens are rebuilt from the replaced text so the word timings belong to the words
+the singer sees. Applied entries are recorded under
+`pipeline.romanization_info.replacements`. Add both cases if the source uses
+them. The same folder accepts `<stem>.lrc` and `<stem>.txt` full overrides.
+
+### QA
+
+```powershell
+python tools\check_lyrics.py --energy
+python tools\check_lyrics.py --strict
+python tools\eval_lyrics.py --lyrics-dir lyrics --energy --json
+```
+
+The strict checker treats unexplained line-level cues as problems; every
+pipeline line-level cue carries a reason in `pipeline.line_level`. Energy findings
+are diagnostics, not failures. The per-song report is written under
+`tools/.cache/reports/<stem>.json` (or the shadow reports directory).
 
 ### 1. Preflight
 
@@ -221,6 +319,9 @@ edits are safe. To regenerate one specific song explicitly:
   files that are expected to have complete word timings.
 - The run ends with `done: N ok, 0 failed`.
 - The checker ends with `total structural problems: 0`.
+- For JA/KO, report `timing_source` (`forced-alignment` or `lrclib-word-sync`) and
+  `pipeline.alignment.candidate.word_sync` when LRCLIB word timing was evaluated. A song can
+  win the word-sync tier even when another candidate has a higher forced score.
 - No `duration mismatch` warning. If present, stop and report both durations;
   do not accept the SRT until the user confirms the pairing.
 
@@ -237,9 +338,11 @@ Do not paste full lyrics, SRT, or JSON.
 - Do not use `--force` unless the audio file changed.
 - Do not inspect audio, run Whisper manually, write exploratory scripts, or
   search the web unless one specific song fails or has no usable reference.
-- Do not modify `songs/`, `original_songs/`, or the timing pipeline during a
-  lyric run. Tooling changes require an explicit user request.
-- Do not create backups. Generated files replace the matching SRT/JSON directly.
+- Do not modify `songs/` or `original_songs/` during a lyric run. Pipeline
+  changes belong in a separate lyric-tooling task with tests.
+- The pipeline backs up replaced active pairs under `tools/.cache/backups/` and
+  refuses to replace edited files unless `--overwrite-edited` is passed. Do not
+  bypass that guard or delete backups during a run.
 - Do not run `pytest` or `node --check` unless app code changed.
 - Energy warnings are usually backing vocals, ad-libs, or separation bleed.
   Ignore them unless a lyric cue is silent or starts more than 1.2s late.
@@ -262,8 +365,11 @@ song for manual lyric review. Do not invent text or hand-retime it.
 ## Tooling notes
 
 - `tools/generate_lyrics.py` needs the lyric dependencies plus `ffmpeg`/`ffprobe`.
-  `tools/add_lyrics.ps1` uses `python` from PATH by default; pass `-Python`
-  (for example `.\venv\Scripts\python.exe`) to select an interpreter that has
+  English/Tagalog use `requirements-lyrics.txt`; Japanese/Korean forced alignment
+  also needs `requirements-lyrics-i18n.txt` and the pinned
+  `ctc-forced-aligner` install in that file's header. `tools/add_lyrics.ps1` uses
+  `python` from PATH by default; pass `-Python` (for example
+  `.\venv\Scripts\python.exe`) to select an interpreter that has
   Demucs/faster-whisper/torch installed.
 - Whisper tries CUDA `float16` first and falls back to CPU `int8` if CUDA setup or
   transcription fails. CUDA requires the optional CUDA 12 runtime packages listed

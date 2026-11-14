@@ -1,6 +1,8 @@
 """Cue-building tests for line-level fallback and inferred gap timing."""
 from __future__ import annotations
 
+import pytest
+
 from tools.generate_lyrics import _needs_full_asr, _reject_suspect_reference_offset
 from tools.lyrics import align, cues
 
@@ -109,6 +111,37 @@ def test_overlap_without_tail_trim_falls_back_to_line_level():
     trimmed = cues._trim_cue_overlaps([previous, current], 4.0)
     assert trimmed[1]["words"] == []
     assert trimmed[1]["line_level_reason"]
+
+
+def test_word_sync_blocks_become_display_words():
+    pytest.importorskip("fugashi")
+    pytest.importorskip("unidic_lite")
+    reference = {
+        "lines": [{
+            "start": 8.64,
+            "end": 12.8,
+            "text": "We are fighting dreamers takami o mezashite",
+            "word_sync_blocks": [
+                {"text": "We", "start": 8.64, "end": 9.07,
+                 "romanized": "We"},
+                {"text": "are", "start": 9.07, "end": 9.47,
+                 "romanized": "are"},
+                {"text": "fighting", "start": 9.47, "end": 10.38,
+                 "romanized": "fighting"},
+                {"text": "dreamers", "start": 10.38, "end": 11.18,
+                 "romanized": "dreamers"},
+                {"text": "高みを目指して", "start": 11.18, "end": 12.8,
+                 "romanized": "Takami o mezashite"},
+            ],
+        }],
+    }
+    alignments = cues.build_word_sync_lines(reference, 15.0, "ja")
+    words = alignments[0]["words"]
+    assert [word["text"] for word in words] == [
+        "We", "are", "fighting", "dreamers", "takami", "o", "mezashite"]
+    assert words[0]["start"] == 8.64
+    assert words[-1]["end"] == 12.8
+    assert all(word["aligned"] for word in words)
 
 
 def test_candidate_rank_prefers_the_better_final_build():

@@ -4,10 +4,11 @@ from __future__ import annotations
 import pytest
 
 from tools.generate_lyrics import (
+    _apply_text_replacements,
     _script_gate,
     _script_gate_blocks_publication,
 )
-from tools.lyrics import romanize
+from tools.lyrics import reference, romanize
 
 
 def _japanese_deps():
@@ -71,13 +72,32 @@ def test_korean_romanization_fixtures(source, expected):
 
 
 @pytest.mark.parametrize("source,expected", [
-    ("Tōkyō", "Tokyo"),
-    ("Tôkyô", "Tokyo"),
+    ("Tōkyō", "Toukyou"),
+    ("Tôkyô", "Toukyou"),
+    ("Ōsaka", "Ousaka"),
+    ("Kādo", "Kaado"),
     ("Nanka shiawase Chotto shiawase", "Nanka shiawase chotto shiawase"),
     ("  Koin hajiku you ni arukidasou  ", "Koin hajiku you ni arukidasou"),
 ])
 def test_pre_romanized_normalization(source, expected):
     assert romanize.normalize_pre_romanized(source) == expected
+
+
+def test_text_replacements_apply_before_alignment_tokens():
+    lines = [{"text": "O-ppan gangnamseuta-il (uh)", "words": [{"text": "old"}]}]
+    replaced, applied = _apply_text_replacements(
+        lines, {"O-ppan gangnamseuta-il": "Oppan Gangnam style"})
+    assert replaced[0]["text"] == "Oppan Gangnam style (uh)"
+    assert replaced[0]["words"] == []
+    assert applied == [{
+        "line": 1,
+        "from": "O-ppan gangnamseuta-il",
+        "to": "Oppan Gangnam style",
+        "count": 1,
+    }]
+    tokens = reference.flatten_tokens(replaced, "en")
+    assert [token["text"] for token in tokens] == [
+        "Oppan", "Gangnam", "style", "(uh)"]
 
 
 def test_script_gate_blocks_a_leaking_line():
