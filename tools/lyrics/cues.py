@@ -803,8 +803,15 @@ def _aligned_word_map(line_alignment: dict) -> dict[int, object]:
 
 
 def _interpolate_aligned(tokens: list[dict], word_map: dict[int, object],
-                         line_start: float, line_end: float):
-    """Return measured/inferred word timings, or None for a large gap."""
+                         line_start: float, line_end: float, *,
+                         allow_edges: bool = False):
+    """Return measured/inferred word timings, or None for a large gap.
+
+    Japanese and Korean known-lyrics lines are aligned per window. A window can
+    clip the first or last word even when the rest of the line is confident, so
+    those languages allow the edge tokens to be filled from the line bounds
+    (marked inferred). Interior gaps are distributed across the run.
+    """
     words: list[dict | None] = [None] * len(tokens)
     for index, word in word_map.items():
         if not 0 <= index < len(tokens):
@@ -831,22 +838,36 @@ def _interpolate_aligned(tokens: list[dict], word_map: dict[int, object],
             index += 1
         run_end = index
         run_length = run_end - run_start
-        if run_length != 1 or run_start == 0 or run_end == len(tokens):
-            return None
-        previous = words[run_start - 1]
-        following = words[run_end]
-        if previous is None or following is None:
-            return None
-        gap_start = previous["end"]
-        gap_end = following["start"]
+        if run_start == 0:
+            if not allow_edges:
+                return None
+            gap_start = line_start
+        else:
+            previous = words[run_start - 1]
+            if previous is None:
+                return None
+            gap_start = previous["end"]
+        if run_end == len(tokens):
+            if not allow_edges:
+                return None
+            gap_end = line_end
+        else:
+            following = words[run_end]
+            if following is None:
+                return None
+            gap_end = following["start"]
         if gap_end <= gap_start:
             return None
-        words[run_start] = {
-            "text": tokens[run_start]["text"],
-            "start": gap_start,
-            "end": gap_end,
-            "inferred": True,
-        }
+        slot = (gap_end - gap_start) / run_length
+        if slot < MIN_WORD_LENGTH - 1e-9:
+            return None
+        for offset in range(run_length):
+            words[run_start + offset] = {
+                "text": tokens[run_start + offset]["text"],
+                "start": gap_start + slot * offset,
+                "end": gap_start + slot * (offset + 1),
+                "inferred": True,
+            }
 
     result = []
     previous_end = line_start
@@ -936,13 +957,26 @@ def _cue_with_words(tokens: list[dict], words: list[dict], start: float,
     }
 
 
-def _trim_cue_overlaps(cues: list[dict], duration: float) -> list[dict]:
+def _trim_cue_overlaps(cues: list[dict], duration: float, *,
+                       allow_tail_trim: bool = False) -> list[dict]:
     """Trim the previous cue's linger instead of throwing away aligned words."""
     for index in range(len(cues) - 1):
         previous = cues[index]
         current = cues[index + 1]
         if current["start"] >= previous["end"] - 0.001:
             continue
+        if (allow_tail_trim and current.get("words")
+                and previous.get("words")):
+            last = previous["words"][-1]
+            new_end = float(current["start"]) - 0.02
+            if new_end >= float(last["start"]) + MIN_WORD_LENGTH:
+                last["end"] = round(new_end, 3)
+                previous["end"] = round(min(
+                    float(previous["end"]),
+                    max(float(previous["start"]) + MIN_WORD_LENGTH,
+                        new_end)), 3)
+                if previous["end"] <= current["start"]:
+                    continue
         last_word_end = max(
             (float(word.get("end", previous["start"]))
              for word in previous.get("words") or []),
@@ -972,11 +1006,37 @@ def _trim_cue_overlaps(cues: list[dict], duration: float) -> list[dict]:
     return cues
 
 
+def _line_alignment_offset(lines: list[dict],
+                           line_alignments: list[dict]) -> float:
+    offsets = []
+    for index, line in enumerate(lines):
+        if line.get("start") is None or index >= len(line_alignments):
+            continue
+        words = [word for word in line_alignments[index].get("words") or []
+                 if _word_value(word, "aligned", False)]
+        if words:
+            offsets.append(min(float(_word_value(word, "start", 0.0))
+                               for word in words)
+                           - float(line["start"]))
+    if not offsets:
+        return 0.0
+    offsets.sort()
+    return offsets[len(offsets) // 2]
+
+
 def build_aligned_lines(reference: dict, line_alignments: list[dict],
                         duration: float, audio=None,
-                        language: str = "en") -> list[dict]:
+                        language: str = "en", *,
+                        allow_edge_inference: bool | None = None
+                        ) -> list[dict]:
     """Build cues from forced-alignment word timings, with line-level fallback."""
     lines = reference.get("lines") or []
+    if allow_edge_inference is None:
+        allow_edges = language in ("ja", "ko")
+    else:
+        allow_edges = bool(allow_edge_inference)
+    reference_offset = (_line_alignment_offset(lines, line_alignments)
+                        if allow_edges else 0.0)
     built = []
     previous_end = 0.0
     for line_index, line in enumerate(lines):
@@ -1007,12 +1067,51 @@ def build_aligned_lines(reference: dict, line_alignments: list[dict],
                  if _word_value(word, "aligned", False)),
                 default=candidate_start + 0.3)
             candidate_end = min(duration, candidate_end + PHRASE_LINGER)
-            words = _interpolate_aligned(tokens, word_map, candidate_start,
-                                          candidate_end)
+            line_start = candidate_start
+            line_end = candidate_end
+            aligned_indices = [
+                index for index, word in word_map.items()
+                if 0 <= index < len(tokens)
+                and _word_value(word, "aligned", False)]
+            need_leading = bool(aligned_indices) and min(aligned_indices) > 0
+            need_trailing = (bool(aligned_indices)
+                             and max(aligned_indices) < len(tokens) - 1)
+            if allow_edges and (need_leading or need_trailing):
+                if need_leading and line.get("start") is not None:
+                    line_start = min(
+                        line_start,
+                        float(line["start"]) + reference_offset)
+                    line_start = max(
+                        line_start, float(previous_end) + 0.01)
+                if need_trailing:
+                    reference_end = (next_start if next_start is not None
+                                     else line.get("end"))
+                    if reference_end is not None:
+                        line_end = max(
+                            line_end,
+                            float(reference_end) + reference_offset - 0.05)
+                    last_aligned_end = max(
+                        (float(_word_value(word, "end", candidate_start))
+                         for word in word_map.values()
+                         if _word_value(word, "aligned", False)),
+                        default=candidate_start)
+                    if next_start is not None:
+                        line_end = min(
+                            line_end,
+                            max(last_aligned_end + MIN_WORD_LENGTH,
+                                next_start + reference_offset - 0.05))
+                line_end = min(duration, max(line_end, line_start + 0.3))
+            words = _interpolate_aligned(
+                tokens, word_map, line_start, line_end,
+                allow_edges=allow_edges)
             if words:
                 _trim_leading_alignment_gap(words, line.get("start"), audio)
                 start = words[0]["start"]
-                end = max(words[-1]["end"], candidate_end)
+                if allow_edges:
+                    end = max(words[-1]["end"],
+                              min(candidate_end, line_end))
+                else:
+                    end = max(words[-1]["end"], candidate_end)
                 if audio is not None:
                     phrase_end = vocal_phrase_end(audio, start, end)
                     if phrase_end is not None:
@@ -1044,7 +1143,8 @@ def build_aligned_lines(reference: dict, line_alignments: list[dict],
             "line_level_reason": reason,
         })
         previous_end = end
-    return _trim_cue_overlaps(built, duration)
+    return _trim_cue_overlaps(
+        built, duration, allow_tail_trim=allow_edges)
 
 
 def build_aligned_asr_lines(asr_lines: list[dict], line_alignments: list[dict],

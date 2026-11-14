@@ -2,14 +2,15 @@
 from __future__ import annotations
 
 from tools.generate_lyrics import _needs_full_asr, _reject_suspect_reference_offset
-from tools.lyrics import cues
+from tools.lyrics import align, cues
 
 
 def test_needs_full_asr_language_paths():
     assert _needs_full_asr("tl", True, False)[0] is False
     assert _needs_full_asr("en", True, False)[0] is True
     assert _needs_full_asr("en", True, True)[0] is False
-    assert _needs_full_asr("ja", True, False)[0] is True
+    assert _needs_full_asr("ja", True, False)[0] is False
+    assert _needs_full_asr("ko", True, False)[0] is False
     assert _needs_full_asr("en", False, False)[0] is True
 
 
@@ -77,6 +78,54 @@ def test_distribute_words_is_always_marked_inferred():
     words = cues.distribute_words(
         [{"text": "a", "norm": "a"}, {"text": "bb", "norm": "bb"}], 0.0, 2.0)
     assert all(word["inferred"] is True for word in words)
+
+
+def test_tail_trim_keeps_the_next_line_words():
+    previous = {
+        "start": 0.0, "end": 2.5, "text": "one two",
+        "words": [{"text": "one", "start": 0.0, "end": 0.8},
+                  {"text": "two", "start": 0.8, "end": 2.0}],
+    }
+    current = {
+        "start": 1.8, "end": 3.0, "text": "three",
+        "words": [{"text": "three", "start": 1.8, "end": 2.8}],
+    }
+    trimmed = cues._trim_cue_overlaps(
+        [previous, current], 4.0, allow_tail_trim=True)
+    assert trimmed[0]["words"][-1]["end"] == 1.78
+    assert trimmed[1]["words"]
+
+
+def test_overlap_without_tail_trim_falls_back_to_line_level():
+    previous = {
+        "start": 0.0, "end": 2.5, "text": "one two",
+        "words": [{"text": "one", "start": 0.0, "end": 0.8},
+                  {"text": "two", "start": 0.8, "end": 2.0}],
+    }
+    current = {
+        "start": 1.8, "end": 3.0, "text": "three",
+        "words": [{"text": "three", "start": 1.8, "end": 2.8}],
+    }
+    trimmed = cues._trim_cue_overlaps([previous, current], 4.0)
+    assert trimmed[1]["words"] == []
+    assert trimmed[1]["line_level_reason"]
+
+
+def test_candidate_rank_prefers_the_better_final_build():
+    better = {
+        "duration_error": 1.0,
+        "alignment": {"mean_score": -0.5},
+        "record": {},
+        "build_quality": {"coverage": 0.90, "line_level_rate": 0.10},
+    }
+    more_line_level = {
+        "duration_error": 0.1,
+        "alignment": {"mean_score": -0.2},
+        "record": {},
+        "build_quality": {"coverage": 0.95, "line_level_rate": 0.30},
+    }
+    assert align.candidate_rank_key(better) > align.candidate_rank_key(
+        more_line_level)
 
 
 def test_trim_leading_alignment_gap_only_moves_silent_leading_words(monkeypatch):

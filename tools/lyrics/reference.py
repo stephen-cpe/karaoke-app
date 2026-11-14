@@ -654,16 +654,21 @@ def _edit_distance(left: str, right: str) -> int:
 
 
 def artist_name_close(query: str, matched: str, max_edits: int = 2) -> bool:
-    """True when two artist names are within a small typo distance."""
+    """True when two artist names are within a small typo distance.
+
+    Short names get a tighter budget: PSY vs SIA is two edits but obviously a
+    different artist. Names of six or more characters keep the caller's limit.
+    """
     left = _normalize_artist(query)
     right = _normalize_artist(matched)
     if not left or not right:
         return False
     if left == right:
         return True
-    if abs(len(left) - len(right)) > max_edits:
+    limit = 1 if min(len(left), len(right)) < 6 else max_edits
+    if abs(len(left) - len(right)) > limit:
         return False
-    return _edit_distance(left, right) <= max_edits
+    return _edit_distance(left, right) <= limit
 
 
 def fuzzy_artist_candidates(records: list[dict[str, Any]], artist: str,

@@ -27,6 +27,8 @@ WINDOW_GAP_SECONDS = 2.5
 WINDOW_MAX_SECONDS = 30.0
 WINDOW_PAD_SECONDS = 1.5
 WINDOW_MIN_SECONDS = 1.0
+LINE_WINDOW_START_PAD = 0.4
+LINE_WINDOW_END_PAD = 0.7
 
 
 @dataclass
@@ -170,7 +172,9 @@ def build_line_windows(lines: list[dict[str, Any]], duration: float,
 
 
 def build_per_line_windows(lines: list[dict[str, Any]], duration: float,
-                           audio=None) -> list[tuple[float, float, list[int]]]:
+                           audio=None, *, start_pad: float = WINDOW_PAD_SECONDS,
+                           end_pad: float = WINDOW_PAD_SECONDS
+                           ) -> list[tuple[float, float, list[int]]]:
     """One soft window per timed line, for ASR segment-based alignment."""
     windows = []
     for index, line in enumerate(lines):
@@ -182,9 +186,9 @@ def build_per_line_windows(lines: list[dict[str, Any]], duration: float,
         if end is None:
             end = start + 4.0
         end = float(end)
-        window_start = max(0.0, start - WINDOW_PAD_SECONDS)
+        window_start = max(0.0, start - float(start_pad))
         window_end = min(duration, max(end, start + WINDOW_MIN_SECONDS)
-                         + WINDOW_PAD_SECONDS)
+                         + float(end_pad))
         if window_end <= window_start:
             window_end = min(duration, window_start + WINDOW_MIN_SECONDS)
         windows.append((window_start, window_end, [index]))
@@ -210,6 +214,72 @@ def _quantile(values: list[float], fraction: float) -> float | None:
     ordered = sorted(values)
     return ordered[min(len(ordered) - 1,
                        int(round(fraction * (len(ordered) - 1))))]
+
+
+def _line_reference_bounds(lines: list[dict[str, Any]], index: int,
+                           duration: float) -> tuple[float, float]:
+    if not 0 <= index < len(lines):
+        return 0.0, duration
+    line = lines[index]
+    start = float(line.get("start") or 0.0)
+    end = line.get("end")
+    if end is None:
+        end = None
+        for later in lines[index + 1:]:
+            if later.get("start") is not None:
+                end = float(later["start"])
+                break
+        end = float(end) if end is not None else start + 4.0
+    return start, float(end)
+
+
+def _merge_alignment_words(primary: AlignmentResult,
+                           secondary: AlignmentResult,
+                           lines: list[dict[str, Any]], duration: float,
+                           threshold: float) -> AlignmentResult:
+    """Merge a tight per-line pass with a whole-song pass.
+
+    The tight pass is constrained to the LRCLIB line window and is reliable
+    near the reference timestamps. The whole-song pass recovers words the
+    window cut off, but can attach a repeated line to another occurrence, so
+    only accept secondary timings close to the line's reference bounds.
+    """
+    merged: list[WordTiming] = []
+    previous_end: dict[int, float] = {}
+    for tight, wide in zip(primary.words, secondary.words):
+        line_start, line_end = _line_reference_bounds(
+            lines, tight.line, duration)
+        margin = 1.5
+        in_bounds = (line_start - margin <= wide.start
+                     and wide.end <= line_end + margin)
+        chosen = tight
+        if (wide.aligned and in_bounds
+                and wide.score >= threshold
+                and (not tight.aligned
+                     or wide.score > tight.score + 0.05)):
+            chosen = wide
+        last_end = previous_end.get(tight.line)
+        if chosen.aligned and last_end is not None \
+                and chosen.start < last_end - 0.05:
+            chosen = tight if tight.aligned and tight.start >= last_end - 0.05 \
+                else wide if wide.aligned and wide.start >= last_end - 0.05 \
+                else tight
+        merged.append(chosen)
+        if chosen.aligned:
+            previous_end[tight.line] = chosen.end
+
+    aligned = sum(1 for word in merged if word.aligned)
+    score_values = [word.score for word in merged if word.score > -900]
+    return AlignmentResult(
+        words=merged,
+        total_words=primary.total_words,
+        aligned_words=aligned,
+        coverage=aligned / primary.total_words if primary.total_words else 0.0,
+        mean_score=(sum(score_values) / len(score_values)
+                    if score_values else -999.0),
+        low_score_words=sum(1 for word in merged if word.score < threshold),
+        seconds=primary.seconds + secondary.seconds,
+    )
 
 
 class AlignSession:
@@ -329,12 +399,15 @@ class AlignSession:
                      offset: float = 0.0, *,
                      windows: list[tuple[float, float, list[int]]] | None = None,
                      star_frequency: str | None = None,
-                     min_word_score: float | None = None) -> AlignmentResult:
+                     min_word_score: float | None = None,
+                     time_shift: float | None = None) -> AlignmentResult:
         self.load()
         from ctc_forced_aligner import get_alignments, get_spans, postprocess_results
         started = time.perf_counter()
         threshold = (MIN_WORD_SCORE if min_word_score is None
                      else float(min_word_score))
+        shift = (ALIGNMENT_TIME_SHIFT if time_shift is None
+                 else float(time_shift))
         words = [
             WordTiming(
                 index=index,
@@ -374,11 +447,11 @@ class AlignSession:
                 word = words[token_indices[local_index]]
                 word.start = round(max(
                     0.0, window_offset + float(result.get("start", 0.0))
-                    + ALIGNMENT_TIME_SHIFT), 3)
+                    + shift), 3)
                 word.end = round(max(
                     word.start + MIN_WORD_SECONDS,
                     window_offset + float(result.get("end", 0.0))
-                    + ALIGNMENT_TIME_SHIFT), 3)
+                    + shift), 3)
                 word.score = round(float(result.get("score", -999.0)), 4)
                 word.aligned = (
                     word.end > word.start + MIN_WORD_SECONDS
@@ -502,6 +575,67 @@ class AlignSession:
             snapped.append(index)
         return snapped
 
+    def _retry_low_coverage_lines(self, emissions, stride: float,
+                                  lines: list[dict[str, Any]],
+                                  tokens: list[dict[str, Any]],
+                                  result: AlignmentResult, language: str,
+                                  duration: float, threshold: float,
+                                  shift: float) -> AlignmentResult:
+        """Re-align only the lines that are still below the coverage target.
+
+        A wider per-line window gives the CTC model more context than the
+        tight LRCLIB window, without the whole-song pass's repeated-chorus
+        ambiguity.
+        """
+        by_line: dict[int, list[WordTiming]] = {}
+        for word in result.words:
+            by_line.setdefault(word.line, []).append(word)
+        retry_seconds = 0.0
+        for index, line in enumerate(lines):
+            if line.get("start") is None:
+                continue
+            line_words = by_line.get(index, [])
+            total = len(line_words)
+            aligned = sum(1 for word in line_words if word.aligned)
+            coverage = aligned / total if total else 0.0
+            if total == 0 or coverage >= LINE_COVERAGE_TARGET:
+                continue
+            start, end = _line_reference_bounds(lines, index, duration)
+            window = (max(0.0, start - 2.0),
+                      min(duration, max(end + 1.5, start + 1.0)), [index])
+            subset = [token for token in tokens
+                      if int(token.get("line", 0)) == index]
+            if not subset:
+                continue
+            retry = self.align_tokens(
+                emissions, stride, subset, language, windows=[window],
+                star_frequency="edges", min_word_score=threshold,
+                time_shift=shift)
+            retry_seconds += retry.seconds
+            local = {word.token: word for word in retry.words if word.aligned}
+            for position, current in enumerate(result.words):
+                if current.line != index:
+                    continue
+                candidate = local.get(current.token)
+                if (candidate is not None
+                        and start - 1.5 <= candidate.start
+                        and candidate.end <= end + 1.5
+                        and (not current.aligned
+                             or candidate.score > current.score + 0.05)):
+                    result.words[position] = candidate
+
+        aligned_words = sum(1 for word in result.words if word.aligned)
+        scores = [word.score for word in result.words if word.score > -900]
+        result.aligned_words = aligned_words
+        result.coverage = (aligned_words / result.total_words
+                           if result.total_words else 0.0)
+        result.mean_score = (sum(scores) / len(scores)
+                             if scores else -999.0)
+        result.low_score_words = sum(
+            1 for word in result.words if word.score < threshold)
+        result.seconds += retry_seconds
+        return result
+
     def align_candidate(self, emissions, stride: float,
                         lines: list[dict[str, Any]],
                         tokens: list[dict[str, Any]],
@@ -511,24 +645,48 @@ class AlignSession:
                         star_frequency: str | None = None,
                         min_word_score: float | None = None,
                         audio_data=None,
-                        snap_repeated: bool = False
+                        snap_repeated: bool = False,
+                        time_shift: float | None = None,
+                        merge_passes: bool = False,
+                        retry_low_coverage: bool = False,
+                        start_pad: float | None = None,
+                        end_pad: float | None = None
                         ) -> CandidateAlignment:
         threshold = (MIN_WORD_SCORE if min_word_score is None
                      else float(min_word_score))
+        shift = (ALIGNMENT_TIME_SHIFT if time_shift is None
+                 else float(time_shift))
         if duration <= 0:
             duration = max(
                 (float(line.get("end") or line.get("start") or 0.0)
                  for line in lines), default=0.0) + 5.0
         if windowed:
             if window_mode == "line":
-                windows = build_per_line_windows(lines, duration, audio_data)
+                windows = build_per_line_windows(
+                    lines, duration, audio_data,
+                    start_pad=(LINE_WINDOW_START_PAD if start_pad is None
+                               else float(start_pad)),
+                    end_pad=(LINE_WINDOW_END_PAD if end_pad is None
+                             else float(end_pad)))
             else:
                 windows = build_line_windows(lines, duration, audio_data)
         else:
             windows = None
         result = self.align_tokens(
             emissions, stride, tokens, language, windows=windows,
-            star_frequency=star_frequency, min_word_score=threshold)
+            star_frequency=star_frequency, min_word_score=threshold,
+            time_shift=shift)
+        if merge_passes:
+            wide = self.align_tokens(
+                emissions, stride, tokens, language, windows=None,
+                star_frequency="edges", min_word_score=threshold,
+                time_shift=shift)
+            result = _merge_alignment_words(
+                result, wide, lines, duration, threshold)
+        if retry_low_coverage:
+            result = self._retry_low_coverage_lines(
+                emissions, stride, lines, tokens, result, language,
+                duration, threshold, shift)
         by_line_for_offset: dict[int, list[WordTiming]] = {}
         for word in result.words:
             by_line_for_offset.setdefault(word.line, []).append(word)
@@ -601,7 +759,7 @@ class AlignSession:
                           if score_values else None),
             "score_median": (round(_quantile(score_values, 0.50), 4)
                              if score_values else None),
-            "time_shift": ALIGNMENT_TIME_SHIFT,
+            "time_shift": shift,
             "reference_offset": round(reference_offset, 4),
             "low_confidence_lines": low_confidence_lines,
             "snapped_repeated_lines": snapped_lines,
@@ -616,7 +774,12 @@ class AlignSession:
                               window_mode: str = "group",
                               star_frequency: str | None = None,
                               min_word_score: float | None = None,
-                              snap_repeated: bool = False
+                              snap_repeated: bool = False,
+                              time_shift: float | None = None,
+                              merge_passes: bool = False,
+                              retry_low_coverage: bool = False,
+                              start_pad: float | None = None,
+                              end_pad: float | None = None
                               ) -> CandidateAlignment:
         emissions, stride = self.prepare_emissions(audio_np)
         return self.align_candidate(
@@ -624,17 +787,30 @@ class AlignSession:
             windowed=windowed, window_mode=window_mode,
             star_frequency=star_frequency,
             min_word_score=min_word_score, audio_data=audio_np,
-            snap_repeated=snap_repeated)
+            snap_repeated=snap_repeated, time_shift=time_shift,
+            merge_passes=merge_passes,
+            retry_low_coverage=retry_low_coverage,
+            start_pad=start_pad, end_pad=end_pad)
 
 
 def candidate_rank_key(candidate: dict[str, Any]) -> tuple:
     alignment = candidate.get("alignment") or {}
     record = candidate.get("record") or {}
+    build = candidate.get("build_quality") or {}
+    duration_error = float(candidate.get("duration_error") or 0.0)
+    if build:
+        return (
+            float(build.get("coverage") or 0.0)
+            - float(build.get("line_level_rate") or 0.0),
+            -duration_error,
+            float(alignment.get("mean_score") or -999.0),
+            1 if record.get("hasWordSync") else 0,
+        )
     return (
         float(alignment.get("line_coverage") or 0.0),
         float(alignment.get("word_coverage") or 0.0),
+        -duration_error,
         float(alignment.get("mean_score") or -999.0),
-        -float(candidate.get("duration_error") or 0.0),
         1 if record.get("hasWordSync") else 0,
     )
 

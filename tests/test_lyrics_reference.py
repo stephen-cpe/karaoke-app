@@ -202,6 +202,12 @@ def test_artist_name_close_accepts_spong_cola_typo():
     assert not reference.artist_name_close("Spong Cola", "Wolf Hotel")
 
 
+def test_artist_name_close_short_name_allows_one_edit_only():
+    assert reference.artist_name_close("PSY", "PSI")
+    assert not reference.artist_name_close("PSY", "Sia")
+    assert reference.artist_name_close("MOMOLAND", "MOMOLAN")
+
+
 def test_fuzzy_artist_candidates_requires_close_artist_and_duration():
     records = [
         {"id": 1, "artistName": "Sponge Cola", "duration": 216.0},

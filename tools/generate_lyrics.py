@@ -36,6 +36,7 @@ from tools.lyrics import (  # noqa: E402
     publish,
     qa,
     reference,
+    romanize,
     textnorm,
 )
 
@@ -50,6 +51,15 @@ SOURCE_DIR = LYRICS_DIR / "source"
 AUDIO_EXTENSIONS = (".mp3", ".wav")
 DURATION_MISMATCH_WARN = 1.0
 MAX_REFERENCE_OFFSET = 5.0
+ALIGNMENT_TIME_SHIFTS = {
+    "tl": -0.20,
+    "ja": -0.20,
+    "ko": -0.20,
+}
+
+
+def _alignment_time_shift(language: str) -> float:
+    return ALIGNMENT_TIME_SHIFTS.get(language, align.ALIGNMENT_TIME_SHIFT)
 
 # Compatibility exports for tests and older helper scripts.
 atomic_write_text = cache.atomic_write_text
@@ -213,6 +223,7 @@ def _candidate_summary(item: dict[str, Any]) -> dict[str, Any]:
         "penalty": round(float(item.get("penalty", 0.0)), 3),
         "word_sync": bool(item.get("word_sync")),
         "alignment": item.get("alignment"),
+        "build_quality": item.get("build_quality"),
     }
 
 
@@ -254,10 +265,76 @@ def _needs_full_asr(language: str, has_reference: bool,
             return False, "English forced-alignment path requested"
         return True, "English compatibility path keeps ASR timing"
     if language in ("ja", "ko"):
-        return True, "JA/KO forced alignment needs romanization (Phase 3)"
+        return False, "known JA/KO text is romanized and force-aligned"
     if language == "tl":
         return False, "known Tagalog text is force-aligned"
     return True, "no forced-alignment path for this language"
+
+
+def _romanize_candidate(item: dict[str, Any], language: str) -> None:
+    """Replace native-script reference text with the display romanization."""
+    lines = item.get("lines") or []
+    texts = [str(line.get("text") or "") for line in lines]
+    pre_romanized = (
+        language == "ja"
+        and not any(textnorm.has_japanese(text) for text in texts))
+    romanized_lines, readings = romanize.romanize_lines(
+        lines, language, pre_romanized=pre_romanized)
+    item["lines"] = romanized_lines
+    item["tokens"] = reference.flatten_tokens(romanized_lines, "en")
+    item["romanized_readings"] = readings
+    item["romanization"] = {
+        "language": language,
+        "pre_romanized": pre_romanized,
+        "method": ("pre-romanized"
+                   if pre_romanized else
+                   "korean-academic" if language == "ko"
+                   else "japanese-fugashi"),
+    }
+
+
+def _romanize_asr_lines(lines: list[dict[str, Any]], language: str
+                        ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    romanized_lines, readings = romanize.romanize_lines(lines, language)
+    for line in romanized_lines:
+        words = []
+        for word in line.get("words") or []:
+            result = romanize.romanize_line(
+                str(word.get("text") or ""), language)
+            words.append({**word, "text": result.text})
+        line["words"] = words
+    return romanized_lines, readings
+
+
+def _script_gate_blocks_publication(language: str,
+                                    gate: dict[str, Any]) -> bool:
+    """A JA/KO song is not written when display text still leaks script."""
+    return language in ("ja", "ko") and not bool(gate.get("passed"))
+
+
+def _script_gate(cues: list[dict[str, Any]], language: str) -> dict[str, Any]:
+    """Hard gate: display text and word text must contain no native script."""
+    leaks = []
+    for index, cue in enumerate(cues, 1):
+        if cue.get("instrumental"):
+            continue
+        text = str(cue.get("text") or "")
+        word_text = " ".join(
+            str(word.get("text") or "") for word in cue.get("words") or [])
+        combined = f"{text} {word_text}"
+        if language == "ja":
+            leak = textnorm.has_kana(combined) or textnorm.has_kanji(combined)
+        elif language == "ko":
+            leak = textnorm.has_hangul(combined)
+        else:
+            leak = False
+        if leak:
+            leaks.append({
+                "line": index,
+                "text": text,
+                "words": word_text,
+            })
+    return {"passed": not leaks, "language": language, "leaks": leaks}
 
 
 def _prepare_alignment_candidates(records: list[dict[str, Any]], language: str,
@@ -299,25 +376,72 @@ def _prepare_alignment_candidates(records: list[dict[str, Any]], language: str,
                     local=None)
                 if rescored["duration_error"] <= reference.LRCLIB_DURATION_TOLERANCE:
                     item = rescored
+        if language in ("ja", "ko"):
+            _romanize_candidate(item, language)
         full.append(item)
     return full
 
 
+def _alignment_choice_key(summary: dict[str, Any]) -> tuple:
+    """Prefer the pass that leaves the most lines above the word threshold."""
+    return (
+        float(summary.get("line_coverage") or 0.0),
+        float(summary.get("word_coverage") or 0.0),
+        float(summary.get("mean_score") or -999.0),
+    )
+
+
 def _align_candidates(candidates: list[dict[str, Any]], language: str,
-                      audio_data, session: align.AlignSession
+                      audio_data, session: align.AlignSession,
+                      duration: float
                       ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     emissions, stride = session.prepare_emissions(audio_data)
     emissions_seconds = session.seconds
     total_align_seconds = 0.0
     for item in candidates:
+        known_jako = language in ("ja", "ko")
+        duration_error = float(item.get("duration_error") or 0.0)
+        windowed = duration_error > 1.5
         result = session.align_candidate(
             emissions, stride, item["lines"], item["tokens"], language,
-            windowed=float(item.get("duration_error") or 0.0) > 1.5,
+            windowed=windowed,
             window_mode="line",
-            star_frequency=("edges"
-                            if float(item.get("duration_error") or 0.0) > 1.5
-                            else "line"),
-            audio_data=audio_data, snap_repeated=True)
+            star_frequency="edges" if windowed else "line",
+            audio_data=audio_data, snap_repeated=True,
+            time_shift=_alignment_time_shift(language))
+        if known_jako:
+            base_key = _alignment_choice_key(result.summary)
+            if base_key[0] < 0.98 or base_key[1] < 0.98:
+                refined = session.align_candidate(
+                    emissions, stride, item["lines"], item["tokens"], language,
+                    windowed=True, window_mode="line", star_frequency="edges",
+                    audio_data=audio_data, snap_repeated=True,
+                    merge_passes=True, retry_low_coverage=True,
+                    start_pad=align.LINE_WINDOW_START_PAD,
+                    end_pad=align.LINE_WINDOW_END_PAD,
+                    time_shift=_alignment_time_shift(language))
+                if (_alignment_choice_key(refined.summary)
+                        > base_key):
+                    result = refined
+        allow_edges = (known_jako
+                       and bool((result.summary or {}).get("windowed")))
+        built = cues.build_aligned_lines(
+            item, result.lines, duration, audio_data, language,
+            allow_edge_inference=allow_edges)
+        lyric_lines = sum(1 for cue in built if not cue.get("instrumental"))
+        line_level = sum(1 for cue in built
+                         if not cue.get("instrumental")
+                         and not cue.get("words"))
+        built_words = sum(len(cue.get("words") or []) for cue in built)
+        item["build_quality"] = {
+            "lyric_lines": lyric_lines,
+            "line_level_lines": line_level,
+            "line_level_rate": round(
+                line_level / lyric_lines if lyric_lines else 0.0, 4),
+            "coverage": round(
+                built_words / len(item["tokens"]) if item["tokens"] else 0.0,
+                4),
+        }
         item["alignment"] = result.summary
         item["line_alignment"] = result.lines
         total_align_seconds += float(result.summary.get("seconds") or 0.0)
@@ -665,6 +789,7 @@ def process_song(stem: str, original: Path, karaoke: Path, cache_dir: Path,
         line_alignments: list[dict[str, Any]] = []
         aligner_info: dict[str, Any] = {}
         asr_lines: list[dict[str, Any]] | None = None
+        romanization_info: dict[str, Any] | None = None
 
         if override and override.get("lines"):
             if full_asr_needed:
@@ -686,10 +811,21 @@ def process_song(stem: str, original: Path, karaoke: Path, cache_dir: Path,
                 align_session = align.AlignSession()
                 try:
                     started = time.perf_counter()
+                    known_jako = language in ("ja", "ko")
                     result = align_session.align_audio_candidate(
                         audio_data, reference_dict["lines"],
                         reference_dict["tokens"], language, duration,
-                        snap_repeated=True)
+                        windowed=known_jako,
+                        window_mode="line",
+                        star_frequency="edges" if known_jako else None,
+                        snap_repeated=True,
+                        merge_passes=known_jako,
+                        retry_low_coverage=known_jako,
+                        start_pad=(align.LINE_WINDOW_START_PAD
+                                   if known_jako else None),
+                        end_pad=(align.LINE_WINDOW_END_PAD
+                                 if known_jako else None),
+                        time_shift=_alignment_time_shift(language))
                     alignment_info = result.summary
                     line_alignments = result.lines
                     aligner_info = {
@@ -702,7 +838,10 @@ def process_song(stem: str, original: Path, karaoke: Path, cache_dir: Path,
                     report["stages"]["alignment"] = aligner_info
                     built = cues.build_aligned_lines(
                         reference_dict, line_alignments, duration,
-                        audio_data, language)
+                        audio_data, language,
+                        allow_edge_inference=(
+                            language in ("ja", "ko")
+                            and bool((alignment_info or {}).get("windowed"))))
                     text_source = "user"
                     timing_source = "forced-alignment"
                 finally:
@@ -718,7 +857,8 @@ def process_song(stem: str, original: Path, karaoke: Path, cache_dir: Path,
                 try:
                     started = time.perf_counter()
                     candidates, aligner_info = _align_candidates(
-                        candidate_items, language, audio_data, align_session)
+                        candidate_items, language, audio_data, align_session,
+                        duration)
                     chosen = candidates[0]
                     alignment_info = chosen.get("alignment")
                     line_alignments = chosen.get("line_alignment") or []
@@ -729,7 +869,10 @@ def process_song(stem: str, original: Path, karaoke: Path, cache_dir: Path,
                     report["stages"]["alignment"] = aligner_info
                     built = cues.build_aligned_lines(
                         reference_dict, line_alignments, duration,
-                        audio_data, language)
+                        audio_data, language,
+                        allow_edge_inference=(
+                            language in ("ja", "ko")
+                            and bool((alignment_info or {}).get("windowed"))))
                     text_source = reference_dict.get(
                         "text_source", "lrclib-plain")
                     timing_source = "forced-alignment"
@@ -777,14 +920,25 @@ def process_song(stem: str, original: Path, karaoke: Path, cache_dir: Path,
             asr_lines = cues.build_from_transcript(transcript, duration, language)
             if not asr_lines:
                 raise RuntimeError("ASR produced no lyric lines")
-            tokens = cues.flat_lrc_tokens(asr_lines, language)
+            asr_readings: list[dict[str, Any]] = []
+            if language in ("ja", "ko"):
+                asr_lines, asr_readings = _romanize_asr_lines(
+                    asr_lines, language)
+                romanization_info = {
+                    "language": language,
+                    "method": ("korean-academic" if language == "ko"
+                               else "japanese-fugashi"),
+                    "readings": asr_readings,
+                }
+            tokens = cues.flat_lrc_tokens(asr_lines, "en")
             align_session = align.AlignSession()
             try:
                 started = time.perf_counter()
                 result = align_session.align_audio_candidate(
                     audio_data, asr_lines, tokens, language, duration,
                     windowed=True, window_mode="line", star_frequency="edges",
-                    min_word_score=align.MIN_WORD_SCORE)
+                    min_word_score=align.MIN_WORD_SCORE,
+                    time_shift=_alignment_time_shift(language))
                 cleaned_lines, cleanup_dropped = _clean_asr_lines(
                     asr_lines, result.lines, audio_data, duration, language,
                     align.MIN_WORD_SCORE)
@@ -796,12 +950,14 @@ def process_song(stem: str, original: Path, karaoke: Path, cache_dir: Path,
                              len(cleanup_dropped))
                 if cleaned_lines:
                     asr_lines = cleaned_lines
-                    tokens = cues.flat_lrc_tokens(asr_lines, language)
+                    tokens = cues.flat_lrc_tokens(
+                        asr_lines, "en" if language in ("ja", "ko") else language)
                     result = align_session.align_audio_candidate(
                         audio_data, asr_lines, tokens, language, duration,
                         windowed=True, window_mode="line",
                         star_frequency="edges",
-                        min_word_score=align.MIN_WORD_SCORE)
+                        min_word_score=align.MIN_WORD_SCORE,
+                        time_shift=_alignment_time_shift(language))
                 alignment_info = result.summary
                 line_alignments = result.lines
                 aligner_info = {
@@ -818,6 +974,13 @@ def process_song(stem: str, original: Path, karaoke: Path, cache_dir: Path,
                 timing_source = "forced-alignment"
             finally:
                 align_session.close()
+
+        if romanization_info is None and reference_dict:
+            if reference_dict.get("romanization"):
+                romanization_info = {
+                    **reference_dict["romanization"],
+                    "readings": reference_dict.get("romanized_readings") or [],
+                }
 
         if not built:
             raise RuntimeError("no lyric lines were produced")
@@ -896,7 +1059,10 @@ def process_song(stem: str, original: Path, karaoke: Path, cache_dir: Path,
             "language_inputs": decision.get("inputs", {}),
             "text_source": text_source,
             "timing_source": timing_source,
-            "romanization": "reference-romaji" if decision.get("reference_romaji") else None,
+            "romanization": (
+                romanization_info.get("method")
+                if romanization_info else None),
+            "romanization_info": romanization_info,
             "needs_review": qa_result["needs_review"],
             "review_reasons": qa_result["review_reasons"],
             "lrclib": {
@@ -966,11 +1132,18 @@ def process_song(stem: str, original: Path, karaoke: Path, cache_dir: Path,
         report["timing_source"] = timing_source
         report["candidates"] = [_candidate_summary(item) for item in candidates]
 
-        if language in ("ja", "ko") and output_dir.resolve() == LYRICS_DIR.resolve():
+        gate = _script_gate(final_cues, language)
+        pipeline["script_gate"] = gate
+        if _script_gate_blocks_publication(language, gate):
+            qa_result["needs_review"] = True
+            qa_result["review_reasons"].append(
+                f"script gate found {len(gate['leaks'])} leaking line(s)")
+            pipeline["needs_review"] = True
+            pipeline["review_reasons"] = qa_result["review_reasons"]
             report["status"] = "blocked"
             report["error"] = (
-                "JA/KO romanization is not implemented until Phase 3; "
-                "use --output-dir for a shadow run")
+                "script gate failed: active display text still contains "
+                "Japanese/Korean script; the song was not written")
             _write_report(reports_dir, stem, report)
             return report
 
