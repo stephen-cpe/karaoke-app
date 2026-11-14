@@ -124,6 +124,8 @@
 
 ## Windows desktop packaging
 
+- Python 3.14 is the only supported version. Use CPython 3.14 x64 for
+  development, tests, and release builds.
 - The distributable is a PyInstaller one-folder build named `karaoke-app.exe`.
   Keep `python app.py`, `python app.py --dev`, and all existing tests working.
 - `desktop.py` must import `karaoke.create_app` rather than importing `app.py`,
@@ -139,10 +141,11 @@
 - Build locally with:
 
   ```powershell
-  # Use a clean CPython 3.13.x x64 environment for release builds.
-  # Python 3.14's Tk 9 library layout is not reliably collected by the
-  # current PyInstaller release; normal app development can still use 3.14.
-  py -3.13 -m venv .venv-build
+  # Use a clean CPython 3.14.x x64 environment for release builds.
+  # PyInstaller 6.22.3 bundles the Tcl/Tk 9.0.4 DLLs, whose Tcl/Tk scripts
+  # live in an embedded data archive; the packaged self-test and GUI smoke
+  # test verify it.
+  py -3.14 -m venv .venv-build
   .\.venv-build\Scripts\python -m pip install -r requirements.txt `
     -r packaging\requirements-desktop.txt `
     -r packaging\requirements-build.txt pytest ruff

@@ -24,13 +24,17 @@ jobs:
       - name: Set up native CPython x64
         uses: actions/setup-python@v7
         with:
-          python-version: "3.13"
+          python-version: "3.14"
           architecture: "x64"
           cache: pip
           cache-dependency-path: |
             requirements.txt
             packaging/requirements-desktop.txt
             packaging/requirements-build.txt
+
+      - name: Show Python version
+        shell: pwsh
+        run: python --version
 
       - name: Set up Node.js for JavaScript tests
         uses: actions/setup-node@v7
