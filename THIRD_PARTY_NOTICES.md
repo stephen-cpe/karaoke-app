@@ -65,6 +65,37 @@ These files are served locally so the web UI does not need a CDN or Google Fonts
 The host player uses qrcode-generator to draw the phone join QR code locally and
 offline.
 
+## Lyrics pipeline (optional, not distributed)
+
+The lyric tools under `tools/` are optional and are not bundled with the Windows
+application. They are installed only for local, personal lyric preparation. The
+following versions are the ones verified in Phase 0/3:
+
+| Package | Version | License |
+|---|---|---|
+| torch | 2.15.0+cu132 | BSD-3-Clause (wheel also carries bundled third-party licenses) |
+| transformers | 5.22.2 | Apache-2.0 |
+| ctc-forced-aligner | 0.3.0 (pinned Git commit) | BSD-2-Clause code; its default MMS model is CC-BY-NC-4.0 |
+| uroman | 1.3.1.1 | Apache-2.0 |
+| nltk | 3.10.4 | Apache-2.0 |
+| Unidecode | 1.4.0 | GPL-2.0-or-later |
+| cutlet | 0.5.2 | MIT |
+| fugashi | 1.5.2 | MIT AND BSD-3-Clause |
+| unidic-lite | 1.0.8 | MIT package; bundled UniDic data under its upstream license |
+| hangul-romanize | 0.1.0 | BSD-2-Clause |
+| PyYAML | 6.0.3 | MIT |
+| pybind11 | 3.0.1 | BSD-3-Clause |
+| torchcodec | 0.17.0 | BSD-3-Clause |
+| jaconv | 0.5.0 | MIT |
+| mojimoji | 0.0.13 | Apache-2.0 |
+
+These dependencies and the MMS aligner model are **not** part of the distributed
+app. The model's CC-BY-NC-4.0 terms restrict commercial use; the tools are for
+personal, non-commercial lyric preparation. Unidecode is GPL-2.0-or-later; it is
+acceptable here because the pipeline is optional and not distributed. Review these
+terms before redistributing the tools or any generated model files. LRCLIB and
+Whisper outputs remain subject to their own terms; see the LRCLIB note below.
+
 ## External programs and services
 
 - **FFmpeg** is used for pitch shifting, audio normalization, and the

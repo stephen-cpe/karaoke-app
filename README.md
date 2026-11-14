@@ -213,6 +213,7 @@ karaoke_app/
 ├── static/
 │   ├── background.js         # procedural WebGL star/nebula/galaxy background
 │   ├── scripts.js            # host-only audio engine + shared-session client
+│   ├── lyrics_display.js     # shared word-wipe / full-line presentation rules
 │   ├── remote.js / remote.css # phone remote (controls only, no audio element)
 │   ├── sync_editor.js        # Lyrics Editor UI and draft/publish workflow
 │   ├── lyric_reconcile.js    # pure text/word-timing reconciliation rules
@@ -226,7 +227,7 @@ karaoke_app/
 │   └── icon-*.png, apple-touch-icon.png # PWA / Apple touch icons
 ├── templates/                # index.html (host), remote.html (phone), sync_editor.html
 ├── tools/
-│   ├── generate_lyrics.py    # Demucs + Whisper + LRCLIB lyric timing pipeline
+│   ├── generate_lyrics.py    # Demucs + LRCLIB/ASR + romanization/forced alignment
 │   ├── check_lyrics.py       # structural and vocal-energy validator
 │   ├── add_lyrics.ps1        # generate + validate wrapper
 │   └── .cache/               # separated vocals, transcripts, LRCLIB responses (ignored)
@@ -390,16 +391,77 @@ songs/00001_Two Steps Behind_Def Leppard.mp3
 original_songs/00001_Two Steps Behind_Def Leppard.mp3
 ```
 
-The tool separates vocals with Demucs, transcribes them with faster-whisper
-`large-v3` (CUDA `float16` when available, CPU `int8` fallback), uses LRCLIB
-synced lyrics when a usable reference is found (at least 25% token coverage) to
-correct the text and line breaks, and maps the online timestamps onto the local
-audio. If no usable reference is found, it builds lyrics from the local Whisper
-transcript. It writes two files:
+The tool separates vocals with Demucs, then chooses the lyric source per song:
 
-- `lyrics/<stem>.srt` — ordinary line-level subtitles, portable to any player
-- `lyrics/<stem>.words.json` — the same cues plus per-word timings; the web player
+- **Known lyrics (LRCLIB or a user override).** English uses the existing
+  ASR-timed compatibility path by default; Tagalog is force-aligned; Japanese and
+  Korean are romanized first and force-aligned on the same text the singer sees.
+  JA/KO use LRCLIB line windows, line `<star>` separation, a confidence threshold,
+  and line-level fallback. When LRCLIB has word-level lyric timing, the pipeline
+  compares it with forced alignment word by word against the vocal onsets and
+  keeps the timing source that agrees better with the audio.
+- **No usable reference.** The pipeline falls back to the local faster-whisper
+  `large-v3` transcript (CUDA `float16` when available, CPU `int8` otherwise).
+  ASR-only files can contain text errors; they are not word-sync candidates.
+
+Japanese romanization uses fugashi/unidic-lite readings plus a rule-based
+post-processor (long vowels, particles, sokuon, `n'`, katakana as sung, Latin
+pass-through). Korean uses `hangul-romanize` academic output; Korean is
+**provisional** until native-speaker feedback is collected. A hard script gate
+refuses to publish a JA/KO song if any active display text still contains kana,
+kanji, or Hangul. The gate is recorded in `pipeline.script_gate`.
+
+It writes two files:
+
+- `lyrics/<stem>.srt` - ordinary line-level subtitles, portable to any player
+- `lyrics/<stem>.words.json` - the same cues plus per-word timings; the web player
   prefers this file for word-by-word highlighting and falls back to the SRT
+
+Lines without word timings are valid. The host and remote now show them fully in
+the sung style for the whole cue instead of leaving them unhighlighted.
+
+### Lyric overrides and spelling replacements
+
+`lyrics/source/` is the per-song override folder:
+
+- `<stem>.lrc` or `<stem>.txt` replaces the lyrics. The LRC form keeps its
+  timestamps.
+- `<stem>.json` can set `"language": "ja"`/`"ko"`/`"tl"`/`"en"` when detection is
+  wrong.
+- The same JSON can add display-spelling replacements, applied to romanized text
+  **before** alignment so the timings belong to the replaced words:
+
+```json
+{
+  "language": "ko",
+  "replacements": {
+    "O-ppan gangnamseuta-il": "Oppan Gangnam style"
+  }
+}
+```
+
+Applied replacements are recorded under
+`pipeline.romanization_info.replacements`. Replacements are case-sensitive; add
+both cases if the source uses them.
+
+### Flags and publishing rules
+
+```powershell
+python tools\generate_lyrics.py                    # all songs with an original
+python tools\generate_lyrics.py --missing          # only songs without an SRT yet
+python tools\generate_lyrics.py --song "Innocent"  # one song (title or stem)
+python tools\generate_lyrics.py --no-online        # local transcript only
+python tools\generate_lyrics.py --force            # ignore cached vocals/transcripts
+python tools\generate_lyrics.py --output-dir tools\.cache\shadow  # shadow run
+python tools\generate_lyrics.py --align-english    # force-align English too
+python tools\generate_lyrics.py --overwrite-edited # replace edited active files
+```
+
+`--missing` only processes songs without an SRT; it never overwrites existing
+files. A normal run replaces pipeline-generated files, but it refuses to replace
+a pair that was edited outside the pipeline unless `--overwrite-edited` is given.
+Previous pairs are backed up under `tools/.cache/backups/`. A blocked script gate
+returns before any file is written.
 
 Install the lyric dependencies separately from the Flask app (they are large and
 are not in the core runtime):
@@ -533,7 +595,7 @@ venv\Scripts\python -m pytest
 venv\Scripts\ruff check .
 node --check static\lyric_reconcile.js
 node --check static\sync_editor.js
-node --test tests\js\reconcile.test.js
+node --test "tests/js/*.test.js"
 ```
 
 The suite covers filename parsing, the catalog endpoint, media-route extension
@@ -581,7 +643,7 @@ py -3.13 -m venv .venv-build
   -r packaging\requirements-desktop.txt `
   -r packaging\requirements-build.txt pytest ruff
 .\.venv-build\Scripts\python -m pytest -m "not browser"
-node --test tests\js\reconcile.test.js
+node --test "tests/js/*.test.js"
 .\.venv-build\Scripts\python -m ruff check .
 .\packaging\build.ps1 -Version 0.0.2 -Python .\.venv-build\Scripts\python.exe
 ```

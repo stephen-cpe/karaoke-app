@@ -1,126 +1,96 @@
 """Generate karaoke lyrics (SRT + word timings) from the original songs.
 
 Pipeline per song:
-  1. Separate the vocals with Demucs (GPU if available) so Whisper hears the
-     singer instead of the band.
-  2. Transcribe with faster-whisper large-v3 and word timestamps.
-  3. Optionally fetch LRCLIB synced lyrics. The local audio supplies the timing;
-     the online text supplies line breaks and fixes words Whisper misheard.
-  4. Build one cue per lyric line, insert [Instrumental] cues for long gaps,
-     and write:
-       lyrics/<song stem>.srt
-       lyrics/<song stem>.words.json
+  1. Separate vocals with Demucs; cache the stem by original content hash.
+  2. Acquire lyrics from a user override, LRCLIB, or speech recognition.
+  3. Detect the song language from script, a Tagalog lexicon, and Whisper LID.
+  4. Transcribe with faster-whisper using the detected language.
+  5. Build cues and word timings, insert [Instrumental] gaps, and publish with
+     provenance, edited-file protection, and backups.
 
 The SRT is ordinary, portable line-level subtitles. The JSON sidecar adds
 per-word timings for the karaoke player's word-by-word highlighting.
-
-Requirements (installed separately from the Flask app):
-    pip install faster-whisper demucs torch
-
-Run from the project root, for example:
-    python tools/generate_lyrics.py --song "Two Steps Behind"
-    python tools/generate_lyrics.py              # all songs
-    python tools/generate_lyrics.py --no-online  # local transcript only
 """
 from __future__ import annotations
 
 import argparse
-import difflib
-import json
 import logging
-import os
-import re
 import shutil
-import site
-import subprocess
 import sys
-import tempfile
 import time
-import urllib.parse
-import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from tools.lyrics import (  # noqa: E402
+    align,
+    asr,
+    audio,
+    cache,
+    cues,
+    langdetect,
+    publish,
+    qa,
+    reference,
+    romanize,
+    textnorm,
+)
+
 SONGS_DIR = PROJECT_ROOT / "songs"
 ORIGINALS_DIR = PROJECT_ROOT / "original_songs"
 LYRICS_DIR = PROJECT_ROOT / "lyrics"
 CACHE_DIR = PROJECT_ROOT / "tools" / ".cache"
+REPORTS_DIR = CACHE_DIR / "reports"
+BACKUPS_DIR = CACHE_DIR / "backups"
+SOURCE_DIR = LYRICS_DIR / "source"
 
 AUDIO_EXTENSIONS = (".mp3", ".wav")
-LRC_TIMESTAMP = re.compile(r"\[(\d+):(\d+(?:\.\d+)?)\]")
-USER_AGENT = "karaoke-lyrics-sync/1.0 (personal local use)"
-LRCLIB_TIMEOUT = 30
-DURATION_MISMATCH_WARN = 1.0  # seconds between original and instrumental
-INSTRUMENTAL_GAP = 3.0  # seconds; shorter gaps just leave the screen blank briefly
-PHRASE_GAP = 2.5        # seconds of silence that ends a sung phrase
-PHRASE_LINGER = 0.6     # keep a finished line on screen briefly before clearing it
-# Whisper sometimes "hears" words at the ends of abruptly cut recordings.
-# These are never lyrics.
-HALLUCINATION_PHRASES = (
-    "thank you for watching",
-    "thanks for watching",
-    "thank you watching",
-    "please subscribe",
-    "like and subscribe",
-)
+DURATION_MISMATCH_WARN = 1.0
+MAX_REFERENCE_OFFSET = 5.0
+ALIGNMENT_TIME_SHIFTS = {
+    "tl": -0.20,
+    "ja": -0.20,
+    "ko": -0.20,
+}
+
+
+def _alignment_time_shift(language: str) -> float:
+    return ALIGNMENT_TIME_SHIFTS.get(language, align.ALIGNMENT_TIME_SHIFT)
+
+# Compatibility exports for tests and older helper scripts.
+atomic_write_text = cache.atomic_write_text
+srt_time = cues.srt_time
+norm_token = textnorm.norm_token
+clean_text = textnorm.clean_text
+split_display_tokens = textnorm.split_display_tokens
+parse_lrc = reference.parse_lrc
+chunk_ranges = asr.chunk_ranges
+load_vocal_audio = audio.load_vocal_audio
+vocal_onset = audio.vocal_onset
+vocal_phrase_end = audio.vocal_phrase_end
+distribute_words = cues.distribute_words
+interpolate_known = cues.interpolate_known
+local_timing_is_reasonable = cues.local_timing_is_reasonable
+build_lyric_lines = cues.build_lyric_lines
+add_instrumental_cues = cues.add_instrumental_cues
+build_from_transcript = cues.build_from_transcript
+flat_lrc_tokens = cues.flat_lrc_tokens
+map_lrc_time = cues.map_lrc_time
+align_reference_words = cues.align_reference_words
+tokens_similar = cues.tokens_similar
+duration_of = audio.duration_of
+configure_nvidia_dlls = asr.configure_nvidia_dlls
+cuda_whisper_available = asr.cuda_whisper_available
 
 log = logging.getLogger("lyrics")
 
 
-# ---------------------------------------------------------------------------
-# Small utilities
-# ---------------------------------------------------------------------------
-
-def run(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
-    log.debug("running: %s", " ".join(cmd))
-    return subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
-                          errors="replace", **kwargs)
-
-
-def atomic_write_text(path: Path, text: str) -> None:
-    """Write a text file without exposing a partial file to the next run."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temp_path = tempfile.mkstemp(
-        dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
-            fh.write(text)
-        os.replace(temp_path, path)
-    except BaseException:
-        try:
-            os.unlink(temp_path)
-        except OSError:
-            pass
-        raise
-
-
-def norm_token(text: str) -> str:
-    """Lowercase and strip punctuation so 'I'm', 'I? m' and 'Im' compare equal."""
-    text = text.lower().replace("\u2019", "'").replace("\u2018", "'").replace("`", "'")
-    return re.sub(r"[^a-z0-9]+", "", text)
-
-
-def clean_text(text: str, capitalize: bool = True) -> str:
-    """Fix the '?' apostrophe artifacts common in LRCLIB text and tidy spacing."""
-    text = text.replace("\u2019", "'").replace("\u2018", "'")
-    text = re.sub(r"(?<=[A-Za-z])\?\s*(?=(?:m|s|t|ve|re|ll|d)\b)", "'", text)
-    text = re.sub(r"(^|\s)\?\s*(?=[Cc]ause\b)", r"\1'", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    if text and capitalize:
-        text = text[0].upper() + text[1:]
-    return text
-
-
-def srt_time(seconds: float) -> str:
-    ms = max(0, int(round(seconds * 1000)))
-    hours, ms = divmod(ms, 3_600_000)
-    minutes, ms = divmod(ms, 60_000)
-    secs, ms = divmod(ms, 1_000)
-    return f"{hours:02d}:{minutes:02d}:{secs:02d},{ms:03d}"
-
-
 def split_stem(stem: str) -> tuple[str, str]:
-    """Split 'id_Title_Artist' into (title, artist), matching app.py's rules."""
+    """Split 'id_Title_Artist' into (title, artist), matching the app's rules."""
     _, separator, rest = stem.partition("_")
     if not separator:
         return stem, ""
@@ -133,14 +103,15 @@ def split_stem(stem: str) -> tuple[str, str]:
 def find_song_files(song_filter: str | None) -> list[tuple[str, Path, Path]]:
     """Return (stem, original_path, karaoke_path) for matching songs."""
     found = []
-    originals = {p.stem: p for p in ORIGINALS_DIR.glob("*") if p.suffix.lower() in AUDIO_EXTENSIONS}
+    originals = {path.stem: path for path in ORIGINALS_DIR.glob("*")
+                 if path.suffix.lower() in AUDIO_EXTENSIONS}
     for stem, original in sorted(originals.items(), key=lambda item: item[0].casefold()):
         if song_filter and song_filter.casefold() not in stem.casefold():
             continue
         karaoke = SONGS_DIR / f"{stem}{original.suffix.lower()}"
         if not karaoke.exists():
-            # Allow a different extension in songs/ (e.g. original wav, karaoke mp3).
-            candidates = [p for p in SONGS_DIR.glob(f"{stem}.*") if p.suffix.lower() in AUDIO_EXTENSIONS]
+            candidates = [path for path in SONGS_DIR.glob(f"{stem}.*")
+                          if path.suffix.lower() in AUDIO_EXTENSIONS]
             if not candidates:
                 log.warning("%s: no matching file in %s, skipping", stem, SONGS_DIR)
                 continue
@@ -149,1426 +120,1320 @@ def find_song_files(song_filter: str | None) -> list[tuple[str, Path, Path]]:
     return found
 
 
-def duration_of(path: Path) -> float:
-    result = run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
-                  "-of", "default=noprint_wrappers=1:nokey=1", str(path)])
+def _seconds(started: float) -> float:
+    return round(time.perf_counter() - started, 2)
+
+
+def _relative(path: Path) -> str:
     try:
-        return float(result.stdout.strip())
+        return str(path.resolve().relative_to(PROJECT_ROOT))
     except ValueError:
-        return 0.0
+        return str(path.resolve())
 
 
-# ---------------------------------------------------------------------------
-# Stage 1 + 2: vocals and transcription
-# ---------------------------------------------------------------------------
+def _write_report(reports_dir: Path, stem: str, report: dict[str, Any]) -> None:
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    cache.atomic_write_json(reports_dir / f"{stem}.json", report)
 
-def separate_vocals(stem: str, original: Path, cache_dir: Path, force: bool = False) -> Path:
-    vocals = cache_dir / "stems" / "htdemucs" / stem / "vocals.wav"
+
+def separate_vocals(stem: str, original: Path, cache_dir: Path,
+                    force: bool = False) -> tuple[Path, dict[str, Any]]:
+    """Separate vocals into a cache keyed by the original's content hash."""
+    original_hash = cache.sha256_file(original)
+    vocals = cache.stem_cache_path(cache_dir, stem, original_hash)
+    info = {
+        "original_sha256": original_hash,
+        "device": None,
+        "cache_hit": False,
+        "seconds": 0.0,
+        "path": _relative(vocals),
+    }
     if vocals.is_file() and vocals.stat().st_size > 0 and not force:
         log.info("  vocals cached: %s", vocals)
-        return vocals
+        info["cache_hit"] = True
+        return vocals, info
 
     log.info("  separating vocals with Demucs...")
-    device = "cpu"
+    root = cache.stem_cache_root(cache_dir, original_hash)
+    devices = []
     try:
         import torch
         if torch.cuda.is_available():
-            device = "cuda"
+            devices.append("cuda")
     except Exception:
         pass
-
-    result = run([sys.executable, "-m", "demucs", "--two-stems=vocals",
-                  "-n", "htdemucs", "-d", device,
-                  "-o", str(cache_dir / "stems"), str(original)])
-    if (result.returncode != 0 or not vocals.is_file()
-            or vocals.stat().st_size == 0):
-        details = (result.stderr or result.stdout or "")[-3000:]
-        raise RuntimeError(f"Demucs did not produce {vocals}\n{details}")
-    return vocals
-
-
-TRANSCRIBE_CHUNK = 55.0
-TRANSCRIBE_OVERLAP = 8.0
-TRANSCRIBE_STEP = TRANSCRIBE_CHUNK - TRANSCRIBE_OVERLAP
-TRANSCRIBER_VERSION = "chunked-v2"
-
-
-def chunk_ranges(duration: float) -> list[tuple[float, float, float, float]]:
-    """Split audio into overlapping clips and return their non-overlapping cores.
-
-    Each tuple is (clip_start, clip_end, core_start, core_end). Whisper timestamps
-    drift badly on long music files, so every region is transcribed in a clip
-    where it sits away from the clip edges; the cores then partition the song
-    without duplicate or boundary-cut words.
-    """
-    clips: list[tuple[float, float]] = []
-    start = 0.0
-    while True:
-        end = min(duration, start + TRANSCRIBE_CHUNK)
-        clips.append((start, end))
-        if end >= duration - 0.01:
-            break
-        start += TRANSCRIBE_STEP
-    result = []
-    for index, (clip_start, clip_end) in enumerate(clips):
-        core_start = 0.0 if index == 0 else (clip_start + clips[index - 1][1]) / 2
-        core_end = (duration if index == len(clips) - 1
-                    else (clip_end + clips[index + 1][0]) / 2)
-        if core_end <= core_start:
-            core_start, core_end = clip_start, clip_end
-        result.append((clip_start, clip_end, core_start, core_end))
-    return result
-
-
-# Handles must stay alive for the process lifetime; closing one removes the
-# directory from the Windows DLL search path again.
-_NVIDIA_DLL_HANDLES = []
-_NVIDIA_DLL_DIRS: set[str] = set()
-
-
-def configure_nvidia_dlls() -> None:
-    """Expose pip-installed CUDA 12 DLLs to CTranslate2 on Windows."""
-    if os.name != "nt":
-        return
-    try:
-        site_roots = list(site.getsitepackages())
-        site_roots.append(site.getusersitepackages())
-    except (AttributeError, OSError):
-        return
-    for site_root in site_roots:
-        for package in ("cublas", "cudnn"):
-            bin_dir = Path(site_root) / "nvidia" / package / "bin"
-            if not bin_dir.is_dir() or str(bin_dir) in _NVIDIA_DLL_DIRS:
-                continue
-            try:
-                _NVIDIA_DLL_HANDLES.append(os.add_dll_directory(str(bin_dir)))
-            except (AttributeError, OSError):
-                pass
-            os.environ["PATH"] = str(bin_dir) + os.pathsep + os.environ.get("PATH", "")
-            _NVIDIA_DLL_DIRS.add(str(bin_dir))
-
-
-def cuda_whisper_available() -> bool:
-    """Return True when CTranslate2 can see a CUDA device.
-
-    Detection only proves the driver is visible; cuBLAS/cuDNN can still fail
-    when the model is loaded or used. ``transcribe`` therefore falls back to
-    CPU if an actual CUDA transcription fails.
-    """
-    configure_nvidia_dlls()
-    try:
-        import ctranslate2
-        return ctranslate2.get_cuda_device_count() > 0
-    except Exception:
-        return False
-
-
-def _transcribe_with_model(model, vocals: Path, prompt: str) -> tuple[list[dict], str, float, float]:
-    """Run the chunked transcription with an already loaded Whisper model."""
-    started = time.time()
-    duration = duration_of(vocals)
-    if duration <= 0:
-        raise RuntimeError(f"could not read duration of {vocals}")
-
-    rows = []
-    language = "en"
-    language_probability = 1.0
-    with tempfile.TemporaryDirectory(prefix="karaoke-whisper-") as tmp:
-        tmp_dir = Path(tmp)
-        for clip_start, clip_end, core_start, core_end in chunk_ranges(duration):
-            clip_path = tmp_dir / f"clip-{clip_start:07.2f}.wav"
-            result = run([
-                "ffmpeg", "-v", "error", "-y",
-                "-ss", f"{clip_start:.3f}", "-t", f"{clip_end - clip_start:.3f}",
-                "-i", str(vocals), "-vn", "-ac", "1", "-ar", "16000",
-                "-c:a", "pcm_s16le", str(clip_path),
-            ])
-            if not clip_path.exists():
-                raise RuntimeError(
-                    f"ffmpeg could not extract {clip_start:.1f}-{clip_end:.1f}s\n"
-                    f"{(result.stderr or result.stdout or '')[-2000:]}"
-                )
-            segments, info = model.transcribe(
-                str(clip_path),
-                language="en",
-                beam_size=5,
-                temperature=0.0,
-                word_timestamps=True,
-                condition_on_previous_text=False,
-                initial_prompt=prompt,
-            )
-            language = info.language
-            language_probability = info.language_probability
-
-            chunk_words = []
-            log_probs = []
-            for segment in segments:
-                log_probs.append(segment.avg_logprob)
-                for word in segment.words or []:
-                    text = (word.word or "").strip()
-                    if not text:
-                        continue
-                    # Timestamps are relative to the extracted clip.
-                    word_start = float(word.start) + clip_start
-                    word_end = float(word.end) + clip_start
-                    if word_end <= word_start:
-                        word_end = word_start + 0.15
-                    midpoint = (word_start + word_end) / 2
-                    if midpoint < core_start or midpoint >= core_end:
-                        continue
-                    chunk_words.append({
-                        "word": text,
-                        "start": round(word_start, 3),
-                        "end": round(word_end, 3),
-                        "prob": round(word.probability, 4),
-                    })
-            if not chunk_words:
-                log.info("    [%6.1f-%6.1f] no words", clip_start, clip_end)
-                continue
-            rows.append({
-                "start": chunk_words[0]["start"],
-                "end": chunk_words[-1]["end"],
-                "text": " ".join(word["word"] for word in chunk_words),
-                "avg_logprob": round(sum(log_probs) / len(log_probs), 4) if log_probs else -1.0,
-                "no_speech_prob": 0.0,
-                "words": chunk_words,
-            })
-            log.info("    [%6.1f-%6.1f] %d words: %s", clip_start, clip_end,
-                     len(chunk_words),
-                     " ".join(word["word"] for word in chunk_words)[:90])
-
-    log.info("  transcribed in %.1fs (%d segments, %d words)", time.time() - started,
-             len(rows), sum(len(row["words"]) for row in rows))
-    return rows, language, language_probability, duration
-
-
-def transcribe(stem: str, vocals: Path, prompt: str, cache_dir: Path,
-               force: bool = False) -> dict:
-    out = cache_dir / "transcripts" / f"{stem}.json"
-    if out.exists() and not force:
-        try:
-            cached = json.loads(out.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            log.warning("  transcript cache is unreadable; re-running Whisper")
+    devices.append("cpu")
+    last_error = None
+    for device in devices:
+        started = time.perf_counter()
+        result = audio.run([
+            sys.executable, "-m", "demucs", "--two-stems=vocals",
+            "-n", "htdemucs", "-d", device, "-o", str(root), str(original),
+        ])
+        if (result.returncode == 0 and vocals.is_file()
+                and vocals.stat().st_size > 0):
+            info.update({"device": device, "seconds": _seconds(started)})
+            log.info("  separated vocals on %s in %.1fs", device.upper(),
+                     info["seconds"])
+            return vocals, info
+        last_error = (result.stderr or result.stdout or "")[-3000:]
+        if device == "cuda":
+            log.warning("  Demucs CUDA failed; trying CPU")
         else:
-            if cached.get("transcriber") == TRANSCRIBER_VERSION:
-                log.info("  transcript cached: %s", out)
-                return cached
-            log.info("  transcript cache is outdated; re-running Whisper")
-
-    configure_nvidia_dlls()
-    try:
-        from faster_whisper import WhisperModel
-    except ImportError as exc:
-        raise RuntimeError(
-            "faster-whisper is not installed. Run: pip install faster-whisper demucs torch"
-        ) from exc
-
-    devices = []
-    if cuda_whisper_available():
-        devices.append(("cuda", "float16"))
-    devices.append(("cpu", "int8"))
-
-    data = None
-    for device, compute_type in devices:
-        log.info("  loading Whisper large-v3 (%s %s)...", device.upper(), compute_type)
-        try:
-            model = WhisperModel("large-v3", device=device, compute_type=compute_type,
-                                 cpu_threads=0)
-            log.info("  transcribing in %.0fs overlapping clips on %s...",
-                     TRANSCRIBE_CHUNK, device.upper())
-            rows, language, language_probability, duration = _transcribe_with_model(
-                model, vocals, prompt)
-        except Exception as exc:
-            if device == "cuda":
-                log.warning("  CUDA Whisper failed (%s); falling back to CPU int8", exc)
-                continue
-            raise
-        data = {
-            "transcriber": TRANSCRIBER_VERSION,
-            "info": {"duration": duration, "language": language,
-                     "language_probability": language_probability},
-            "segments": rows,
-        }
-        break
-
-    if data is None:
-        raise RuntimeError("no Whisper device could transcribe the vocals")
-
-    atomic_write_text(out, json.dumps(data, indent=2, ensure_ascii=False))
-    return data
-
-
-# ---------------------------------------------------------------------------
-# Stage 3: online reference (LRCLIB)
-# ---------------------------------------------------------------------------
-
-def lrclib_search(artist: str, title: str, cache_dir: Path) -> list[dict]:
-    """Fetch LRCLIB search results, cached by song title/artist."""
-    key = re.sub(r"[^a-z0-9]+", "_", f"{artist}_{title}".lower()).strip("_")
-    cache = cache_dir / "lrclib" / f"{key}.json"
-    if cache.exists():
-        try:
-            cached = json.loads(cache.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            cached = None
-        if isinstance(cached, list) and cached:
-            return cached
-        # Empty responses used to be cached forever, which blocked a later
-        # retry from ever finding lyrics. Treat them as missing.
-        log.info("  LRCLIB cache is empty; retrying online")
-
-    query = urllib.parse.urlencode({"q": f"{artist} {title}",
-                                    "track_name": title, "artist_name": artist})
-    url = f"https://lrclib.net/api/search?{query}"
-    last = None
-    for attempt in range(1, 4):
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-            with urllib.request.urlopen(req, timeout=LRCLIB_TIMEOUT) as response:
-                data = json.load(response)
-            if not isinstance(data, list):
-                raise ValueError("LRCLIB returned an unexpected payload")
-            if data:
-                atomic_write_text(cache, json.dumps(data, indent=2, ensure_ascii=False))
-            else:
-                log.info("  LRCLIB returned no results (not cached; will retry next run)")
-            return data
-        except Exception as exc:
-            last = exc
-            log.warning("  LRCLIB attempt %d failed: %s", attempt, exc)
-            if attempt < 3:
-                time.sleep(2 * attempt)
-    log.warning("  LRCLIB unavailable (%s); continuing with local transcript", last)
-    return []
-
-
-def parse_lrc(synced: str) -> list[dict]:
-    lines = []
-    for raw in (synced or "").splitlines():
-        raw = raw.strip()
-        if not raw:
-            continue
-        stamps = LRC_TIMESTAMP.findall(raw)
-        if not stamps:
-            continue
-        text = clean_text(LRC_TIMESTAMP.sub("", raw).strip())
-        if not text:
-            continue
-        if re.fullmatch(r"\[[^\]]+\]", text) or re.fullmatch(r"\(instrumental\)", text, re.I):
-            continue
-        for minutes, seconds in stamps:
-            lines.append({"start": int(minutes) * 60 + float(seconds), "text": text})
-    lines.sort(key=lambda line: line["start"])
-    return lines
-
-
-def split_display_tokens(text: str) -> list[dict]:
-    tokens = []
-    for raw in text.split():
-        norm = norm_token(raw)
-        if not norm:
-            if tokens:
-                tokens[-1]["text"] += raw
-            continue
-        tokens.append({"text": raw, "norm": norm})
-    return tokens
-
-
-SILENCE_RMS = 0.0015  # ~-56 dBFS; below this a "word" is Whisper hallucinating silence
-ONSET_RMS = 0.003      # ~-50 dBFS; first window loud enough to be singing
-STRONG_ONSET_RMS = 0.02  # used when looking backwards; avoids nabbing bleed
-
-
-def load_vocal_audio(vocals: Path):
-    """Decode the vocal stem once to mono 16 kHz float samples for energy checks."""
-    import numpy as np
-
-    proc = subprocess.run(
-        ["ffmpeg", "-v", "error", "-i", str(vocals), "-ac", "1", "-ar", "16000",
-         "-f", "f32le", "-"],
-        capture_output=True,
-    )
-    if proc.returncode != 0 or not proc.stdout:
-        return None
-    return np.frombuffer(proc.stdout, dtype=np.float32)
-
-
-def _window_rms(audio, sample_rate: int, start: float, end: float,
-                window: float = 0.05, hop: float = 0.025):
-    """RMS for fixed-size windows in [start, end), with absolute window times."""
-    import numpy as np
-
-    first = max(0, int(start * sample_rate))
-    last = min(len(audio), int(end * sample_rate))
-    if last <= first:
-        return np.array([]), np.array([])
-    samples = np.square(audio[first:last], dtype=np.float64)
-    width = max(1, int(window * sample_rate))
-    if len(samples) <= width:
-        value = float(np.sqrt(np.mean(samples)))
-        return np.array([start]), np.array([value])
-    cumulative = np.concatenate(([0.0], np.cumsum(samples)))
-    step = max(1, int(hop * sample_rate))
-    starts = np.arange(0, len(samples) - width + 1, step)
-    times = start + starts / sample_rate
-    energies = (cumulative[starts + width] - cumulative[starts]) / width
-    return times, np.sqrt(np.maximum(energies, 0))
-
-
-def vocal_onset(audio, start: float, end: float,
-                threshold: float = ONSET_RMS, sample_rate: int = 16000):
-    """Return the first moment in [start, end) where singing is audible."""
-    if audio is None or end <= start:
-        return None
-    times, values = _window_rms(audio, sample_rate, start, end)
-    for moment, value in zip(times, values):
-        if value >= threshold:
-            return float(moment)
-    return None
-
-
-def vocal_phrase_end(audio, start: float, limit: float,
-                     threshold: float = ONSET_RMS, sample_rate: int = 16000,
-                     phrase_gap: float = PHRASE_GAP):
-    """Return the last audible moment of the first sung phrase in [start, limit).
-
-    A lyric line can be followed by a long instrumental tail; without this the
-    cue (and its word timings) stretches all the way to the next line. Stop at
-    the first real silence instead, ignoring short gaps between syllables.
-    """
-    if audio is None or limit <= start:
-        return None
-    times, values = _window_rms(audio, sample_rate, start, limit)
-    if not len(times):
-        return None
-
-    # Scale the gate to the loudness of this phrase so quiet verses still work
-    # while instrument bleed in a loud mix does not.
-    local_peak = float(values.max())
-    if local_peak < threshold:
-        return None
-    gate = max(threshold, local_peak * 0.08)
-
-    active = values >= gate
-    first = int(active.argmax())
-    if not active[first]:
-        return None
-    last_active = first
-    for index in range(first + 1, len(times)):
-        if active[index]:
-            last_active = index
-        elif times[index] - times[last_active] >= phrase_gap:
             break
-    return min(limit, float(times[last_active]) + 0.05)
+    raise RuntimeError(f"Demucs did not produce {vocals}\n{last_error}")
 
 
-def _max_window_rms(audio, sample_rate: int, start: float, end: float,
-                    window: float = 0.05) -> float:
-    """Loudest 50 ms inside a word, so long held notes are not judged as silence."""
-    import numpy as np
-
-    first = max(0, int(start * sample_rate))
-    last = min(len(audio), int(end * sample_rate))
-    if last <= first:
-        return 0.0
-    samples = np.square(audio[first:last], dtype=np.float64)
-    width = max(1, int(window * sample_rate))
-    if len(samples) <= width:
-        return float(np.sqrt(np.mean(samples)))
-    cumulative = np.concatenate(([0.0], np.cumsum(samples)))
-    starts = np.arange(0, len(samples) - width + 1, max(1, width // 2))
-    energies = (cumulative[starts + width] - cumulative[starts]) / width
-    return float(np.sqrt(np.max(energies)))
+def _reference_text(reference_dict: dict[str, Any] | None) -> str:
+    if not reference_dict:
+        return ""
+    return "\n".join(str(line.get("text") or "")
+                     for line in reference_dict.get("lines") or [])
 
 
-def filter_silent_words(transcript: dict, vocals: Path, audio=None) -> dict:
-    """Drop words Whisper invented in silent parts of the vocal stem.
+def _reference_line_count(reference_dict: dict[str, Any] | None,
+                          language: str) -> int:
+    if not reference_dict:
+        return 0
+    return sum(
+        1 for line in reference_dict.get("lines") or []
+        if textnorm.token_count(str(line.get("text") or ""), language) > 0
+    )
 
-    Music prompts and song titles can make Whisper emit text over an intro or
-    instrumental break. Those words always sit in near-silence, while real
-    singing (even quiet backing vocals) has measurable energy.
+
+def _candidate_summary(item: dict[str, Any]) -> dict[str, Any]:
+    record = item.get("record") or {}
+    return {
+        "id": record.get("id"),
+        "track": record.get("trackName"),
+        "artist": record.get("artistName"),
+        "album": record.get("albumName"),
+        "duration": record.get("duration"),
+        "has_word_sync": record.get("hasWordSync"),
+        "form": item.get("form_name"),
+        "score": round(float(item.get("score", 0.0)), 3),
+        "duration_error": round(float(item.get("duration_error", 0.0)), 3),
+        "coverage": round(float(item.get("coverage", 0.0)), 4),
+        "local_coverage": round(float(item.get("local_coverage", 0.0)), 4),
+        "offset": round(float(item.get("offset", 0.0)), 3),
+        "energy_score": round(float(item.get("energy_score", 0.0)), 4),
+        "penalty": round(float(item.get("penalty", 0.0)), 3),
+        "word_sync": bool(item.get("word_sync")),
+        "alignment": item.get("alignment"),
+        "build_quality": item.get("build_quality"),
+    }
+
+
+def _provisional_reference(records: list[dict[str, Any]], language: str,
+                           duration: float, audio_data,
+                           client: reference.LRCLIBClient):
+    chosen, scored = reference.choose_candidate(
+        records, language, duration, audio_data, local=None,
+        fetch_full=client.fetch_by_id)
+    return chosen, scored
+
+
+def _reject_suspect_reference_offset(reference_dict: dict[str, Any] | None,
+                                     report: dict[str, Any]) -> None:
+    if not reference_dict:
+        return
+    try:
+        offset = float(reference_dict.get("offset") or 0.0)
+    except (TypeError, ValueError):
+        offset = 0.0
+    if abs(offset) <= MAX_REFERENCE_OFFSET:
+        return
+    reference_dict["alignment_offset_reset"] = round(offset, 3)
+    reference_dict["offset"] = 0.0
+    reference_dict["anchors"] = {}
+    reference_dict["token_local"] = {}
+    message = (f"reference timing offset {offset:+.1f}s is implausible for "
+               "a same-duration master; falling back to LRCLIB/onset timing")
+    report.setdefault("warnings", []).append(message)
+    log.warning("  %s", message)
+
+
+def _needs_full_asr(language: str, has_reference: bool,
+                    align_english: bool) -> tuple[bool, str]:
+    if not has_reference:
+        return True, "ASR text is the lyric source"
+    if language == "en":
+        if align_english:
+            return False, "English forced-alignment path requested"
+        return True, "English compatibility path keeps ASR timing"
+    if language in ("ja", "ko"):
+        return False, "known JA/KO text is romanized and force-aligned"
+    if language == "tl":
+        return False, "known Tagalog text is force-aligned"
+    return True, "no forced-alignment path for this language"
+
+
+def _apply_text_replacements(lines: list[dict[str, Any]],
+                             replacements: dict[str, str] | None
+                             ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Apply display-spelling replacements before alignment.
+
+    Replacements are matched against the romanized line text. The line's
+    token list is rebuilt from the replaced text so the timings belong to the
+    words the singer actually sees.
     """
-    if audio is None:
-        audio = load_vocal_audio(vocals)
-    if audio is None:
-        log.warning("  could not analyse vocal energy; keeping all transcript words")
-        return transcript
-    sample_rate = 16000
+    if not replacements:
+        return lines, []
+    cleaned = {
+        str(source): str(target)
+        for source, target in replacements.items()
+        if str(source) and str(target)
+    }
+    if not cleaned:
+        return lines, []
+    result = []
+    applied = []
+    for index, line in enumerate(lines):
+        row = dict(line)
+        text = str(row.get("text") or "")
+        row_applied = []
+        for source, target in cleaned.items():
+            if source in text:
+                count = text.count(source)
+                text = text.replace(source, target)
+                row_applied.append({
+                    "line": index + 1,
+                    "from": source,
+                    "to": target,
+                    "count": count,
+                })
+        if row_applied:
+            row["text"] = text
+            row["words"] = []
+            applied.extend(row_applied)
+        result.append(row)
+    return result, applied
 
-    dropped = 0
-    segments = []
-    for segment in transcript.get("segments", []):
+
+def _romanize_candidate(item: dict[str, Any], language: str,
+                        replacements: dict[str, str] | None = None) -> None:
+    """Replace native-script reference text with the display romanization."""
+    lines = item.get("lines") or []
+    texts = [str(line.get("text") or "") for line in lines]
+    pre_romanized = (
+        language == "ja"
+        and not any(textnorm.has_japanese(text) for text in texts))
+    romanized_lines, readings = romanize.romanize_lines(
+        lines, language, pre_romanized=pre_romanized)
+    for row in romanized_lines:
+        blocks = []
+        for word in row.get("words") or []:
+            result = romanize.romanize_line(
+                str(word.get("text") or ""), language,
+                pre_romanized=pre_romanized)
+            block_text = result.text
+            if replacements:
+                block_lines, _ = _apply_text_replacements(
+                    [{"text": block_text}], replacements)
+                block_text = str(block_lines[0].get("text") or "")
+            if block_text:
+                blocks.append({**word, "romanized": block_text})
+        row["word_sync_blocks"] = blocks
+    replaced_lines, applied = _apply_text_replacements(
+        romanized_lines, replacements)
+    item["lines"] = replaced_lines
+    item["tokens"] = reference.flatten_tokens(replaced_lines, "en")
+    item["romanized_readings"] = readings
+    item["replacements_applied"] = applied
+    item["romanization"] = {
+        "language": language,
+        "pre_romanized": pre_romanized,
+        "method": ("pre-romanized"
+                   if pre_romanized else
+                   "korean-academic" if language == "ko"
+                   else "japanese-fugashi"),
+        "replacements": applied,
+    }
+
+
+def _romanize_asr_lines(lines: list[dict[str, Any]], language: str
+                        ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    romanized_lines, readings = romanize.romanize_lines(lines, language)
+    for line in romanized_lines:
+        words = []
+        for word in line.get("words") or []:
+            result = romanize.romanize_line(
+                str(word.get("text") or ""), language)
+            words.append({**word, "text": result.text})
+        line["words"] = words
+    return romanized_lines, readings
+
+
+def _script_gate_blocks_publication(language: str,
+                                    gate: dict[str, Any]) -> bool:
+    """A JA/KO song is not written when display text still leaks script."""
+    return language in ("ja", "ko") and not bool(gate.get("passed"))
+
+
+def _script_gate(cues: list[dict[str, Any]], language: str) -> dict[str, Any]:
+    """Hard gate: display text and word text must contain no native script."""
+    leaks = []
+    for index, cue in enumerate(cues, 1):
+        if cue.get("instrumental"):
+            continue
+        text = str(cue.get("text") or "")
+        word_text = " ".join(
+            str(word.get("text") or "") for word in cue.get("words") or [])
+        combined = f"{text} {word_text}"
+        if language == "ja":
+            leak = textnorm.has_kana(combined) or textnorm.has_kanji(combined)
+        elif language == "ko":
+            leak = textnorm.has_hangul(combined)
+        else:
+            leak = False
+        if leak:
+            leaks.append({
+                "line": index,
+                "text": text,
+                "words": word_text,
+            })
+    return {"passed": not leaks, "language": language, "leaks": leaks}
+
+
+def _prepare_alignment_candidates(records: list[dict[str, Any]], language: str,
+                                  duration: float, audio_data, client,
+                                  replacements: dict[str, str] | None = None
+                                  ) -> list[dict[str, Any]]:
+    prepared = []
+    for record in records:
+        try:
+            forms = reference.record_forms(record)
+            item = reference.score_record(
+                record, forms, language, duration, audio_data, local=None)
+        except Exception as exc:
+            log.warning("  candidate parse failed for %s: %s",
+                        record.get("id"), exc)
+            continue
+        if item["duration_error"] > reference.LRCLIB_DURATION_TOLERANCE:
+            continue
+        if item["record"].get("instrumental"):
+            continue
+        if float(item.get("compatibility") or 0.0) < 0.5:
+            continue
+        prepared.append(item)
+
+    prepared.sort(key=lambda item: item["score"], reverse=True)
+    full = []
+    for item in prepared:
+        record_id = item["record"].get("id")
+        if record_id is not None:
+            try:
+                full_record = client.fetch_by_id(int(record_id))
+            except Exception as exc:
+                log.warning("  LRCLIB by-id fetch failed for %s: %s",
+                            record_id, exc)
+                full_record = None
+            if full_record:
+                forms = reference.record_forms(full_record)
+                rescored = reference.score_record(
+                    full_record, forms, language, duration, audio_data,
+                    local=None)
+                if rescored["duration_error"] <= reference.LRCLIB_DURATION_TOLERANCE:
+                    item = rescored
+        if language in ("ja", "ko"):
+            _romanize_candidate(item, language, replacements)
+        full.append(item)
+    return full
+
+
+def _alignment_choice_key(summary: dict[str, Any]) -> tuple:
+    """Prefer the pass that leaves the most lines above the word threshold."""
+    return (
+        float(summary.get("line_coverage") or 0.0),
+        float(summary.get("word_coverage") or 0.0),
+        float(summary.get("mean_score") or -999.0),
+    )
+
+
+def _local_word_onset(audio_data, start: float, end: float):
+    times, values = audio.window_rms(
+        audio_data, max(0.0, start - 0.75), min(end + 0.05, start + 0.25),
+        window=0.05, hop=0.025)
+    if not len(values):
+        return None
+    peak = float(values.max())
+    threshold = max(audio.ONSET_RMS, 0.2 * peak)
+    active = [bool(value >= threshold) for value in values]
+    transition = None
+    for index in range(1, len(active)):
+        if (not active[index - 1] and active[index]
+                and times[index] <= start + 0.10):
+            transition = float(times[index])
+    return transition
+
+
+def _timing_agreement(built: list[dict[str, Any]], audio_data,
+                      max_words: int = 300) -> dict[str, Any]:
+    if audio_data is None:
+        return {"n": 0, "within_0_2": 0.0, "p90_abs": 9.99,
+                "median": 0.0}
+    word_intervals = []
+    for cue in built:
+        if cue.get("instrumental"):
+            continue
+        for word in cue.get("words") or []:
+            word_intervals.append((float(word["start"]), float(word["end"])))
+    if not word_intervals:
+        return {"n": 0, "within_0_2": 0.0, "p90_abs": 9.99,
+                "median": 0.0}
+    if len(word_intervals) > max_words:
+        step = len(word_intervals) / float(max_words)
+        word_intervals = [word_intervals[int(index * step)]
+                          for index in range(max_words)]
+    diffs = []
+    for start, end in word_intervals:
+        onset = _local_word_onset(audio_data, start, end)
+        if onset is not None:
+            diffs.append(start - onset)
+    if not diffs:
+        return {"n": 0, "within_0_2": 0.0, "p90_abs": 9.99,
+                "median": 0.0}
+    abs_values = sorted(abs(value) for value in diffs)
+    p90 = abs_values[min(len(abs_values) - 1, round(0.9 * (len(abs_values) - 1)))]
+    diffs.sort()
+    median = diffs[len(diffs) // 2]
+    return {
+        "n": len(diffs),
+        "within_0_2": round(
+            sum(1 for value in diffs if abs(value) <= 0.2) / len(diffs), 4),
+        "p90_abs": round(p90, 3),
+        "median": round(median, 3),
+    }
+
+
+def _built_quality(built: list[dict[str, Any]], audio_data,
+                   total_tokens: int, max_words: int = 60
+                   ) -> dict[str, Any]:
+    lyric_lines = sum(1 for cue in built if not cue.get("instrumental"))
+    line_level = sum(1 for cue in built
+                     if not cue.get("instrumental") and not cue.get("words"))
+    words = sum(len(cue.get("words") or []) for cue in built)
+    agreement = _timing_agreement(built, audio_data, max_words=max_words)
+    coverage = words / total_tokens if total_tokens else 0.0
+    line_level_rate = line_level / lyric_lines if lyric_lines else 0.0
+    first_start = None
+    for cue in built:
+        if cue.get("instrumental") or not cue.get("words"):
+            continue
+        first_start = float(cue["words"][0]["start"])
+        break
+    first_rms = None
+    if first_start is not None and audio_data is not None:
+        first_rms = audio.max_window_rms(
+            audio_data, max(0.0, first_start - 0.2), first_start + 0.5)
+    silent_first = (first_rms is not None
+                    and first_rms < audio.ONSET_RMS)
+    score = (coverage - line_level_rate
+             + agreement["within_0_2"] - agreement["p90_abs"] * 0.5
+             - (0.75 if silent_first else 0.0))
+    return {
+        "lyric_lines": lyric_lines,
+        "line_level_lines": line_level,
+        "line_level_rate": round(line_level_rate, 4),
+        "coverage": round(coverage, 4),
+        "agreement": agreement,
+        "first_word_rms": (round(first_rms, 5)
+                           if first_rms is not None else None),
+        "silent_first_word": silent_first,
+        "score": round(score, 4),
+    }
+
+
+def _align_candidates(candidates: list[dict[str, Any]], language: str,
+                      audio_data, session: align.AlignSession,
+                      duration: float
+                      ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    emissions, stride = session.prepare_emissions(audio_data)
+    emissions_seconds = session.seconds
+    total_align_seconds = 0.0
+    for item in candidates:
+        known_jako = language in ("ja", "ko")
+        duration_error = float(item.get("duration_error") or 0.0)
+        windowed = duration_error > 1.5
+        result = session.align_candidate(
+            emissions, stride, item["lines"], item["tokens"], language,
+            windowed=windowed,
+            window_mode="line",
+            star_frequency="edges" if windowed else "line",
+            audio_data=audio_data, snap_repeated=True,
+            time_shift=_alignment_time_shift(language))
+        if known_jako:
+            base_key = _alignment_choice_key(result.summary)
+            if base_key[0] < 0.98 or base_key[1] < 0.98:
+                refined = session.align_candidate(
+                    emissions, stride, item["lines"], item["tokens"], language,
+                    windowed=True, window_mode="line", star_frequency="edges",
+                    audio_data=audio_data, snap_repeated=True,
+                    merge_passes=True, retry_low_coverage=True,
+                    start_pad=align.LINE_WINDOW_START_PAD,
+                    end_pad=align.LINE_WINDOW_END_PAD,
+                    time_shift=_alignment_time_shift(language))
+                if (_alignment_choice_key(refined.summary)
+                        > base_key):
+                    result = refined
+        allow_edges = known_jako
+        built = cues.build_aligned_lines(
+            item, result.lines, duration, audio_data, language,
+            allow_edge_inference=allow_edges)
+        forced_quality = _built_quality(
+            built, audio_data, len(item["tokens"]))
+        item["forced_built"] = built
+        item["forced_quality"] = forced_quality
+        item["build_quality"] = forced_quality
+        item["word_sync"] = None
+        if any(line.get("word_sync_blocks") for line in item["lines"]):
+            word_alignments = cues.build_word_sync_lines(
+                item, duration, language)
+            word_built = cues.build_aligned_lines(
+                item, word_alignments, duration, audio_data, language,
+                allow_edge_inference=known_jako)
+            for cue in word_built:
+                if not cue.get("instrumental") and cue.get("words"):
+                    cue["timing_source"] = "lrclib-word-sync"
+            item["word_sync"] = {
+                "line_alignment": word_alignments,
+                "built": word_built,
+                "quality": _built_quality(
+                    word_built, audio_data, len(item["tokens"])),
+            }
+        item["alignment"] = result.summary
+        item["line_alignment"] = result.lines
+        total_align_seconds += float(result.summary.get("seconds") or 0.0)
+    candidates.sort(key=align.candidate_rank_key, reverse=True)
+    word_sync_info = {"evaluated": 0, "won": False}
+    word_candidates = [item for item in candidates
+                       if item.get("word_sync")]
+    if word_candidates:
+        word_best = max(
+            word_candidates,
+            key=lambda item: item["word_sync"]["quality"]["score"])
+        forced_best = candidates[0]
+        forced_quality = forced_best.get("forced_quality") or {}
+        word_quality = word_best["word_sync"]["quality"]
+        word_sync_info.update({
+            "evaluated": len(word_candidates),
+            "candidate": (word_best.get("record") or {}).get("id"),
+            "forced_score": forced_quality.get("score"),
+            "word_sync_score": word_quality.get("score"),
+            "forced_agreement": forced_quality.get("agreement"),
+            "word_sync_agreement": word_quality.get("agreement"),
+        })
+        if (word_quality["score"]
+                > float(forced_quality.get("score") or -999.0) + 0.02):
+            candidates.remove(word_best)
+            candidates.insert(0, word_best)
+            word_best["chosen_tier"] = "word-sync"
+            word_sync_info["won"] = True
+        else:
+            forced_best["chosen_tier"] = "forced-alignment"
+    if candidates and not candidates[0].get("chosen_tier"):
+        candidates[0]["chosen_tier"] = "forced-alignment"
+    info = {
+        "model": session.model_name,
+        "device": session.device,
+        "dtype": str(session.dtype),
+        "load_seconds": round(session.load_seconds, 2),
+        "emissions_seconds": round(emissions_seconds, 2),
+        "candidate_seconds": round(total_align_seconds, 2),
+        "candidates_aligned": len(candidates),
+        "word_sync": word_sync_info,
+    }
+    return candidates, info
+
+
+def _alignment_lines_summary(line_alignments: list[dict[str, Any]]
+                             ) -> list[dict[str, Any]]:
+    return [{
+        "reference_line": int(line.get("index", index)) + 1,
+        "coverage": round(float(line.get("coverage") or 0.0), 4),
+        "aligned_words": int(line.get("aligned_words") or 0),
+        "total_words": int(line.get("total_words") or 0),
+        "mean_score": line.get("mean_score"),
+        "min_score": line.get("min_score"),
+    } for index, line in enumerate(line_alignments)]
+
+
+def _timing_source_summary(final_cues: list[dict[str, Any]]) -> dict[str, Any]:
+    counts: dict[str, int] = {}
+    asr_fallback_lines = []
+    line_level_lines = []
+    for index, cue in enumerate(final_cues, 1):
+        source = str(cue.get("timing_source") or "none")
+        counts[source] = counts.get(source, 0) + 1
+        if source == "asr" and not cue.get("instrumental"):
+            if cue.get("line_fallback_reason"):
+                asr_fallback_lines.append(index)
+        if (not cue.get("instrumental") and not cue.get("words")):
+            line_level_lines.append(index)
+    return {
+        "counts": counts,
+        "asr_fallback_lines": asr_fallback_lines,
+        "line_level_lines": line_level_lines,
+    }
+
+
+def _clean_asr_lines(asr_lines: list[dict[str, Any]],
+                     line_alignments: list[dict[str, Any]],
+                     audio_data, duration: float, language: str,
+                     threshold: float) -> tuple[list[dict[str, Any]],
+                                                list[dict[str, Any]]]:
+    """Remove ASR words with no vocal energy or low aligner confidence."""
+    first_strong = None
+    if audio_data is not None:
+        first_strong = audio.vocal_onset(
+            audio_data, 0.0, duration, threshold=audio.STRONG_ONSET_RMS)
+    cleaned = []
+    dropped = []
+    for line_index, line in enumerate(asr_lines):
+        alignment = (line_alignments[line_index]
+                     if line_index < len(line_alignments) else {})
+        by_token = {
+            int(word.token): word for word in alignment.get("words") or []
+            if getattr(word, "token", None) is not None
+        }
         kept = []
-        for word in segment.get("words", []):
-            rms = _max_window_rms(audio, sample_rate,
-                                  float(word.get("start", 0.0)),
-                                  float(word.get("end", 0.0)))
-            if rms < SILENCE_RMS:
-                dropped += 1
+        for token_index, word in enumerate(line.get("words") or []):
+            start = float(word.get("start", 0.0))
+            end = float(word.get("end", start + 0.15))
+            timing = by_token.get(token_index)
+            rms = (audio.max_window_rms(audio_data, start, end)
+                   if audio_data is not None else 0.0)
+            reason = None
+            if timing is not None and timing.score < threshold:
+                reason = (f"aligner score {timing.score:.3f} "
+                          f"< {threshold:.2f}")
+            elif audio_data is not None and rms < audio.ONSET_RMS:
+                reason = f"no vocal energy (rms {rms:.5f})"
+            elif (audio_data is not None and first_strong is not None
+                  and end <= first_strong + 0.05
+                  and rms < audio.STRONG_ONSET_RMS):
+                reason = f"before first vocal onset ({first_strong:.2f}s)"
+            if reason:
+                dropped.append({
+                    "line": line_index + 1,
+                    "text": str(word.get("text") or "").strip(),
+                    "start": round(start, 3),
+                    "end": round(end, 3),
+                    "score": (round(timing.score, 4)
+                              if timing is not None else None),
+                    "reason": reason,
+                })
                 continue
             kept.append(word)
         if not kept:
             continue
-        segment["words"] = kept
-        segment["start"] = kept[0]["start"]
-        segment["end"] = kept[-1]["end"]
-        segment["text"] = " ".join(word.get("word", "") for word in kept).strip()
-        segments.append(segment)
-    transcript["segments"] = segments
-    if dropped:
-        log.info("  removed %d hallucinated word(s) from silence", dropped)
-    return transcript
-
-
-def strip_hallucinations(transcript: dict) -> dict:
-    """Remove boilerplate Whisper invents at the end of video-sourced audio."""
-    removed = 0
-    segments = []
-    for segment in transcript.get("segments", []):
-        words = list(segment.get("words", []))
-        norms = [norm_token(word.get("word", "")) for word in words]
-        for phrase in HALLUCINATION_PHRASES:
-            parts = [norm_token(part) for part in phrase.split()]
-            if len(norms) < len(parts) or norms[-len(parts):] != parts:
-                continue
-            removed += len(parts)
-            words = words[:-len(parts)]
-            norms = norms[:-len(parts)]
-            break
-        if not words:
+        text = textnorm.clean_text(
+            " ".join(str(word.get("text") or "") for word in kept),
+            language=language)
+        if not text:
             continue
-        segment["words"] = words
-        segment["start"] = words[0]["start"]
-        segment["end"] = words[-1]["end"]
-        segment["text"] = " ".join(word.get("word", "") for word in words).strip()
-        segments.append(segment)
-    transcript["segments"] = segments
-    if removed:
-        log.info("  removed %d word(s) from a Whisper boilerplate phrase", removed)
-    return transcript
+        row = dict(line)
+        row["start"] = round(float(kept[0]["start"]), 3)
+        row["end"] = round(min(duration, float(kept[-1]["end"]) + 0.35), 3)
+        row["text"] = text
+        row["words"] = kept
+        cleaned.append(row)
+    return cleaned, dropped
 
-
-def local_words(transcript: dict) -> list[dict]:
-    words = []
-    for segment in transcript.get("segments", []):
-        for word in segment.get("words", []):
-            text = (word.get("word") or "").strip()
-            norm = norm_token(text)
-            if not norm:
-                continue
-            start = float(word.get("start", 0.0))
-            end = float(word.get("end", start + 0.15))
-            if end <= start:
-                end = start + 0.15
-            # Chunk boundaries and repeated choruses can make Whisper emit the
-            # same word twice at the exact same time. One copy is enough.
-            if words and abs(start - words[-1]["start"]) < 0.001 \
-                    and abs(end - words[-1]["end"]) < 0.001:
-                continue
-            words.append({"text": text, "norm": norm, "start": start, "end": end})
-    return words
-
-
-def flat_lrc_tokens(lines: list[dict]) -> list[dict]:
-    tokens = []
-    for line_index, line in enumerate(lines):
-        for token_index, token in enumerate(split_display_tokens(line["text"])):
-            tokens.append({
-                "text": token["text"],
-                "norm": token["norm"],
-                "line": line_index,
-                "token": token_index,
-                "line_start": line["start"],
-            })
-    return tokens
-
-
-VERSION_PENALTIES = {
-    "karaoke": 6.0,
-    "instrumental": 6.0,
-    "cover": 3.0,
-    "acoustic": 1.2,
-    "live": 1.2,
-    "remix": 1.2,
-    "demo": 1.2,
-}
-
-
-def version_penalty(candidate: dict, duration: float) -> float:
-    """Penalise alternate versions so the studio recording wins when possible."""
-    haystack = " ".join(
-        str(candidate.get(key) or "")
-        for key in ("trackName", "albumName", "artistName")
-    ).lower()
-    penalty = sum(weight for word, weight in VERSION_PENALTIES.items()
-                  if re.search(rf"\b{re.escape(word)}\b", haystack))
-    candidate_duration = candidate.get("duration")
-    if candidate_duration and duration > 0:
-        penalty += min(2.0, abs(float(candidate_duration) - duration) / 10.0)
-    return penalty
-
-
-def choose_reference(local: list[dict], candidates: list[dict],
-                     duration: float = 0.0) -> dict | None:
-    """Pick the LRCLIB version whose words best match the local transcript."""
-    best = None
-    for candidate in candidates:
-        lines = parse_lrc(candidate.get("syncedLyrics") or "")
-        if not lines:
-            continue
-        tokens = flat_lrc_tokens(lines)
-        if not tokens:
-            continue
-        matcher = difflib.SequenceMatcher(
-            None, [word["norm"] for word in local], [token["norm"] for token in tokens],
-            autojunk=False)
-        blocks = [block for block in matcher.get_matching_blocks() if block.size]
-        matched = sum(block.size for block in blocks)
-        if not matched:
-            continue
-        token_local = {}
-        for block in blocks:
-            for offset in range(block.size):
-                token_local[block.b + offset] = block.a + offset
-
-        anchors, anchor_stats = robust_line_anchors(lines, tokens, token_local, local)
-        if not anchors:
-            continue
-        offset = anchor_stats["median_offset"]
-        coverage = matched / len(tokens)
-        local_coverage = matched / len(local) if local else 0.0
-        penalty = version_penalty(candidate, duration)
-        score = 8 * coverage + 4 * local_coverage - 0.05 * abs(offset) - penalty
-        record = {
-            "score": score,
-            "coverage": coverage,
-            "local_coverage": local_coverage,
-            "offset": offset,
-            "anchor_mad": anchor_stats["mad"],
-            "anchor_tolerance": anchor_stats["tolerance"],
-            "penalty": penalty,
-            "lines": lines,
-            "tokens": tokens,
-            "token_local": token_local,
-            "anchors": anchors,
-            "candidate": candidate,
-        }
-        if best is None or record["score"] > best["score"]:
-            best = record
-    return best
-
-
-def robust_line_anchors(lines: list[dict], tokens: list[dict],
-                        token_local: dict[int, int], local: list[dict]) -> tuple[dict[int, float], dict]:
-    """Keep only line anchors that agree with the song's overall offset.
-
-    LRCLIB text often repeats choruses, and Whisper can match a later repetition
-    to an earlier occurrence in the reference. Those mismatches produce anchor
-    offsets tens of seconds away from the rest; a median/MAD filter removes them.
-    """
-    starts_by_line: dict[int, list[float]] = {}
-    first_token: dict[int, int] = {}
-    for token_index, token in enumerate(tokens):
-        first_token.setdefault(token["line"], token_index)
-    for token_index, local_index in token_local.items():
-        line_index = tokens[token_index]["line"]
-        # Only the line's first word is a reliable line-start anchor. If
-        # Whisper missed the opening word (common with held notes or backing
-        # vocals), the next word can be seconds later.
-        if token_index != first_token[line_index]:
-            continue
-        starts_by_line.setdefault(line_index, []).append(local[local_index]["start"])
-    if not starts_by_line:
-        return {}, {}
-
-    offsets = sorted(min(starts) - lines[line_index]["start"]
-                     for line_index, starts in starts_by_line.items())
-    median = offsets[len(offsets) // 2]
-    mad = sorted(abs(offset - median) for offset in offsets)[len(offsets) // 2]
-    tolerance = max(1.25, min(3.0, 5.0 * mad))
-
-    anchors = {}
-    for line_index, starts in starts_by_line.items():
-        start = min(starts)
-        if abs(start - lines[line_index]["start"] - median) <= tolerance:
-            anchors[line_index] = start
-
-    # Anchors must move forward with the reference timestamps.
-    monotonic = {}
-    last_start = None
-    for line_index in sorted(anchors):
-        if last_start is not None and anchors[line_index] <= last_start:
-            continue
-        monotonic[line_index] = anchors[line_index]
-        last_start = anchors[line_index]
-
-    return monotonic, {"median_offset": median, "mad": mad, "tolerance": tolerance}
-
-
-def mapped_line_windows(lines: list[dict], anchors: dict[int, float],
-                        duration: float, offset: float = 0.0) -> list[tuple[float, float]]:
-    """Map every LRC line start to local time and return (start, end) windows."""
-    starts = [max(0.0, map_lrc_time(anchors, lines, line["start"], offset))
-              for line in lines]
-    windows = []
-    for index, start in enumerate(starts):
-        end = starts[index + 1] if index + 1 < len(starts) else duration
-        if end <= start:
-            end = start + 0.5
-        windows.append((start, end))
-    return windows
-
-
-def align_reference_words(reference: dict, local: list[dict], duration: float,
-                          iterations: int = 2) -> None:
-    """Re-align reference tokens using local time windows instead of global order.
-
-    Repeated chorus lines are common, so a single global diff can tie a local
-    chorus to the wrong repetition. After a robust first mapping, each line is
-    matched only against words near that line's mapped time; iterating tightens
-    the anchors for lines whose word timings were initially unreliable.
-    """
-    lines = reference["lines"]
-    tokens = reference["tokens"]
-    anchors = reference["anchors"]
-    tokens_by_line: dict[int, list[int]] = {}
-    for token_index, token in enumerate(tokens):
-        tokens_by_line.setdefault(token["line"], []).append(token_index)
-
-    token_local: dict[int, int] = {}
-    for _ in range(max(1, iterations)):
-        offset = reference.get("offset", 0.0)
-        windows = mapped_line_windows(lines, anchors, duration, offset)
-        new_token_local: dict[int, int] = {}
-        # Keep anchors that were already trusted; tighten them where this
-        # iteration found a stronger text match.
-        new_anchors: dict[int, float] = dict(anchors)
-        # Each local word belongs to at most one reference line. Without this,
-        # a duplicated LRC line can steal the previous line's words and produce
-        # a squeezed duplicate cue.
-        claimed: set[int] = set()
-        for line_index, token_indices in tokens_by_line.items():
-            start, end = windows[line_index]
-            candidates = [
-                (local_index, word)
-                for local_index, word in enumerate(local)
-                if local_index not in claimed
-                and start - 1.5 <= word["start"] <= end + 1.5
-            ]
-            if not candidates:
-                continue
-            matcher = difflib.SequenceMatcher(
-                None,
-                [tokens[index]["norm"] for index in token_indices],
-                [word["norm"] for _, word in candidates],
-                autojunk=False,
-            )
-            matched: dict[int, int] = {}
-            for block in matcher.get_matching_blocks():
-                for token_offset in range(block.size):
-                    matched[block.a + token_offset] = candidates[block.b + token_offset][0]
-            if not matched:
-                continue
-            # A misheard final word (love -> life) breaks the exact diff and
-            # would otherwise drop the last word of the cue. Recover a short
-            # trailing run when the unused local word sounds close enough and
-            # sits immediately after the last match.
-            last_offset = max(matched)
-            if last_offset < len(token_indices) - 1:
-                used = set(matched.values())
-                last_end = local[matched[last_offset]]["end"]
-                spare = [
-                    (local_index, word)
-                    for local_index, word in candidates
-                    if local_index not in used
-                    and word["start"] >= last_end - 0.05
-                    and word["start"] <= last_end + 1.2
-                ]
-                for token_offset, (local_index, word) in zip(
-                        range(last_offset + 1, len(token_indices)), spare):
-                    if tokens_similar(tokens[token_indices[token_offset]]["norm"],
-                                      word["norm"]):
-                        matched[token_offset] = local_index
-                        last_end = word["end"]
-                    else:
-                        break
-            ratio = len(matched) / len(token_indices)
-            longest = max((block.size for block in matcher.get_matching_blocks()),
-                          default=0)
-            # A line whose second half was lost by Whisper can still have a
-            # trustworthy run of two or more consecutive words in the middle.
-            # Keep those; a couple of scattered matches are not enough.
-            if ratio < 0.34 and len(token_indices) > 3 and longest < 2:
-                continue
-            for token_offset, local_index in matched.items():
-                new_token_local[token_indices[token_offset]] = local_index
-                claimed.add(local_index)
-
-            # Use the first matched word as the line anchor when enough of
-            # the line matched. A reference timestamp can be several seconds
-            # off (an extra repeated chorus or a displaced line); the audio
-            # match is more trustworthy than the LRC clock.
-            first_offset = min(matched)
-            first_start = local[matched[first_offset]]["start"]
-            if first_offset <= 1 and ratio >= 0.5:
-                # If the line's first word was dropped as silent, step back a
-                # little so it still gets a slice at the start of the cue.
-                new_anchors[line_index] = max(0.0, first_start - 0.35 * first_offset)
-            elif ratio >= 0.75:
-                new_anchors[line_index] = max(0.0, first_start - 0.35 * min(first_offset, 2))
-
-        if not new_anchors:
-            break
-        monotonic = {}
-        last_start = None
-        for line_index in sorted(new_anchors):
-            if last_start is not None and new_anchors[line_index] <= last_start:
-                continue
-            monotonic[line_index] = new_anchors[line_index]
-            last_start = new_anchors[line_index]
-        anchors = monotonic
-        token_local = new_token_local
-
-    reference["anchors"] = anchors
-    reference["token_local"] = token_local
-    offsets = sorted(anchors[index] - lines[index]["start"] for index in anchors)
-    if offsets:
-        reference["offset"] = offsets[len(offsets) // 2]
-
-
-def drop_duplicate_unmatched_lines(reference: dict) -> None:
-    """Remove a repeated LRC line that has no audio match of its own.
-
-    LRCLIB sometimes lists the same line twice while Whisper merges both
-    repetitions into one phrase. Keeping the second line creates a squeezed
-    duplicate cue that highlights the first line's words again.
-    """
-    lines = reference["lines"]
-    tokens = reference["tokens"]
-    token_local = reference.get("token_local", {})
-    tokens_by_line: dict[int, list[int]] = {index: [] for index in range(len(lines))}
-    for token_index, token in enumerate(tokens):
-        tokens_by_line[token["line"]].append(token_index)
-
-    def line_norm(text: str) -> str:
-        return " ".join(token["norm"] for token in split_display_tokens(text))
-
-    skip: set[int] = set()
-    for line_index in range(1, len(lines)):
-        if line_norm(lines[line_index]["text"]) != line_norm(lines[line_index - 1]["text"]):
-            continue
-        if any(index in token_local for index in tokens_by_line[line_index]):
-            continue
-        skip.add(line_index)
-    if not skip:
-        return
-
-    line_map: dict[int, int] = {}
-    new_lines = []
-    for line_index, line in enumerate(lines):
-        if line_index in skip:
-            continue
-        line_map[line_index] = len(new_lines)
-        new_lines.append(line)
-
-    token_map: dict[int, int] = {}
-    new_tokens = []
-    for token_index, token in enumerate(tokens):
-        if token["line"] in skip:
-            continue
-        token_map[token_index] = len(new_tokens)
-        token = dict(token)
-        token["line"] = line_map[token["line"]]
-        new_tokens.append(token)
-
-    reference["lines"] = new_lines
-    reference["tokens"] = new_tokens
-    reference["anchors"] = {
-        line_map[line_index]: value
-        for line_index, value in reference.get("anchors", {}).items()
-        if line_index in line_map
-    }
-    reference["token_local"] = {
-        token_map[token_index]: local_index
-        for token_index, local_index in token_local.items()
-        if token_index in token_map
-    }
-
-
-# ---------------------------------------------------------------------------
-# Stage 4: build cues and word timings
-# ---------------------------------------------------------------------------
-
-def tokens_similar(left: str, right: str) -> bool:
-    """True when two short words are one typo apart (e.g. love/life).
-
-    Whisper occasionally mishears a word while keeping its timing. Only permit
-    this for words long enough that a single-character difference is unlikely
-    to turn one real word into another unrelated one.
-    """
-    if left == right:
-        return True
-    if len(left) < 4 or len(right) < 4 or abs(len(left) - len(right)) > 1:
-        return False
-    if len(left) == len(right):
-        return sum(a != b for a, b in zip(left, right)) <= 1
-    shorter, longer = (left, right) if len(left) < len(right) else (right, left)
-    for index in range(len(longer)):
-        if longer[:index] + longer[index + 1:] == shorter:
-            return True
-    return False
-
-
-def map_lrc_time(anchors: dict[int, float], lines: list[dict], value: float,
-                 default_offset: float = 0.0) -> float:
-    """Map an LRC timestamp to local audio time using matched line anchors."""
-    pairs = sorted((lines[index]["start"], local_start)
-                   for index, local_start in anchors.items())
-    if not pairs:
-        return value + default_offset
-    if value == pairs[0][0]:
-        return pairs[0][1]
-    if value == pairs[-1][0]:
-        return pairs[-1][1]
-    if value < pairs[0][0] or value > pairs[-1][0]:
-        # Outside the anchored range, a single global offset is safer than
-        # extending the slope of the nearest pair.
-        return value + default_offset
-    for (lrc0, local0), (lrc1, local1) in zip(pairs, pairs[1:]):
-        if lrc0 <= value <= lrc1:
-            if lrc1 == lrc0:
-                return local0
-            return local0 + (local1 - local0) * (value - lrc0) / (lrc1 - lrc0)
-    return value + default_offset
-
-
-def distribute_words(tokens: list[dict], start: float, end: float) -> list[dict]:
-    """Give every token a slice of [start, end], weighted by word length."""
-    if not tokens:
-        return []
-    if end <= start:
-        end = start + 0.5
-    weights = [max(1, len(token["norm"])) for token in tokens]
-    total = sum(weights)
-    cursor = start
-    words = []
-    for index, (token, weight) in enumerate(zip(tokens, weights)):
-        share = (end - start) * weight / total
-        word_start = cursor
-        word_end = end if index == len(tokens) - 1 else cursor + share
-        if word_end <= word_start:
-            word_end = word_start + 0.12
-        words.append({"text": token["text"],
-                      "start": round(word_start, 3),
-                      "end": round(word_end, 3)})
-        cursor = word_end
-    return words
-
-
-def interpolate_known(tokens: list[dict], known: dict[int, tuple[float, float]],
-                      start: float, end: float) -> list[dict]:
-    """Use real word timings where available, fill the gaps smoothly."""
-    words = [None] * len(tokens)
-    for index, times in known.items():
-        if not 0 <= index < len(tokens):
-            continue
-        word_start, word_end = times
-        # A word timed after the line has already ended belongs to a later
-        # line (often the next lyric line matched by mistake). Let the gap
-        # filler distribute it instead of clipping it to zero length.
-        if word_start >= end - 0.05 or word_end <= start + 0.05:
-            continue
-        words[index] = {"text": tokens[index]["text"],
-                        "start": max(start, word_start),
-                        "end": min(end, max(word_start + 0.12, word_end))}
-
-    # Fill each run of unknown tokens between two known neighbours.
-    index = 0
-    while index < len(tokens):
-        if words[index] is not None:
-            index += 1
-            continue
-        run_start = index
-        while index < len(tokens) and words[index] is None:
-            index += 1
-        run_end = index
-        gap_start = words[run_start - 1]["end"] if run_start > 0 else start
-        gap_end = words[run_end]["start"] if run_end < len(tokens) else end
-        run = tokens[run_start:run_end]
-        if gap_end <= gap_start:
-            gap_end = gap_start + 0.12 * len(run)
-        filled = distribute_words(run, gap_start, gap_end)
-        words[run_start:run_end] = filled
-
-    # Clamp, enforce order, and keep every word inside the line.
-    previous_end = start
-    result = []
-    for word in words:
-        word_start = max(start, previous_end, word["start"])
-        word_end = min(end, max(word_start + 0.12, word["end"]))
-        result.append({"text": word["text"],
-                       "start": round(word_start, 3),
-                       "end": round(word_end, 3)})
-        previous_end = word_end
-    return result
-
-
-def local_timing_is_reasonable(tokens: list[dict], known: dict[int, tuple[float, float]],
-                               line_start: float, line_end: float) -> bool:
-    if not known:
-        return False
-    coverage = len(known) / len(tokens)
-    if coverage < 0.55:
-        # Whisper can drop the start or end of a line but still time a solid
-        # run in the middle. Trust that run instead of re-distributing every
-        # word evenly across a cue that may be several seconds long.
-        offsets = sorted(known)
-        consecutive = offsets == list(range(offsets[0], offsets[-1] + 1))
-        if coverage < 0.25 or len(offsets) < 2 or not consecutive:
-            return False
-    ordered = sorted(known.items())
-    first_start = ordered[0][1][0]
-    last_end = ordered[-1][1][1]
-    if first_start < line_start - 1.5 or first_start > line_start + 2.0:
-        return False
-    if last_end < line_start + 0.25 * (line_end - line_start):
-        return False
-    previous_end = None
-    for _, (word_start, word_end) in ordered:
-        if word_start < line_start - 1.5 or word_end > line_end + 0.75:
-            return False
-        if word_end - word_start > 5.0:
-            return False
-        if previous_end is not None and word_start - previous_end > 6.0:
-            return False
-        previous_end = word_end
-    return True
-
-
-def build_lyric_lines(reference: dict, duration: float, audio=None) -> list[dict]:
-    lines = reference["lines"]
-    tokens = reference["tokens"]
-    token_local = reference["token_local"]
-    anchors = reference["anchors"]
-
-    tokens_by_line: dict[int, list[int]] = {index: [] for index in range(len(lines))}
-    for token_index, token in enumerate(tokens):
-        tokens_by_line[token["line"]].append(token_index)
-
-    # First pass: decide when each line starts. A known first word is more
-    # accurate than the LRC timestamp, but if it disagrees wildly the reference
-    # wins. Starts are made monotonic so cues can never overlap.
-    line_info = []
-    previous_start = -1.0
-    previous_word_end = 0.0
-    for line_index, line in enumerate(lines):
-        line_tokens = tokens_by_line[line_index]
-        mapped_start = map_lrc_time(anchors, lines, line["start"],
-                                    reference.get("offset", 0.0))
-        next_lrc = lines[line_index + 1]["start"] if line_index + 1 < len(lines) else duration
-        mapped_next = map_lrc_time(anchors, lines, next_lrc,
-                                   reference.get("offset", 0.0))
-        if mapped_next <= mapped_start:
-            mapped_next = mapped_start + 1.0
-
-        known = {}
-        for token_index in line_tokens:
-            if token_index in token_local:
-                local = reference["local"][token_local[token_index]]
-                known[token_index - line_tokens[0]] = (local["start"], local["end"])
-
-        if known and 0 in known and abs(known[0][0] - mapped_start) <= 2.0:
-            line_start = known[0][0]
-        else:
-            line_start = mapped_start
-
-        # If no word matched this line, the LRC timestamp is the only hint and
-        # may be early (or belong to a different edition). The first audible
-        # vocal in the mapped window is a safer start.
-        if audio is not None:
-            onset = vocal_onset(audio, line_start + 0.15,
-                                min(mapped_next, line_start + 4.0))
-            if onset is not None:
-                if not known and onset > line_start + 0.5:
-                    line_start = onset
-                elif known and 0 in known:
-                    first_known = known[0][0]
-                    if first_known > line_start + 1.2 and onset < first_known - 0.05:
-                        line_start = onset
-
-        # A reference timestamp can point at the wrong repeat of a chorus.
-        # When this line is far from the previous one, look just before the
-        # mapped start for a strong vocal onset. Requiring silence at the
-        # search boundary keeps us from stealing the previous phrase's tail.
-        if audio is not None and previous_start >= 0 and line_start - previous_start > 6.0:
-            back_start = max(previous_start + 0.2, line_start - 2.0)
-            back_onset = vocal_onset(audio, back_start, line_start + 0.1,
-                                     threshold=STRONG_ONSET_RMS)
-            if back_onset is not None and back_start + 0.2 <= back_onset < line_start - 0.2:
-                line_start = back_onset
-
-        # The reference sometimes starts the next line while the previous
-        # line's last word is still being sung. Do not cut that word in half;
-        # delay the next cue slightly instead.
-        if previous_word_end and line_start < previous_word_end + 0.05 \
-                and previous_word_end - line_start < 2.0:
-            line_start = previous_word_end + 0.05
-
-        if line_start <= previous_start:
-            line_start = previous_start + 0.12
-        previous_start = line_start
-        line_info.append((line_tokens, mapped_start, mapped_next, known, line_start))
-
-        # Reserve enough room after the last known word for any trailing
-        # tokens that Whisper missed. Otherwise a delayed next cue can clip
-        # the final word even though the reference text includes it.
-        valid = {offset: times for offset, times in known.items()
-                 if 0.0 <= times[1] - times[0] <= 5.0}
-        if valid:
-            last_offset = max(valid)
-            trailing = max(0, len(line_tokens) - 1 - last_offset)
-            previous_word_end = valid[last_offset][1] + 0.12 * trailing
-        else:
-            previous_word_end = 0.0
-
-    built = []
-    for line_index, (line_tokens, mapped_start, mapped_next, known, line_start) in enumerate(line_info):
-        if not line_tokens:
-            continue
-
-        # Keep a single line on screen for a sane amount of time. A long
-        # "Oh-oh" cue over a 30-second instrumental break is not useful, but
-        # a normal six-word line must not be cut off just because its words
-        # are held for a while.
-        token_count = len(line_tokens)
-        if token_count <= 2:
-            max_duration = 8.0
-        elif token_count <= 4:
-            max_duration = 10.0
-        else:
-            max_duration = 14.0
-        # Empty LRC lines are separators, not cues. Keep looking for the next
-        # line that actually has words so the current line can use its full
-        # vocal phrase instead of stopping at an arbitrary separator.
-        next_start = duration
-        for later_tokens, _, _, _, later_start in line_info[line_index + 1:]:
-            if later_tokens:
-                next_start = later_start
-                break
-        line_end = min(next_start - 0.05, line_start + max_duration)
-        if line_end <= line_start:
-            line_end = line_start + 0.8
-
-        valid = {offset: times for offset, times in known.items()
-                 if 0.0 <= times[1] - times[0] <= 5.0}
-        required_end = 0.0
-        trailing = 0
-        if valid:
-            last_offset = max(valid)
-            trailing = max(0, token_count - 1 - last_offset)
-            required_end = valid[last_offset][1] + 0.12 * trailing
-
-        # Do not stretch a line across the instrumental tail that follows it.
-        # End the cue shortly after the singing stops; add_instrumental_cues()
-        # will label the remaining gap.
-        if audio is not None:
-            phrase_end = vocal_phrase_end(audio, line_start, line_end)
-            if phrase_end is not None:
-                line_end = min(line_end, max(line_start + 0.6,
-                                             phrase_end + PHRASE_LINGER))
-
-        # The 2.5s phrase gap can bridge a held note and a following backing
-        # vocal or ad-lib that Whisper never transcribed. For a fully timed
-        # line, split the tail at a shorter silence so the cue ends with its
-        # own phrase. Starting after the final word keeps held notes intact.
-        if valid and trailing == 0 and len(valid) / token_count >= 0.6 and audio is not None:
-            last_end = valid[max(valid)][1]
-            if line_end - last_end > PHRASE_LINGER:
-                tail_end = vocal_phrase_end(audio, last_end + 0.05, line_end,
-                                            phrase_gap=0.8)
-                if tail_end is not None:
-                    line_end = max(required_end,
-                                   min(line_end, tail_end + PHRASE_LINGER))
-
-        # A fully matched line should not keep one word on screen for many
-        # seconds while a separate vocal phrase plays. Only trim the tail when
-        # another local word actually starts in the gap; a long held note has
-        # no new word after it and must keep its full phrase.
-        if valid and trailing == 0 and len(valid) / token_count >= 0.75:
-            last_end = valid[last_offset][1]
-            gap_cutoff = next_start - 1.0 if next_start < duration else duration
-            new_phrase = any(last_end + 0.05 <= word["start"] < gap_cutoff
-                             for word in reference.get("local", []))
-            if new_phrase:
-                line_end = min(line_end, last_end + PHRASE_LINGER)
-
-        # Whisper can drop the tail of a line (especially a quiet final word).
-        # If only the middle of a line matched, do not let the unmatched tail
-        # stretch for many seconds over music that follows.
-        if valid and trailing > 0:
-            last_end = valid[last_offset][1]
-            if line_end - last_end > 3.0:
-                line_end = min(line_end,
-                               last_end + max(1.2, 0.55 * trailing) + PHRASE_LINGER)
-        line_end = max(line_end, required_end)
-
-        line_tokens_list = [tokens[index] for index in line_tokens]
-        if local_timing_is_reasonable(line_tokens_list, known, line_start, line_end):
-            words = interpolate_known(line_tokens_list, known, line_start, line_end)
-        else:
-            words = distribute_words(line_tokens_list, line_start, line_end)
-
-        # Remove zero-length/overlapping edge cases introduced by clamping.
-        words = [word for word in words if word["text"] and word["end"] > word["start"]]
-        if not words:
-            continue
-        words[0]["start"] = round(max(0.0, line_start), 3)
-        words[-1]["end"] = round(min(line_end, max(words[-1]["start"] + 0.12, words[-1]["end"])), 3)
-
-        built.append({
-            "start": words[0]["start"],
-            "end": line_end,
-            "text": lines[line_index]["text"],
-            "words": words,
-            "instrumental": False,
-        })
-    return built
-
-
-def add_instrumental_cues(lines: list[dict], duration: float, audio=None) -> list[dict]:
-    cues = [dict(line) for line in lines]
-    cues.sort(key=lambda cue: cue["start"])
-
-    def make_gap(gap_start: float, gap_end: float):
-        if gap_end - gap_start <= 0.8:
-            return None
-        if audio is not None and gap_end - gap_start < 4.5:
-            _, values = _window_rms(audio, 16000, gap_start, gap_end)
-            if len(values) and float(values.max()) >= 0.12:
-                # A held note or ad-lib, not a real instrument-only break.
-                return None
-        return {
-            "start": round(gap_start, 3),
-            "end": round(gap_end, 3),
-            "text": "[Instrumental]",
-            "words": [],
-            "instrumental": True,
-        }
-
-    with_gaps = []
-    previous_end = 0.0
-    for cue in cues:
-        if cue["start"] - previous_end > INSTRUMENTAL_GAP:
-            gap = make_gap(previous_end + (0.2 if with_gaps else 0.4),
-                           cue["start"] - 0.2)
-            if gap:
-                with_gaps.append(gap)
-        with_gaps.append(cue)
-        previous_end = max(previous_end, cue["end"])
-
-    if duration - previous_end > INSTRUMENTAL_GAP:
-        gap = make_gap(previous_end + 0.2, duration - 0.8)
-        if gap:
-            with_gaps.append(gap)
-
-    # Make the timeline strictly ordered and non-overlapping. When a lyric
-    # line is pushed later because the previous line is still on screen, its
-    # word timings have to move too. Re-time them sequentially rather than
-    # pinning every stale word to the new cue start (which would make them
-    # overlap each other).
-    ordered = []
-    previous_end = -1.0
-    for cue in sorted(with_gaps, key=lambda item: item["start"]):
-        if cue["start"] <= previous_end:
-            cue["start"] = previous_end + 0.01
-        if cue["end"] <= cue["start"]:
-            cue["end"] = cue["start"] + 0.5
-
-        words = cue.get("words", [])
-        cursor = cue["start"]
-        for index, word in enumerate(words):
-            remaining = len(words) - index - 1
-            latest_start = max(cursor, cue["end"] - 0.12 * (remaining + 1))
-            word_start = max(cursor, min(word["start"], latest_start))
-            word_end = min(cue["end"], max(word_start + 0.12, word["end"]))
-            if word_end < word_start + 0.12:
-                # Not enough room for this word; extend the cue so the
-                # validator and the player still get a visible highlight.
-                cue["end"] = word_start + 0.12 * (remaining + 1)
-                word_end = word_start + 0.12
-            word["start"] = round(word_start, 3)
-            word["end"] = round(word_end, 3)
-            cursor = word_end
-
-        ordered.append(cue)
-        previous_end = cue["end"]
-    return ordered
-
-
-# ---------------------------------------------------------------------------
-# Offline fallback: split local transcript segments into readable lines
-# ---------------------------------------------------------------------------
-
-def build_from_transcript(transcript: dict, duration: float) -> list[dict]:
-    lines = []
-    for segment in transcript.get("segments", []):
-        words = []
-        for word in segment.get("words", []):
-            text = (word.get("word") or "").strip()
-            if not norm_token(text):
-                continue
-            start = float(word.get("start", 0.0))
-            end = float(word.get("end", start + 0.15))
-            words.append({"text": text, "start": start, "end": max(start + 0.12, end)})
-        if not words:
-            continue
-
-        chunk = []
-        chunk_start = words[0]["start"]
-        for index, word in enumerate(words):
-            chunk.append(word)
-            is_last = index == len(words) - 1
-            next_word = None if is_last else words[index + 1]
-            pause = 0.0 if next_word is None else next_word["start"] - word["end"]
-            ended_sentence = bool(re.search(r"[.!?][\"')\]]?$", word["text"]))
-            long_chunk = word["end"] - chunk_start >= 7.0 or len(chunk) >= 10
-            if is_last or ended_sentence or long_chunk or pause >= 0.8:
-                for item in chunk:
-                    item["text"] = clean_text(item["text"], capitalize=False)
-                if chunk and chunk[0]["text"]:
-                    chunk[0]["text"] = chunk[0]["text"][0].upper() + chunk[0]["text"][1:]
-                text = " ".join(item["text"] for item in chunk)
-                text = clean_text(text)
-                end = min(duration, chunk[-1]["end"] + 0.35)
-                lines.append({"start": round(chunk_start, 3), "end": round(end, 3),
-                              "text": text, "words": chunk, "instrumental": False})
-                chunk = []
-                if next_word is not None:
-                    chunk_start = next_word["start"]
-    return lines
-
-
-# ---------------------------------------------------------------------------
-# Writing
-# ---------------------------------------------------------------------------
-
-def write_outputs(stem: str, cues: list[dict], duration: float) -> tuple[Path, Path]:
-    LYRICS_DIR.mkdir(parents=True, exist_ok=True)
-    srt_path = LYRICS_DIR / f"{stem}.srt"
-    json_path = LYRICS_DIR / f"{stem}.words.json"
-
-    payload = {
-        "version": 1,
-        "song": stem,
-        "duration": round(duration, 3),
-        "generated_by": "Demucs + faster-whisper large-v3; LRCLIB reference for text correction",
-        "lines": [
-            {
-                "start": round(cue["start"], 3),
-                "end": round(cue["end"], 3),
-                "text": cue["text"],
-                "instrumental": bool(cue.get("instrumental")),
-                "words": [
-                    {"text": word["text"],
-                     "start": round(word["start"], 3),
-                     "end": round(word["end"], 3)}
-                    for word in cue.get("words", [])
-                ],
-            }
-            for cue in cues
-        ],
-    }
-    # Write the sidecar first: the SRT is the "--missing" completion marker,
-    # so a crash between the two writes must not leave an unvalidated SRT.
-    atomic_write_text(json_path, json.dumps(payload, indent=2, ensure_ascii=False))
-
-    blocks = []
-    for index, cue in enumerate(cues, 1):
-        blocks.append(f"{index}\n{srt_time(cue['start'])} --> {srt_time(cue['end'])}\n{cue['text']}\n")
-    atomic_write_text(srt_path, "\n".join(blocks))
-    return srt_path, json_path
-
-
-# ---------------------------------------------------------------------------
-# Per-song orchestration
-# ---------------------------------------------------------------------------
 
 def process_song(stem: str, original: Path, karaoke: Path, cache_dir: Path,
-                 use_online: bool, force: bool) -> None:
-    log.info("")
-    log.info("=== %s ===", stem)
-    duration = duration_of(karaoke)
-    if duration <= 0:
-        raise RuntimeError(f"could not read duration of {karaoke}")
-    log.info("  duration: %.1fs", duration)
+                 *, use_online: bool, force: bool, output_dir: Path,
+                 overwrite_edited: bool, reports_dir: Path,
+                 backups_dir: Path, source_dir: Path,
+                 align_english: bool = False) -> dict[str, Any]:
+    report: dict[str, Any] = {
+        "stem": stem,
+        "status": "running",
+        "stages": {},
+        "errors": [],
+        "started_at": datetime.now(timezone.utc).isoformat(),
+    }
+    song_started = time.perf_counter()
+    try:
+        log.info("")
+        log.info("=== %s ===", stem)
+        duration = audio.duration_of(karaoke)
+        if duration <= 0:
+            raise RuntimeError(f"could not read duration of {karaoke}")
+        log.info("  duration: %.1fs", duration)
+        report["duration"] = round(duration, 3)
 
-    original_duration = duration_of(original)
-    if original_duration <= 0:
-        log.warning("  could not read duration of %s", original.name)
-    elif abs(original_duration - duration) > DURATION_MISMATCH_WARN:
-        log.warning(
-            "  duration mismatch: original %.1fs vs instrumental %.1fs; "
-            "check that the instrumental was made from this original",
-            original_duration, duration,
+        original_duration = audio.duration_of(original)
+        if original_duration <= 0:
+            log.warning("  could not read duration of %s", original.name)
+        elif abs(original_duration - duration) > DURATION_MISMATCH_WARN:
+            log.warning(
+                "  duration mismatch: original %.1fs vs instrumental %.1fs; "
+                "check that the instrumental was made from this original",
+                original_duration, duration)
+
+        title, artist = split_stem(stem)
+        report["title"] = title
+        report["artist"] = artist
+
+        started = time.perf_counter()
+        vocals, stem_info = separate_vocals(stem, original, cache_dir, force)
+        report["stages"]["demucs"] = stem_info
+        report["vocal_stem"] = stem_info["path"]
+        audio_data = audio.load_vocal_audio(vocals)
+        if audio_data is None:
+            report["errors"].append("vocal stem could not be decoded for energy checks")
+        music_path = vocals.with_name("no_vocals.wav")
+        music_data = (audio.load_vocal_audio(music_path)
+                      if music_path.is_file() else None)
+        if music_data is None:
+            report["errors"].append(
+                "instrumental stem could not be decoded for gap classification")
+
+        override = reference.user_override(source_dir, stem)
+        replacements = (override.get("replacements")
+                        if override and isinstance(override.get("replacements"), dict)
+                        else None)
+        if override:
+            log.info("  user override: %s", override.get("path"))
+            report["user_override"] = override.get("path")
+            if replacements:
+                log.info("  text replacements: %d phrase(s)", len(replacements))
+
+        client = reference.LRCLIBClient(cache_dir)
+        lookup = None
+        if not use_online:
+            lookup = reference.LookupResult("disabled", [], error="--no-online")
+        elif override and override.get("lines"):
+            lookup = reference.LookupResult("disabled", [], error="user override")
+        else:
+            started = time.perf_counter()
+            try:
+                lookup = client.lookup(title, artist, duration)
+            except (reference.LRCLIBUnavailable, reference.LRCLIBError) as exc:
+                lookup = reference.LookupResult("unreachable", [], error=str(exc),
+                                                requests=client.requests)
+            report["stages"]["lrclib"] = {
+                "seconds": _seconds(started),
+                "status": lookup.status,
+                "cached": lookup.cached,
+                "candidates": len(lookup.records),
+                "requests": lookup.requests,
+                "error": lookup.error,
+                "artist_fuzzy_match": lookup.artist_fuzzy_match,
+            }
+            if lookup.status == "ok":
+                log.info("  LRCLIB: %d candidate(s)%s", len(lookup.records),
+                         " (cached)" if lookup.cached else "")
+            elif lookup.status == "not_found":
+                log.warning("  LRCLIB: not found")
+            elif lookup.status == "unreachable":
+                log.warning("  LRCLIB unreachable: %s", lookup.error)
+
+        session = asr.WhisperSession()
+        lid_results: list[dict[str, Any]] = []
+        model_info: dict[str, Any] = {}
+        transcript: dict[str, Any] | None = None
+        dropped_asr_words: list[dict[str, Any]] = []
+        local: list[dict[str, Any]] = []
+        asr_used = False
+        asr_reason = ""
+        try:
+            started = time.perf_counter()
+            try:
+                lid_results = session.detect_language_windows(
+                    vocals, duration, audio=audio_data)
+            except Exception as exc:
+                report["errors"].append(f"language ID failed: {exc}")
+                log.warning("  language ID failed: %s", exc)
+            report["stages"]["language_id"] = {
+                "seconds": _seconds(started),
+                "windows": len(lid_results),
+            }
+            lid_summary = langdetect.choose_audio_language(lid_results)
+            guess_language = lid_summary.get("language") or "en"
+
+            provisional = None
+            if override and override.get("lines"):
+                reference_lines = reference.clean_lines(
+                    override.get("lines") or [], override.get("language") or guess_language)
+                reference_text = "\n".join(line["text"] for line in reference_lines)
+                reference_line_texts = [line["text"] for line in reference_lines]
+            elif lookup and lookup.records:
+                provisional, _ = _provisional_reference(
+                    lookup.records, guess_language, duration, audio_data, client)
+                reference_text = _reference_text(provisional)
+                reference_line_texts = [line.get("text", "")
+                                        for line in (provisional or {}).get("lines", [])]
+            else:
+                reference_text = ""
+                reference_line_texts = []
+
+            decision = langdetect.detect_language(
+                reference_text, lid_results,
+                override=override.get("language") if override else None,
+                lines=reference_line_texts)
+            language = decision["language"]
+            log.info("  language: %s confidence=%.2f source=%s",
+                     language, float(decision.get("confidence", 0.0)),
+                     decision.get("source"))
+            report["language"] = language
+            report["language_decision"] = decision
+            report["stages"]["language_id"]["result"] = decision.get("source")
+            report["stages"]["language_id"]["language"] = language
+            report["stages"]["language_id"]["confidence"] = round(
+                float(decision.get("confidence", 0.0)), 4)
+            report["stages"]["language_id"]["audio"] = lid_summary
+
+            model_info = {
+                "model": asr.MODEL_NAME,
+                "device": session.device,
+                "compute_type": session.compute_type,
+                "load_seconds": round(session.load_seconds, 2),
+                "fallback_used": session.fallback_used,
+                "purpose": "language-id",
+            }
+            has_reference = bool(
+                (override and override.get("lines"))
+                or (lookup and lookup.records))
+            full_asr_needed, asr_reason = _needs_full_asr(
+                language, has_reference, align_english)
+            english_compat = (
+                language == "en" and has_reference and not align_english)
+            if full_asr_needed:
+                prompt = asr.build_prompt(title, artist, language, None)
+                started = time.perf_counter()
+                legacy_transcript = None
+                legacy_path = None
+                if english_compat and not force:
+                    legacy_transcript, legacy_path = asr.load_legacy_transcript(
+                        cache_dir, stem, duration, language)
+                if legacy_transcript is not None:
+                    transcript = legacy_transcript
+                    asr_reason = (
+                        "English compatibility reuses the pre-Phase-1 transcript cache")
+                    report["stages"]["asr"] = {
+                        "used": True,
+                        "legacy_transcript": True,
+                        "transcript_cache": "legacy",
+                        "cache_hit": True,
+                        "path": legacy_path,
+                        "seconds": 0.0,
+                        "language": language,
+                        "prompt_chars": 0,
+                        "words": sum(len(segment.get("words") or [])
+                                     for segment in transcript.get("segments") or []),
+                        "reason": asr_reason,
+                    }
+                    model_info["purpose"] = "language-id + legacy transcript"
+                    asr_used = True
+                    log.info("  using legacy English transcript: %s", legacy_path)
+                else:
+                    transcript, cache_info = asr.transcribe_cached(
+                        stem, vocals, stem_info["original_sha256"], language, prompt,
+                        cache_dir, force=force, session=session)
+                    report["stages"]["asr"] = {
+                        **cache_info,
+                        "transcript_cache": "content-keyed",
+                        "seconds": cache_info.get("seconds", _seconds(started)),
+                        "language": language,
+                        "prompt_chars": len(prompt),
+                        "words": sum(len(segment.get("words") or [])
+                                     for segment in transcript.get("segments") or []),
+                        "used": True,
+                        "reason": asr_reason,
+                    }
+                    model_info["purpose"] = "language-id + transcription"
+                    asr_used = True
+                    if cache_info.get("cache_hit"):
+                        log.info("  transcript cache hit: %s", cache_info["path"])
+                    else:
+                        log.info("  transcribed in %.1fs",
+                                 report["stages"]["asr"]["seconds"])
+            else:
+                report["stages"]["asr"] = {
+                    "used": False,
+                    "transcript_cache": "none",
+                    "reason": asr_reason,
+                    "seconds": 0.0,
+                    "language": language,
+                }
+                log.info("  full ASR skipped: %s", asr_reason)
+        finally:
+            session.close()
+
+        if transcript is not None:
+            transcript = asr.strip_hallucinations(
+                transcript, dropped=dropped_asr_words)
+            transcript = asr.filter_silent_words(
+                transcript, vocals, audio_data, dropped=dropped_asr_words)
+            local = asr.local_words(transcript, language)
+            report["stages"]["asr"]["local_words"] = len(local)
+            report["stages"]["asr"]["dropped_words"] = len(dropped_asr_words)
+
+        chosen = None
+        candidates: list[dict[str, Any]] = []
+        reference_dict: dict[str, Any] | None = None
+        reference_line_count = 0
+        text_source = "asr"
+        timing_source = "asr"
+        built: list[dict[str, Any]] = []
+        alignment_info: dict[str, Any] | None = None
+        line_alignments: list[dict[str, Any]] = []
+        aligner_info: dict[str, Any] = {}
+        asr_lines: list[dict[str, Any]] | None = None
+        romanization_info: dict[str, Any] | None = None
+
+        if override and override.get("lines"):
+            if full_asr_needed:
+                reference_dict = reference.reference_from_override(
+                    override, language, duration, local)
+                reference_dict["local"] = local
+                cues.align_reference_words(reference_dict, local, duration, language)
+                cues.drop_duplicate_unmatched_lines(reference_dict, language)
+                _reject_suspect_reference_offset(reference_dict, report)
+                reference_line_count = _reference_line_count(reference_dict, language)
+                built = cues.build_lyric_lines(
+                    reference_dict, duration, audio_data, language)
+                text_source = "user"
+                timing_source = "asr"
+            else:
+                reference_dict = reference.reference_from_override(
+                    override, language, duration, [])
+                reference_line_count = _reference_line_count(reference_dict, language)
+                align_session = align.shared_session()
+                try:
+                    started = time.perf_counter()
+                    known_jako = language in ("ja", "ko")
+                    result = align_session.align_audio_candidate(
+                        audio_data, reference_dict["lines"],
+                        reference_dict["tokens"], language, duration,
+                        windowed=known_jako,
+                        window_mode="line",
+                        star_frequency="edges" if known_jako else None,
+                        snap_repeated=True,
+                        merge_passes=known_jako,
+                        retry_low_coverage=known_jako,
+                        start_pad=(align.LINE_WINDOW_START_PAD
+                                   if known_jako else None),
+                        end_pad=(align.LINE_WINDOW_END_PAD
+                                 if known_jako else None),
+                        time_shift=_alignment_time_shift(language))
+                    alignment_info = result.summary
+                    line_alignments = result.lines
+                    aligner_info = {
+                        "model": align_session.model_name,
+                        "device": align_session.device,
+                        "dtype": str(align_session.dtype),
+                        "load_seconds": round(align_session.load_seconds, 2),
+                        "seconds": _seconds(started),
+                    }
+                    report["stages"]["alignment"] = aligner_info
+                    built = cues.build_aligned_lines(
+                        reference_dict, line_alignments, duration,
+                        audio_data, language,
+                        allow_edge_inference=language in ("ja", "ko"))
+                    text_source = "user"
+                    timing_source = "forced-alignment"
+                finally:
+                    align_session.close()
+        elif lookup and lookup.records:
+            if not full_asr_needed:
+                candidate_items = _prepare_alignment_candidates(
+                    lookup.records, language, duration, audio_data, client,
+                    replacements=replacements)
+                if not candidate_items:
+                    raise RuntimeError(
+                        "no LRCLIB candidate could be prepared for forced alignment")
+                align_session = align.shared_session()
+                try:
+                    started = time.perf_counter()
+                    candidates, aligner_info = _align_candidates(
+                        candidate_items, language, audio_data, align_session,
+                        duration)
+                    chosen = candidates[0]
+                    reference_dict = reference.reference_from_candidate(chosen)
+                    reference_line_count = _reference_line_count(
+                        reference_dict, language)
+                    aligner_info["seconds"] = _seconds(started)
+                    report["stages"]["alignment"] = aligner_info
+                    if chosen.get("chosen_tier") == "word-sync":
+                        word_sync = chosen["word_sync"]
+                        quality = word_sync["quality"]
+                        alignment_info = {
+                            "word_coverage": quality["coverage"],
+                            "line_coverage": round(
+                                1.0 - quality["line_level_rate"], 4),
+                            "mean_score": 0.0,
+                            "lines": len(reference_dict.get("lines") or []),
+                            "windowed": False,
+                            "word_sync": {
+                                **(aligner_info.get("word_sync") or {}),
+                                "chosen": True,
+                                "quality": quality,
+                            },
+                            "timing_agreement": quality["agreement"],
+                            "build_quality": quality,
+                        }
+                        line_alignments = word_sync["line_alignment"]
+                        built = word_sync["built"]
+                        timing_source = "lrclib-word-sync"
+                        log.info(
+                            "  word-sync tier: chosen id=%s coverage=%.1f%% "
+                            "line-level=%d agreement=%s",
+                            (chosen.get("record") or {}).get("id"),
+                            float(quality.get("coverage") or 0.0) * 100,
+                            int(quality.get("line_level_lines") or 0),
+                            quality.get("agreement"))
+                    else:
+                        alignment_info = chosen.get("alignment")
+                        if aligner_info.get("word_sync"):
+                            alignment_info["word_sync"] = aligner_info[
+                                "word_sync"]
+                        line_alignments = chosen.get("line_alignment") or []
+                        built = cues.build_aligned_lines(
+                            reference_dict, line_alignments, duration,
+                            audio_data, language,
+                            allow_edge_inference=language in ("ja", "ko"))
+                        timing_source = "forced-alignment"
+                        log.info(
+                            "  forced alignment: chosen id=%s coverage=%.1f%% "
+                            "mean_score=%.3f",
+                            (chosen.get("record") or {}).get("id"),
+                            float(alignment_info.get("word_coverage", 0.0)) * 100,
+                            float(alignment_info.get("mean_score", 0.0)))
+                    text_source = reference_dict.get(
+                        "text_source", "lrclib-plain")
+                finally:
+                    align_session.close()
+            else:
+                legacy_records = None
+                if english_compat:
+                    legacy_records = reference.load_legacy_search(
+                        cache_dir, artist, title)
+                if english_compat and legacy_records:
+                    chosen, candidates = reference.choose_legacy_candidate(
+                        legacy_records, language, duration, local)
+                    log.info("  English compatibility: %d legacy candidate(s)",
+                             len(candidates))
+                else:
+                    chosen, candidates = reference.choose_candidate(
+                        lookup.records, language, duration, audio_data, local=local,
+                        fetch_full=client.fetch_by_id)
+                if chosen:
+                    reference_dict = reference.reference_from_candidate(chosen)
+                    reference_dict["local"] = local
+                    cues.align_reference_words(reference_dict, local, duration, language)
+                    cues.drop_duplicate_unmatched_lines(reference_dict, language)
+                    _reject_suspect_reference_offset(reference_dict, report)
+                    reference_line_count = _reference_line_count(
+                        reference_dict, language)
+                    built = cues.build_lyric_lines(
+                        reference_dict, duration, audio_data, language)
+                    text_source = reference_dict.get("text_source", "lrclib-plain")
+                    timing_source = "asr"
+                else:
+                    built = cues.build_from_transcript(
+                        transcript, duration, language)
+                    text_source = "asr"
+                    timing_source = "asr"
+        else:
+            if transcript is None:
+                raise RuntimeError("no lyric source and no ASR transcript")
+            asr_lines = cues.build_from_transcript(transcript, duration, language)
+            if not asr_lines:
+                raise RuntimeError("ASR produced no lyric lines")
+            asr_readings: list[dict[str, Any]] = []
+            if language in ("ja", "ko"):
+                asr_lines, asr_readings = _romanize_asr_lines(
+                    asr_lines, language)
+                romanization_info = {
+                    "language": language,
+                    "method": ("korean-academic" if language == "ko"
+                               else "japanese-fugashi"),
+                    "readings": asr_readings,
+                }
+            tokens = cues.flat_lrc_tokens(asr_lines, "en")
+            align_session = align.shared_session()
+            try:
+                started = time.perf_counter()
+                result = align_session.align_audio_candidate(
+                    audio_data, asr_lines, tokens, language, duration,
+                    windowed=True, window_mode="line", star_frequency="edges",
+                    min_word_score=align.MIN_WORD_SCORE,
+                    time_shift=_alignment_time_shift(language))
+                cleaned_lines, cleanup_dropped = _clean_asr_lines(
+                    asr_lines, result.lines, audio_data, duration, language,
+                    align.MIN_WORD_SCORE)
+                if cleanup_dropped:
+                    dropped_asr_words.extend(cleanup_dropped)
+                    report["stages"]["asr"]["dropped_words"] = len(
+                        dropped_asr_words)
+                    log.info("  dropped %d low-confidence/no-energy ASR word(s)",
+                             len(cleanup_dropped))
+                if cleaned_lines:
+                    asr_lines = cleaned_lines
+                    tokens = cues.flat_lrc_tokens(
+                        asr_lines, "en" if language in ("ja", "ko") else language)
+                    result = align_session.align_audio_candidate(
+                        audio_data, asr_lines, tokens, language, duration,
+                        windowed=True, window_mode="line",
+                        star_frequency="edges",
+                        min_word_score=align.MIN_WORD_SCORE,
+                        time_shift=_alignment_time_shift(language))
+                alignment_info = result.summary
+                line_alignments = result.lines
+                aligner_info = {
+                    "model": align_session.model_name,
+                    "device": align_session.device,
+                    "dtype": str(align_session.dtype),
+                    "load_seconds": round(align_session.load_seconds, 2),
+                    "seconds": _seconds(started),
+                }
+                report["stages"]["alignment"] = aligner_info
+                built = cues.build_aligned_asr_lines(
+                    asr_lines, line_alignments, duration, audio_data, language)
+                text_source = "asr"
+                timing_source = "forced-alignment"
+            finally:
+                align_session.close()
+
+        if romanization_info is None and reference_dict:
+            if reference_dict.get("romanization"):
+                romanization_info = {
+                    **reference_dict["romanization"],
+                    "readings": reference_dict.get("romanized_readings") or [],
+                    "replacements": (
+                        reference_dict.get("replacements_applied")
+                        or reference_dict["romanization"].get("replacements")
+                        or []),
+                }
+
+        if not built:
+            raise RuntimeError("no lyric lines were produced")
+
+        final_cues = cues.add_instrumental_cues(
+            built, duration, audio_data, music_audio=music_data)
+        qa_result = qa.evaluate(
+            cues=final_cues,
+            language=language,
+            audio=audio_data,
+            reference=reference_dict,
+            reference_line_count=reference_line_count,
+            text_source=text_source,
+            timing_source=timing_source,
+            language_decision=decision,
+            lrclib_status=lookup.status if lookup else "disabled",
+            lrclib_error=lookup.error if lookup else None,
         )
+        offset_reset = (reference_dict.get("alignment_offset_reset")
+                        if reference_dict else None)
+        if offset_reset is not None:
+            qa_result["needs_review"] = True
+            qa_result["review_reasons"].append(
+                f"reference timing offset {offset_reset:+.1f}s was rejected; "
+                "line timings use LRCLIB/onset fallback")
+        line_timing_sources = _timing_source_summary(final_cues)
+        if line_timing_sources["asr_fallback_lines"]:
+            qa_result["needs_review"] = True
+            qa_result["review_reasons"].append(
+                f"{len(line_timing_sources['asr_fallback_lines'])} line(s) use "
+                "Whisper word timing because forced alignment failed")
+        low_confidence_lines = (
+            alignment_info.get("low_confidence_lines") if alignment_info else [])
+        if low_confidence_lines:
+            threshold = (alignment_info.get("score_threshold")
+                         if alignment_info else None)
+            qa_result["needs_review"] = True
+            qa_result["review_reasons"].append(
+                f"{len(low_confidence_lines)} line(s) fell below the forced-alignment "
+                f"confidence threshold (score < {threshold}): "
+                + ", ".join(str(index + 1) for index in low_confidence_lines))
+        snapped_lines = (
+            alignment_info.get("snapped_repeated_lines") if alignment_info else [])
+        if snapped_lines:
+            qa_result["needs_review"] = True
+            qa_result["review_reasons"].append(
+                f"{len(snapped_lines)} repeated line(s) were snapped to their "
+                "offset-corrected LRCLIB occurrence: "
+                + ", ".join(str(index + 1) for index in snapped_lines))
+        fuzzy = lookup.artist_fuzzy_match if lookup else None
+        if fuzzy:
+            qa_result["needs_review"] = True
+            qa_result["review_reasons"].append(
+                "LRCLIB artist name was fuzzy-matched by title-only search: "
+                f"{fuzzy.get('query')!r} -> {fuzzy.get('matched')!r}")
+        if text_source == "asr" and dropped_asr_words:
+            qa_result["needs_review"] = True
+            qa_result["review_reasons"].append(
+                f"{len(dropped_asr_words)} ASR word(s) were dropped for "
+                "no vocal energy, low aligner confidence, or intro hallucination")
+        if alignment_info and not reference_dict:
+            if not line_timing_sources["counts"].get("forced-alignment"):
+                timing_source = "asr"
+        elif alignment_info:
+            if line_timing_sources["counts"].get("lrclib-word-sync"):
+                timing_source = "lrclib-word-sync"
+            else:
+                timing_source = "forced-alignment"
 
-    title, artist = split_stem(stem)
-    prompt = f"{artist} - {title}" if artist else title
+        chosen_id = None
+        if chosen and chosen.get("record"):
+            chosen_id = chosen["record"].get("id")
+        if lookup is not None and "lrclib" in report["stages"]:
+            report["stages"]["lrclib"]["requests"] = client.requests
+        pipeline = {
+            "version": "v2-i18n",
+            "language": language,
+            "language_confidence": round(float(decision.get("confidence", 0.0)), 4),
+            "language_inputs": decision.get("inputs", {}),
+            "text_source": text_source,
+            "timing_source": timing_source,
+            "romanization": (
+                romanization_info.get("method")
+                if romanization_info else None),
+            "romanization_info": romanization_info,
+            "needs_review": qa_result["needs_review"],
+            "review_reasons": qa_result["review_reasons"],
+            "lrclib": {
+                "status": lookup.status if lookup else "disabled",
+                "cached": lookup.cached if lookup else False,
+                "error": lookup.error if lookup else None,
+                "record_id": chosen_id,
+                "candidate_count": len(lookup.records) if lookup else 0,
+                "requests": client.requests,
+                "artist_fuzzy_match": (
+                    lookup.artist_fuzzy_match if lookup else None),
+                "candidate_scores": [_candidate_summary(item) for item in candidates],
+            },
+            "reference_lines": qa_result["retention"]["reference_lines"],
+            "reference_lines_present": qa_result["retention"]["reference_lines_present"],
+            "line_retention": qa_result["retention"]["line_retention"],
+            "line_level": qa_result["alignment"]["line_level"],
+            "line_timing_sources": line_timing_sources,
+            "alignment": {
+                "coverage": round(qa_result["alignment"]["coverage"], 4),
+                "inferred_words": qa_result["alignment"]["inferred_words"],
+                "inferred_rate": round(qa_result["alignment"]["inferred_rate"], 4),
+                "line_level_lines": qa_result["alignment"]["line_level_lines"],
+                "line_level_rate": round(qa_result["alignment"]["line_level_rate"], 4),
+                "forced": alignment_info is not None,
+                "candidate": alignment_info,
+                "low_confidence_lines": (
+                    alignment_info.get("low_confidence_lines")
+                    if alignment_info else []),
+                "score_stats": ({
+                    "threshold": alignment_info.get("score_threshold"),
+                    "min": alignment_info.get("score_min"),
+                    "p10": alignment_info.get("score_p10"),
+                    "median": alignment_info.get("score_median"),
+                    "mean": alignment_info.get("mean_score"),
+                    "low_score_words": alignment_info.get("low_score_words"),
+                } if alignment_info else None),
+                "reference_lines": (_alignment_lines_summary(line_alignments)
+                                    if line_alignments else []),
+            },
+            "asr": {
+                "used": asr_used,
+                "reason": asr_reason,
+                "transcript_cache": (
+                    report["stages"].get("asr") or {}).get("transcript_cache"),
+                "dropped_words": dropped_asr_words,
+                "stage": report["stages"].get("asr"),
+            },
+            "script": qa_result["script"],
+            "sanity": qa_result["sanity"],
+            "synthetic": qa_result["synthetic"],
+            "line_start_deviation": qa_result["line_start_deviation"],
+            "alignment_warnings": ([{
+                "code": "reference_offset_rejected",
+                "seconds": offset_reset,
+            }] if offset_reset is not None else []),
+            "vocal_stem": stem_info["path"],
+            "vocal_stem_sha256": cache.sha256_file(vocals),
+            "models": {**model_info, "aligner": aligner_info},
+            "stage_seconds": report["stages"],
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "output_sha256": publish.lines_sha256(final_cues),
+        }
+        report["pipeline"] = pipeline
+        report["qa"] = qa_result
+        report["text_source"] = text_source
+        report["timing_source"] = timing_source
+        report["candidates"] = [_candidate_summary(item) for item in candidates]
 
-    vocals = separate_vocals(stem, original, cache_dir, force=force)
-    transcript = transcribe(stem, vocals, prompt, cache_dir, force=force)
-    audio = load_vocal_audio(vocals)
-    transcript = strip_hallucinations(transcript)
-    transcript = filter_silent_words(transcript, vocals, audio)
-    local = local_words(transcript)
+        gate = _script_gate(final_cues, language)
+        pipeline["script_gate"] = gate
+        if _script_gate_blocks_publication(language, gate):
+            qa_result["needs_review"] = True
+            qa_result["review_reasons"].append(
+                f"script gate found {len(gate['leaks'])} leaking line(s)")
+            pipeline["needs_review"] = True
+            pipeline["review_reasons"] = qa_result["review_reasons"]
+            report["status"] = "blocked"
+            report["error"] = (
+                "script gate failed: active display text still contains "
+                "Japanese/Korean script; the song was not written")
+            _write_report(reports_dir, stem, report)
+            return report
 
-    reference = None
-    if use_online and local:
-        candidates = lrclib_search(artist, title, cache_dir)
-        if candidates:
-            reference = choose_reference(local, candidates, duration)
-            if reference:
-                reference["local"] = local
-                align_reference_words(reference, local, duration)
-                drop_duplicate_unmatched_lines(reference)
-                log.info("  reference: score=%.2f coverage=%.0f%% local=%.0f%% offset=%+.2fs anchors=%d penalty=%.2f (%s - %s)",
-                         reference["score"], reference["coverage"] * 100,
-                         reference["local_coverage"] * 100, reference["offset"],
-                         len(reference["anchors"]), reference["penalty"],
-                         reference["candidate"].get("artistName"),
-                         reference["candidate"].get("trackName"))
-
-    if reference and reference["coverage"] >= 0.25:
-        cues = build_lyric_lines(reference, duration, audio)
-        source = "reference"
-    else:
-        log.warning("  no usable online reference; using local transcript text")
-        cues = build_from_transcript(transcript, duration)
-        source = "local"
-
-    if not cues:
-        raise RuntimeError("no lyric lines were produced")
-
-    cues = add_instrumental_cues(cues, duration, audio)
-    srt_path, json_path = write_outputs(stem, cues, duration)
-    lyric_count = sum(1 for cue in cues if not cue.get("instrumental"))
-    instrumental_count = len(cues) - lyric_count
-    log.info("  wrote %s (%d lyric lines, %d instrumental cues, source=%s)",
-             srt_path.name, lyric_count, instrumental_count, source)
-    log.info("  wrote %s", json_path.name)
+        publish_result = publish.write_outputs(
+            stem, final_cues, duration, pipeline, output_dir,
+            overwrite_edited=overwrite_edited, backup_dir=backups_dir)
+        report["publish"] = {
+            "written": publish_result.get("written"),
+            "skipped": publish_result.get("skipped"),
+            "reason": publish_result.get("reason"),
+            "srt": _relative(publish_result["srt_path"]),
+            "words": _relative(publish_result["words_path"]),
+            "backups": publish_result.get("backups", []),
+            "output_sha256": publish_result.get("output_sha256"),
+        }
+        report["status"] = "ok" if publish_result.get("written") else "skipped"
+        report["stage_seconds_total"] = _seconds(song_started)
+        _write_report(reports_dir, stem, report)
+        lyric_count = sum(1 for cue in final_cues if not cue.get("instrumental"))
+        instrumental_count = len(final_cues) - lyric_count
+        if publish_result.get("written"):
+            log.info("  wrote %s (%d lyric lines, %d instrumental cues, "
+                     "language=%s, text=%s)", publish_result["srt_path"].name,
+                     lyric_count, instrumental_count, language, text_source)
+            log.info("  wrote %s", publish_result["words_path"].name)
+            if publish_result.get("backups"):
+                log.info("  backed up %d previous file(s)", len(publish_result["backups"]))
+        else:
+            log.warning("  skipped publish: %s", publish_result.get("reason"))
+        return report
+    except Exception as exc:
+        if report.get("status") == "running":
+            report["status"] = "failed"
+        report["error"] = f"{type(exc).__name__}: {exc}"
+        report["stage_seconds_total"] = _seconds(song_started)
+        _write_report(reports_dir, stem, report)
+        raise
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__,
-                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--song", help="only process stems containing this text")
     parser.add_argument("--cache-dir", type=Path, default=CACHE_DIR,
                         help="where vocals/transcripts/LRCLIB responses are cached")
+    parser.add_argument("--output-dir", type=Path, default=LYRICS_DIR,
+                        help="write lyric files here instead of lyrics/")
     parser.add_argument("--no-online", action="store_true",
-                        help="do not use LRCLIB; use the local Whisper transcript only")
+                        help="do not use LRCLIB; use ASR or a user override")
     parser.add_argument("--force", action="store_true",
                         help="re-run Demucs and Whisper even when cached")
+    parser.add_argument("--overwrite-edited", action="store_true",
+                        help="replace lyric files that were edited outside the pipeline")
+    parser.add_argument("--align-english", action="store_true",
+                        help="use forced alignment for English songs instead of ASR timing")
     parser.add_argument("--missing", action="store_true",
                         help="only process songs that do not have an .srt yet")
     parser.add_argument("--verbose", action="store_true")
@@ -1586,30 +1451,46 @@ def main() -> int:
     if not songs:
         log.error("no matching songs found in %s", ORIGINALS_DIR)
         return 1
+    output_dir = args.output_dir.resolve()
     if args.missing:
-        songs = [
-            song for song in songs
-            if not (LYRICS_DIR / f"{song[0]}.srt").exists()
-        ]
+        songs = [song for song in songs
+                 if not (output_dir / f"{song[0]}.srt").exists()]
     if not songs:
         log.info("nothing to do; every matching song already has lyrics")
         return 0
 
     cache_dir = args.cache_dir.resolve()
     cache_dir.mkdir(parents=True, exist_ok=True)
-    log.info("processing %d song(s); cache: %s", len(songs), cache_dir)
+    reports_dir = cache_dir / "reports"
+    if output_dir.resolve() == LYRICS_DIR.resolve():
+        backups_dir = cache_dir / "backups"
+    else:
+        backups_dir = output_dir / "backups"
+    log.info("processing %d song(s); cache: %s; output: %s",
+             len(songs), cache_dir, output_dir)
 
     failures = 0
+    skipped = 0
+    blocked = 0
     for stem, original, karaoke in songs:
         try:
-            process_song(stem, original, karaoke, cache_dir,
-                         use_online=not args.no_online, force=args.force)
+            report = process_song(
+                stem, original, karaoke, cache_dir,
+                use_online=not args.no_online, force=args.force,
+                output_dir=output_dir, overwrite_edited=args.overwrite_edited,
+                reports_dir=reports_dir, backups_dir=backups_dir,
+                source_dir=SOURCE_DIR, align_english=args.align_english)
+            if report.get("status") == "skipped":
+                skipped += 1
+            elif report.get("status") == "blocked":
+                blocked += 1
         except Exception as exc:
             failures += 1
             log.exception("FAILED: %s: %s", stem, exc)
     log.info("")
-    log.info("done: %d ok, %d failed", len(songs) - failures, failures)
-    return 1 if failures else 0
+    log.info("done: %d ok, %d failed, %d skipped, %d blocked",
+             len(songs) - failures - skipped - blocked, failures, skipped, blocked)
+    return 1 if failures or blocked else 0
 
 
 if __name__ == "__main__":

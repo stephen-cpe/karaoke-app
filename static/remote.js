@@ -959,7 +959,12 @@
     }
 
     if (!hasWordTimings || !line.words.length) {
-      ui.lyricsLine.textContent = line.text;
+      const presentation = globalThis.LyricsDisplay
+        ? globalThis.LyricsDisplay.linePresentation(line)
+        : { text: line.text, className: "word sung" };
+      ui.lyricsLine.replaceChildren();
+      ui.lyricsLine.appendChild(makeElement(
+        "span", presentation.className, presentation.text));
       return;
     }
 

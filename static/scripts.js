@@ -1569,7 +1569,13 @@ function renderWordLine(line) {
   }
 
   if (!line.words.length) {
-    lyricsEl.textContent = line.text;
+    const presentation = globalThis.LyricsDisplay
+      ? globalThis.LyricsDisplay.linePresentation(line)
+      : { text: line.text, className: "word sung" };
+    const span = document.createElement("span");
+    span.className = presentation.className;
+    span.textContent = presentation.text;
+    lyricsEl.appendChild(span);
     return;
   }
 
