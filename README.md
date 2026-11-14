@@ -56,7 +56,7 @@ drag-and-drop copy of the working tree, because it still contains the media.
 
 ## Requirements
 
-- **Python 3.13+** (developed on 3.13/3.14)
+- **Python 3.14** (the only supported version; tested with 3.14.10)
 - **FFmpeg** on your PATH for source/developer use — required for on-demand
   transposition, audio normalization, batch pre-transposing, and lyric
   generation. Playback of pre-generated files works without it. The packaged
@@ -73,7 +73,7 @@ Optional dependency groups:
 |---|---|
 | `requirements.txt` | Core Flask + Waitress runtime |
 | `requirements-dev.txt` | Core runtime plus pytest, Playwright, and Ruff |
-| `requirements-media.txt` | `pydub` (and `audioop-lts` on Python 3.13+) for `songs/normalize_audio.py` |
+| `requirements-media.txt` | `pydub` and `audioop-lts` (restores the `audioop` module removed from the standard library) for `songs/normalize_audio.py` |
 | `requirements-lyrics.txt` | Demucs, faster-whisper, PyTorch, CTranslate2, and NumPy pipeline |
 | `requirements-cuda.txt` | Optional NVIDIA CUDA 12 runtime DLLs for GPU inference |
 
@@ -630,14 +630,15 @@ available, the browser tests skip instead of failing the suite.
 
 ## Building the Windows distribution
 
-The Windows build uses native CPython **3.13.9 x64**, PyInstaller 6.22.3
+The Windows build uses native CPython **3.14.10 x64**, PyInstaller 6.22.3
 one-folder packaging, and the same PowerShell script in local builds and GitHub
-Actions. Python 3.14 is supported by the app, but the release build uses 3.13
-because its Tk 8.6 runtime is reliably collected by PyInstaller.
+Actions. PyInstaller 6.22.3 bundles Python 3.14's Tcl/Tk 9.0.4 DLLs, whose
+Tcl/Tk scripts live in an embedded data archive; the packaged self-test and
+GUI smoke test pass on 3.14.
 
 ```powershell
-# Use the CPython 3.13.x x64 interpreter for the release build.
-py -3.13 -m venv .venv-build
+# Use the CPython 3.14.x x64 interpreter for the release build.
+py -3.14 -m venv .venv-build
 .\.venv-build\Scripts\python -m pip install --upgrade pip
 .\.venv-build\Scripts\python -m pip install -r requirements.txt `
   -r packaging\requirements-desktop.txt `

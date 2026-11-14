@@ -11,8 +11,8 @@ their own licenses.
 
 | Package | Version tested | License |
 |---|---|---|
-| Python | 3.13.9 | PSF-2.0 |
-| Tcl/Tk (desktop shell) | 8.6 | BSD-style |
+| Python | 3.14.10 | PSF-2.0 |
+| Tcl/Tk (desktop shell) | 9.0.4 | BSD-style |
 | Flask | 3.1.3 | BSD-3-Clause |
 | Waitress | 3.0.2 | ZPL 2.1 |
 | pystray | 0.19.5 | LGPL-3.0 |
