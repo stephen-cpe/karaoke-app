@@ -110,7 +110,7 @@
   node --check static\sync_editor.js
   node --check static\confirm-dialog.js
   node --check static\sw.js
-  node --test tests\js
+  node --test "tests/js/*.test.js"
   ```
 
 - Browser/UI tests use Playwright and skip when no Chromium-based browser is
@@ -147,7 +147,7 @@
     -r packaging\requirements-desktop.txt `
     -r packaging\requirements-build.txt pytest ruff
   .\.venv-build\Scripts\python -m pytest -m "not browser"
-  node --test tests\js
+  node --test "tests/js/*.test.js"
   .\.venv-build\Scripts\python -m ruff check .
   .\packaging\build.ps1 -Version 0.0.2 `
     -Python .\.venv-build\Scripts\python.exe

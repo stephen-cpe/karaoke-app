@@ -595,7 +595,7 @@ venv\Scripts\python -m pytest
 venv\Scripts\ruff check .
 node --check static\lyric_reconcile.js
 node --check static\sync_editor.js
-node --test tests\js\reconcile.test.js
+node --test "tests/js/*.test.js"
 ```
 
 The suite covers filename parsing, the catalog endpoint, media-route extension
@@ -643,7 +643,7 @@ py -3.13 -m venv .venv-build
   -r packaging\requirements-desktop.txt `
   -r packaging\requirements-build.txt pytest ruff
 .\.venv-build\Scripts\python -m pytest -m "not browser"
-node --test tests\js\reconcile.test.js
+node --test "tests/js/*.test.js"
 .\.venv-build\Scripts\python -m ruff check .
 .\packaging\build.ps1 -Version 0.0.2 -Python .\.venv-build\Scripts\python.exe
 ```

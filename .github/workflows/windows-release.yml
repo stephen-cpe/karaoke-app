@@ -100,7 +100,7 @@ jobs:
 
       - name: Run JavaScript tests
         shell: pwsh
-        run: node --test tests/js/reconcile.test.js
+        run: node --test "tests/js/*.test.js"
 
       - name: Run Ruff
         shell: pwsh
