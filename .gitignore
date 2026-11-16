@@ -14,9 +14,6 @@ htmlcov/
 venv/
 env/
 
-# Local Python environment
-.python313/
-
 # --- Local configuration / secrets ---------------------------------------
 .env
 .env.*
@@ -74,7 +71,6 @@ tools/.cache/
 /dist/
 
 # --- Windows desktop build artifacts --------------------------------------
-.python313/
 .venv-build/
 build/
 dist/
