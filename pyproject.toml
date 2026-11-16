@@ -4,7 +4,6 @@ target-version = "py314"
 exclude = [
   ".git",
   ".pytest_cache",
-  ".python313",
   ".venv",
   ".venv-build",
   "build",
