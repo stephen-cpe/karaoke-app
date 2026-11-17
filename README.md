@@ -10,7 +10,7 @@ your voice.
 > project, not a product. It is **very early pre-alpha** software: behavior and
 > file layouts may change, and it is provided **as-is, with no warranty** and no
 > support commitment. The initial public portable executable release was
-> **v0.0.1 (PRE-ALPHA)**; the next planned release is **v0.0.2 (PRE-ALPHA)**.
+> **v0.0.1 (PRE-ALPHA)**; the next planned release is **v0.0.3 (PRE-ALPHA)**.
 > See `docs/VERSIONING.md` and [Licensing and media](#licensing-and-media).
 
 ## What is not included
@@ -36,10 +36,11 @@ drag-and-drop copy of the working tree, because it still contains the media.
 - **Song catalog scanned live** from the `songs/` folder — no manual list to maintain
 - Live search, one-click queueing, and an always-visible **Up next** panel
 - **Synced lyrics with word-by-word highlighting**, displayed full-screen over a
-  procedurally animated space backdrop of stars, nebulae, and galaxies;
-  `[Instrumental]` cues cover intros and breaks
-- **Built-in procedural background** — WebGL-rendered star fields, nebulae, and a
-  spiral galaxy; no external media assets, and it pauses when the tab is hidden
+  procedurally animated space backdrop of stars, nebulae, galaxies, a ringed
+  planet, and an aurora; `[Instrumental]` cues cover intros and breaks
+- **Built-in procedural background** — five WebGL-rendered space scenes with slow
+  automatic crossfades; no external media assets, and it pauses when the tab is
+  hidden
 - **Automatic lyric timing tool** (`tools/generate_lyrics.py`) using Demucs vocal
   separation, Whisper word timestamps and LRCLIB text
 - **Pitch shifting (±4 semitones)** so singers can find their key, with caching
@@ -155,7 +156,7 @@ back through port 8099; the actual URL is always shown in the window.
 
 See `docs/VERSIONING.md` for the project-specific pre-alpha versioning policy.
 The initial public executable release was `v0.0.1`; the next planned release is
-`v0.0.2`.
+`v0.0.3`.
 
 ## Shared playback model
 
@@ -646,7 +647,7 @@ py -3.14 -m venv .venv-build
 .\.venv-build\Scripts\python -m pytest -m "not browser"
 node --test "tests/js/*.test.js"
 .\.venv-build\Scripts\python -m ruff check .
-.\packaging\build.ps1 -Version 0.0.2 -Python .\.venv-build\Scripts\python.exe
+.\packaging\build.ps1 -Version 0.0.3 -Python .\.venv-build\Scripts\python.exe
 ```
 
 `packaging/build.ps1` downloads and checksum-verifies the pinned Gyan FFmpeg
@@ -656,8 +657,8 @@ and license/source notices, verifies the layout, and creates:
 
 ```text
 dist/karaoke-app/                         # runnable portable folder
-dist/karaoke-app-v0.0.2-win64.zip        # distribution ZIP
-dist/karaoke-app-v0.0.2-win64.zip.sha256
+dist/karaoke-app-v0.0.3-win64.zip        # distribution ZIP
+dist/karaoke-app-v0.0.3-win64.zip.sha256
 ```
 
 The build never includes songs, `original_songs/`, lyrics, AI models, CUDA

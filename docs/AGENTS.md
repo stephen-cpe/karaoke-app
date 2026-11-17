@@ -30,7 +30,7 @@
 - `static/scripts.js` - host-only audio engine and shared-session client.
 - `static/lyrics_display.js` - shared lyric presentation rules (word wipe vs
   full-line sung style), also loaded by Node unit tests.
-- `static/background.js` - host-only procedural WebGL star/nebula/galaxy background.
+- `static/background.js` - host-only procedural WebGL star/nebula/galaxy/planet/aurora background.
 - `static/remote.js`, `static/remote.css`, `templates/remote.html` — controls-only
   phone remote. It must not create audio/video elements or play media.
 - `templates/index.html` — host player page, including the Lyrics Editor link and
@@ -152,7 +152,7 @@
   .\.venv-build\Scripts\python -m pytest -m "not browser"
   node --test "tests/js/*.test.js"
   .\.venv-build\Scripts\python -m ruff check .
-  .\packaging\build.ps1 -Version 0.0.2 `
+  .\packaging\build.ps1 -Version 0.0.3 `
     -Python .\.venv-build\Scripts\python.exe
   ```
 
@@ -160,7 +160,7 @@
   `packaging/cache/`, `packaging/build/`, or downloaded FFmpeg binaries.
 - Versioning and release authorization follow `docs/VERSIONING.md`. The
   initial public executable release was `v0.0.1`; the current planned pre-alpha
-  release is `v0.0.2`. Never promote to `1.0.0` or publish a release without the
+  release is `v0.0.3`. Never promote to `1.0.0` or publish a release without the
   maintainer's explicit decision.
 - Complete `docs/WINDOWS_ACCEPTANCE.md` on a clean Windows 11 x64 machine
   before declaring a release ready. Automated tests and a local build do not
@@ -181,7 +181,7 @@
 - Versioning and release policy are documented in `docs/VERSIONING.md`. Keep
   `karaoke/version.py`, the executable metadata, the GUI label, and release
   tags in sync. The initial public executable release was `v0.0.1`; the current
-  planned pre-alpha release is `v0.0.2`. Do not promote the project to `1.0.0`
+  planned pre-alpha release is `v0.0.3`. Do not promote the project to `1.0.0`
   or publish a release without the maintainer's explicit decision.
 - The Lyrics Editor loads Bootstrap and WaveSurfer from `static/vendor/`; the host
   and remote use custom CSS. The host player also loads the vendored

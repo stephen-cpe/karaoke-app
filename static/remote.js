@@ -24,7 +24,7 @@
   const SSE_RETRY_MAX_MS = 15000;
   const POLL_INTERVAL_MS = 2500;
   const HEARTBEAT_INTERVAL_MS = 4000;
-  const QUEUE_LONG_PRESS_MS = 420;
+  const QUEUE_LONG_PRESS_MS = 250;
   const QUEUE_LONG_PRESS_SLOP_PX = 10;
   const QUEUE_AUTOSCROLL_EDGE_PX = 88;
   const QUEUE_AUTOSCROLL_MAX_PX = 18;
@@ -104,7 +104,7 @@
   // Controls / interaction state
   let transportBusy = false;
   let keyBusy = false;
-  let queueBusy = false;
+  let keyOptimistic = null;
   let seekDragging = false;
   let seekTimer = null;
   let lastSeekValue = null;
@@ -115,10 +115,19 @@
   let lastVolumeAt = 0;
   const addPending = new Set();
 
+  // Queue mutations are applied locally first and sent one at a time. That
+  // keeps a second drag or tap responsive without letting two reorders race.
+  let queueOpsPending = 0;
+  let queueGeneration = 0;
+  let queueChain = Promise.resolve();
+  let confirmedQueue = [];
+
   const queueDrag = {
     pending: false,
     active: false,
     pointerId: null,
+    pressRow: null,
+    pressPointerId: null,
     row: null,
     ghost: null,
     indicator: null,
@@ -190,6 +199,10 @@
 
   function fileStem(filename) {
     return String(filename || "").replace(/\.[^.]+$/, "");
+  }
+
+  function normalizeQueue(raw) {
+    return Array.isArray(raw) ? raw.filter(song => song && song.filename) : [];
   }
 
   async function readJson(response) {
@@ -278,6 +291,10 @@
     }
 
     const previousStatus = shared ? shared.status : null;
+    const serverQueue = normalizeQueue(snapshot.queue);
+    const serverTranspose = Number.isFinite(Number(snapshot.transpose))
+      ? clamp(Math.trunc(Number(snapshot.transpose)), -4, 4) : 0;
+    confirmedQueue = serverQueue;
     shared = {
       server_id: snapshot.server_id || null,
       revision: Number.isFinite(revision) ? revision : 0,
@@ -289,10 +306,8 @@
         ? Math.max(0, Number(snapshot.duration)) : 0,
       current: snapshot.current && typeof snapshot.current === "object"
         ? snapshot.current : null,
-      queue: Array.isArray(snapshot.queue)
-        ? snapshot.queue.filter(song => song && song.filename) : [],
-      transpose: Number.isFinite(Number(snapshot.transpose))
-        ? clamp(Math.trunc(Number(snapshot.transpose)), -4, 4) : 0,
+      queue: queueOpsPending > 0 && shared ? shared.queue : serverQueue,
+      transpose: keyOptimistic !== null ? keyOptimistic : serverTranspose,
       volume: Number.isFinite(Number(snapshot.volume))
         ? clamp(Number(snapshot.volume), 0, 1) : 1,
       error: snapshot.error ? String(snapshot.error) : null
@@ -638,10 +653,10 @@
     const hasSong = !!(shared && shared.current);
     if (ui.queueTabCount) ui.queueTabCount.textContent = String(queue.length);
     if (ui.clearQueue) {
-      ui.clearQueue.disabled = !reachable || queueBusy || queue.length === 0;
+      ui.clearQueue.disabled = !reachable || queue.length === 0;
     }
     if (ui.stopClear) {
-      ui.stopClear.disabled = !reachable || queueBusy || (!hasSong && queue.length === 0);
+      ui.stopClear.disabled = !reachable || (!hasSong && queue.length === 0);
     }
   }
 
@@ -1118,15 +1133,15 @@
       const actions = makeElement("div", "queue-actions");
       const up = makeQueueButton("up", `Move ${song.title || "song"} up`,
         () => moveQueueItem(index, -1));
-      up.disabled = queueBusy || !reachable || index === 0;
+      up.disabled = !reachable || index === 0;
 
       const down = makeQueueButton("down", `Move ${song.title || "song"} down`,
         () => moveQueueItem(index, 1));
-      down.disabled = queueBusy || !reachable || index === queue.length - 1;
+      down.disabled = !reachable || index === queue.length - 1;
 
       const remove = makeQueueButton("close", `Remove ${song.title || "song"} from the queue`,
         () => removeQueueItem(index), "is-remove");
-      remove.disabled = queueBusy || !reachable;
+      remove.disabled = !reachable;
 
       actions.append(up, down, remove);
       row.append(copy, actions);
@@ -1134,31 +1149,84 @@
     });
   }
 
-  async function runQueueAction(action, payload, fallbackMessage) {
-    if (queueBusy) return;
-    queueBusy = true;
+  function reorderQueueLocal(from, to) {
+    if (!shared) return false;
+    const queue = shared.queue;
+    if (!Number.isInteger(from) || !Number.isInteger(to)) return false;
+    if (from < 0 || to < 0 || from >= queue.length || to >= queue.length || from === to) {
+      return false;
+    }
+    const next = queue.slice();
+    const [song] = next.splice(from, 1);
+    next.splice(to, 0, song);
+    shared.queue = next;
+    return true;
+  }
+
+  function removeQueueLocal(index) {
+    if (!shared) return false;
+    if (!Number.isInteger(index) || index < 0 || index >= shared.queue.length) {
+      return false;
+    }
+    const next = shared.queue.slice();
+    next.splice(index, 1);
+    shared.queue = next;
+    return true;
+  }
+
+  function clearQueueLocal() {
+    if (!shared || !shared.queue.length) return false;
+    shared.queue = [];
+    return true;
+  }
+
+  function runQueueAction(action, payload, fallbackMessage, optimistic = null) {
+    const generation = queueGeneration;
+    if (optimistic) optimistic();
+    queueOpsPending += 1;
     renderQueue();
     renderQueueCounts();
-    try {
-      await sendControl(action, payload);
-    } catch (err) {
-      showToast(userMessage(err, fallbackMessage), "error");
-    } finally {
-      queueBusy = false;
-      renderQueue();
-      renderQueueCounts();
-    }
+
+    // Serialize requests. The optimistic queue already contains the new order,
+    // so a second gesture can start immediately while the first request runs.
+    const execute = async () => {
+      if (generation !== queueGeneration) return;
+      try {
+        await sendControl(action, payload);
+      } catch (err) {
+        if (generation !== queueGeneration) return;
+        queueGeneration += 1;
+        queueOpsPending = 0;
+        cancelQueueDrag();
+        if (shared) shared.queue = confirmedQueue.slice();
+        renderQueue();
+        renderQueueCounts();
+        showToast(userMessage(err, fallbackMessage), "error");
+        refreshState();
+        return;
+      }
+      if (generation !== queueGeneration) return;
+      queueOpsPending = Math.max(0, queueOpsPending - 1);
+      if (queueOpsPending === 0) {
+        if (shared) shared.queue = confirmedQueue.slice();
+        renderQueue();
+        renderQueueCounts();
+      }
+    };
+    queueChain = queueChain.then(execute, execute);
   }
 
   function removeQueueItem(index) {
-    runQueueAction("remove", { index }, "Could not remove that song.");
+    runQueueAction("remove", { index }, "Could not remove that song.",
+      () => removeQueueLocal(index));
   }
 
   function moveQueueItem(index, delta) {
     const queue = shared ? shared.queue : [];
     const target = index + delta;
     if (target < 0 || target >= queue.length) return;
-    runQueueAction("reorder", { from: index, to: target }, "Could not reorder the queue.");
+    runQueueAction("reorder", { from: index, to: target },
+      "Could not reorder the queue.", () => reorderQueueLocal(index, target));
   }
 
   function clearQueueLongPressTimer() {
@@ -1167,14 +1235,25 @@
     queueDrag.timer = null;
   }
 
+  function clearQueueRowPressed() {
+    if (queueDrag.pressRow) queueDrag.pressRow.classList.remove("is-pressed");
+    queueDrag.pressRow = null;
+    queueDrag.pressPointerId = null;
+  }
+
+  function setQueueRowPressed(row, pointerId, clientX, clientY) {
+    clearQueueRowPressed();
+    queueDrag.pressRow = row;
+    queueDrag.pressPointerId = pointerId;
+    queueDrag.startX = clientX;
+    queueDrag.startY = clientY;
+    row.classList.add("is-pressed");
+  }
+
   function beginQueueLongPress(event) {
     if (queueDrag.pending || queueDrag.active) return;
     if (event.isPrimary === false) return;
     if (event.pointerType === "mouse" && event.button !== 0) return;
-    if (queueBusy || !reachable) return;
-
-    const queue = shared ? shared.queue : [];
-    if (queue.length < 2) return;
 
     const target = event.target;
     if (!target || typeof target.closest !== "function") return;
@@ -1183,8 +1262,14 @@
     const row = target.closest(".queue-row");
     if (!row || !ui.queueList || !ui.queueList.contains(row)) return;
 
+    const queue = shared ? shared.queue : [];
     const index = Number(row.dataset.queueIndex);
     if (!Number.isInteger(index) || index < 0 || index >= queue.length) return;
+
+    // Show the press immediately, even when a drag cannot start (one row,
+    // offline, or while a previous queue request is still settling).
+    setQueueRowPressed(row, event.pointerId, event.clientX, event.clientY);
+    if (!reachable || queue.length < 2) return;
 
     queueDrag.pending = true;
     queueDrag.pointerId = event.pointerId;
@@ -1203,7 +1288,7 @@
 
     const row = queueDrag.row;
     const queue = shared ? shared.queue : [];
-    if (!row || !row.isConnected || queueBusy || !reachable ||
+    if (!row || !row.isConnected || !reachable ||
         queueDrag.fromIndex < 0 || queueDrag.fromIndex >= queue.length) {
       cancelQueueDrag();
       return;
@@ -1222,6 +1307,8 @@
     queueDrag.grabOffsetY = clamp(queueDrag.startY - rect.top, 0, rect.height);
     queueDrag.pointerY = queueDrag.startY;
 
+    // Remove the pressed tint before cloning so the ghost starts clean.
+    clearQueueRowPressed();
     const ghost = row.cloneNode(true);
     ghost.classList.add("queue-drag-ghost");
     ghost.classList.remove("is-drag-origin");
@@ -1238,6 +1325,16 @@
     row.setAttribute("aria-grabbed", "true");
     if (ui.queueList) ui.queueList.classList.add("is-reordering");
     document.body.classList.add("is-reordering-queue");
+
+    // A short tap of feedback when the row actually lifts. Best effort only:
+    // desktops and browsers without the Vibration API simply ignore it.
+    if (typeof navigator.vibrate === "function") {
+      try {
+        navigator.vibrate(10);
+      } catch {
+        // Haptics are optional.
+      }
+    }
 
     const indicator = makeElement("div", "queue-drop-indicator");
     indicator.setAttribute("aria-hidden", "true");
@@ -1330,45 +1427,64 @@
   }
 
   function queueDragPointerMove(event) {
-    if (!queueDrag.pending && !queueDrag.active) return;
-    if (queueDrag.pointerId !== null && event.pointerId !== queueDrag.pointerId) return;
+    if (queueDrag.active) {
+      if (queueDrag.pointerId !== null && event.pointerId !== queueDrag.pointerId) return;
+      queueDrag.pointerY = event.clientY;
+      if (queueDrag.ghost) {
+        queueDrag.ghost.style.top = `${event.clientY - queueDrag.grabOffsetY}px`;
+      }
+      updateQueueDropTarget();
+      return;
+    }
 
     if (queueDrag.pending) {
+      if (queueDrag.pointerId !== null && event.pointerId !== queueDrag.pointerId) return;
       const dx = event.clientX - queueDrag.startX;
       const dy = event.clientY - queueDrag.startY;
       if (Math.hypot(dx, dy) > QUEUE_LONG_PRESS_SLOP_PX) cancelQueueDrag();
       return;
     }
 
-    if (!queueDrag.active) return;
-    queueDrag.pointerY = event.clientY;
-    if (queueDrag.ghost) {
-      queueDrag.ghost.style.top = `${event.clientY - queueDrag.grabOffsetY}px`;
+    if (queueDrag.pressPointerId !== null) {
+      if (event.pointerId !== queueDrag.pressPointerId) return;
+      const dx = event.clientX - queueDrag.startX;
+      const dy = event.clientY - queueDrag.startY;
+      if (Math.hypot(dx, dy) > QUEUE_LONG_PRESS_SLOP_PX) clearQueueRowPressed();
     }
-    updateQueueDropTarget();
   }
 
   function finishQueueDragPointer(event) {
-    if (queueDrag.pointerId !== null && event.pointerId !== queueDrag.pointerId) return;
-    if (queueDrag.pending && !queueDrag.active) {
+    if (queueDrag.active) {
+      if (queueDrag.pointerId !== null && event.pointerId !== queueDrag.pointerId) return;
+      const from = queueDrag.fromIndex;
+      const to = queueDrag.toIndex;
+      const shouldReorder = to !== from && reachable;
+      stopQueueDrag();
+
+      if (shouldReorder) {
+        runQueueAction("reorder", { from, to }, "Could not reorder the queue.",
+          () => reorderQueueLocal(from, to));
+      } else {
+        renderQueue();
+      }
+      return;
+    }
+
+    if (queueDrag.pending) {
+      if (queueDrag.pointerId !== null && event.pointerId !== queueDrag.pointerId) return;
       cancelQueueDrag();
       return;
     }
-    if (!queueDrag.active) return;
 
-    const from = queueDrag.fromIndex;
-    const to = queueDrag.toIndex;
-    const shouldReorder = to !== from && !queueBusy && reachable;
-    stopQueueDrag();
-
-    if (shouldReorder) {
-      runQueueAction("reorder", { from, to }, "Could not reorder the queue.");
-    } else {
-      renderQueue();
+    if (queueDrag.pressPointerId !== null) {
+      if (event.pointerId !== queueDrag.pressPointerId) return;
+      clearQueueRowPressed();
     }
   }
 
   function queueDragPointerCancel(event) {
+    if (queueDrag.pressPointerId !== null &&
+        event.pointerId !== queueDrag.pressPointerId) return;
     if (queueDrag.pointerId !== null && event.pointerId !== queueDrag.pointerId) return;
     cancelQueueDrag();
   }
@@ -1376,6 +1492,7 @@
   function stopQueueDrag() {
     const wasActive = queueDrag.active;
     clearQueueLongPressTimer();
+    clearQueueRowPressed();
 
     if (queueDrag.frame !== null) {
       cancelAnimationFrame(queueDrag.frame);
@@ -1434,7 +1551,6 @@
   }
 
   async function clearQueue() {
-    if (queueBusy) return;
     const count = shared ? shared.queue.length : 0;
     if (!count) return;
     const confirmed = await karaokeConfirm({
@@ -1445,11 +1561,11 @@
       focus: "cancel"
     });
     if (!confirmed) return;
-    runQueueAction("clear", {}, "Could not clear the queue.");
+    runQueueAction("clear", {}, "Could not clear the queue.",
+      () => clearQueueLocal());
   }
 
   async function stopAndClear() {
-    if (queueBusy) return;
     const confirmed = await karaokeConfirm({
       title: "Stop and clear?",
       message: "Stop the current song and remove every queued song. Playback stays stopped until you choose something else.",
@@ -1458,7 +1574,8 @@
       focus: "cancel"
     });
     if (!confirmed) return;
-    runQueueAction("stop", {}, "Could not stop the player.");
+    runQueueAction("stop", {}, "Could not stop the player.",
+      () => clearQueueLocal());
   }
 
   // --- LIBRARY -----------------------------------------------------------
@@ -1705,18 +1822,32 @@
 
   async function changeKey(delta) {
     if (keyBusy || !shared || !shared.current || !hostIsOnline()) return;
-    const target = clamp(shared.transpose + delta, -4, 4);
-    if (target === shared.transpose) return;
+    const previous = shared.transpose;
+    const target = clamp(previous + delta, -4, 4);
+    if (target === previous) return;
 
     keyBusy = true;
+    keyOptimistic = target;
+    shared.transpose = target;
     renderKey();
+    renderNowPlaying();
+    let result = null;
     try {
-      await sendControl("transpose", { semitones: target });
+      result = await sendControl("transpose", { semitones: target });
     } catch (err) {
+      shared.transpose = previous;
       showToast(userMessage(err, "Could not change the key."), "error");
     } finally {
+      keyOptimistic = null;
+      if (result && result.state) {
+        const settled = Number(result.state.transpose);
+        if (Number.isFinite(settled)) {
+          shared.transpose = clamp(Math.trunc(settled), -4, 4);
+        }
+      }
       keyBusy = false;
       renderKey();
+      renderNowPlaying();
     }
   }
 
@@ -1894,6 +2025,40 @@
 
   // --- EVENT WIRING ------------------------------------------------------
 
+  function setupPressFeedback() {
+    let pressedControl = null;
+    let pressedPointerId = null;
+
+    function clear() {
+      if (pressedControl) pressedControl.classList.remove("is-pressed");
+      pressedControl = null;
+      pressedPointerId = null;
+    }
+
+    // Pointer events fire for touch on Android Chrome. :active does not, which
+    // is why the pressed look is driven from here instead of CSS alone.
+    document.addEventListener("pointerdown", event => {
+      if (event.isPrimary === false) return;
+      if (event.pointerType === "mouse" && event.button !== 0) return;
+      const target = event.target;
+      if (!target || typeof target.closest !== "function") return;
+      const control = target.closest("button");
+      if (!control || control.disabled) return;
+      if (pressedControl !== control) clear();
+      pressedControl = control;
+      pressedPointerId = event.pointerId;
+      control.classList.add("is-pressed");
+    }, { passive: true });
+
+    const release = event => {
+      if (pressedPointerId !== null && event.pointerId !== pressedPointerId) return;
+      clear();
+    };
+    window.addEventListener("pointerup", release);
+    window.addEventListener("pointercancel", release);
+    window.addEventListener("blur", clear);
+  }
+
   function setupHandlers() {
     if (ui.playPauseButton) ui.playPauseButton.addEventListener("click", togglePlayPause);
     if (ui.restartButton) ui.restartButton.addEventListener("click", restartSong);
@@ -1993,6 +2158,7 @@
 
   function init() {
     setupTabs();
+    setupPressFeedback();
     setupHandlers();
     setupPWA();
 

@@ -1,8 +1,9 @@
 // KARAOKE APP — procedural deep-space background.
 //
-// A fullscreen WebGL shader draws the nebulae, dust lanes, and galaxy. The
-// star field is a transparent texture generated at runtime with Canvas2D, so
-// the page needs no external media assets and makes no extra network requests.
+// A fullscreen WebGL shader draws the nebulae, dust lanes, galaxies, ringed
+// planet, and aurora. The star field is a transparent texture generated at
+// runtime with Canvas2D, so the page needs no external media assets and makes
+// no extra network requests.
 //
 // Only the host page loads this module. It renders at a capped rate, pauses
 // while the tab is hidden, and respects prefers-reduced-motion.
@@ -16,7 +17,14 @@
   const SCENE_NEBULA = 0;
   const SCENE_MILKY_WAY = 1;
   const SCENE_SPIRAL = 2;
-  const SCENE_ORDER = [SCENE_NEBULA, SCENE_MILKY_WAY, SCENE_SPIRAL];
+  const SCENE_RINGED = 3;
+  const SCENE_AURORA = 4;
+  const SCENE_ORDER = [
+    SCENE_NEBULA, SCENE_MILKY_WAY, SCENE_SPIRAL, SCENE_RINGED, SCENE_AURORA
+  ];
+  const SCENE_NAMES = [
+    "nebula", "milky-way", "spiral-galaxy", "ringed-planet", "aurora"
+  ];
   const SCENE_SECONDS = 24;
   const FADE_SECONDS = 4;
   const MAX_RENDER_WIDTH = 1600;
@@ -40,6 +48,7 @@
   let lastDraw = 0;
   let elapsed = 0;
   let seed = Math.random() * Math.PI * 2;
+  let forcedScene = null;
   let quality = 1;
   let statStart = 0;
   let statFrames = 0;
@@ -356,10 +365,117 @@ vec3 sceneSpiral(vec2 uv) {
   return 1.0 - exp(-color * 1.35);
 }
 
+vec3 sceneRingedPlanet(vec2 uv) {
+  float aspect = uResolution.x / uResolution.y;
+  vec2 p = (uv - vec2(0.50, 0.66)) * vec2(aspect, 1.0);
+  float radius = 0.190;
+  float r = length(p);
+  float planetMask = 1.0 - smoothstep(radius - 0.0015, radius + 0.0015, r);
+
+  float t = uTime * 0.010;
+  float c = cos(t);
+  float s = sin(t);
+  vec2 bp = mat2(c, -s, s, c) * p;
+
+  vec3 normal = vec3(p / radius, sqrt(max(0.0, 1.0 - (r * r) / (radius * radius))));
+  vec3 lightDir = normalize(vec3(-0.58, 0.42, 0.70));
+  float lit = clamp(dot(normal, lightDir), 0.0, 1.0);
+  float terminator = smoothstep(0.02, 0.22, lit);
+
+  float bands = 0.5 + 0.5 * sin(bp.y * 44.0 + 1.4 * fbm(bp * 2.4 + 4.0));
+  float cloud = fbm(bp * vec2(3.2, 7.0) + vec2(1.7, 8.0));
+  vec3 surface = mix(vec3(0.085, 0.105, 0.160),
+                     vec3(0.57, 0.52, 0.46),
+                     bands * 0.66 + 0.22 + 0.20 * cloud);
+  surface *= 0.32 + 1.05 * terminator;
+
+  float rim = pow(1.0 - max(normal.z, 0.0), 3.0);
+  vec3 atmosphere = vec3(0.24, 0.46, 0.78) * rim * 0.31;
+
+  vec2 rp = p;
+  rp.y *= 2.75;
+  float ringRadius = length(rp) / radius;
+  float ringBand = smoothstep(1.28, 1.34, ringRadius)
+    * (1.0 - smoothstep(2.00, 2.06, ringRadius));
+  float gapA = smoothstep(1.48, 1.51, ringRadius)
+    * (1.0 - smoothstep(1.56, 1.59, ringRadius));
+  float gapB = smoothstep(1.78, 1.81, ringRadius)
+    * (1.0 - smoothstep(1.86, 1.89, ringRadius));
+  float ringMask = ringBand * (1.0 - 0.82 * gapA) * (1.0 - 0.55 * gapB);
+
+  float detail = fbm(vec2(ringRadius * 3.2, 0.7) + uTime * 0.008);
+  vec3 ringColor = mix(vec3(0.57, 0.50, 0.43),
+                       vec3(1.02, 0.93, 0.76),
+                       0.35 + 0.65 * detail);
+  ringColor *= 0.72 + 0.28 * smoothstep(-0.30, 0.30, p.y);
+
+  float shadow = 1.0 - smoothstep(-0.06, 0.06,
+    dot(normalize(p + vec2(0.04, 0.02)), normalize(vec2(0.58, -0.42))));
+  ringColor *= 1.0 - 0.55 * shadow * ringMask * (1.0 - planetMask);
+
+  vec3 color = vec3(0.004, 0.006, 0.014);
+  color += applyStars(uv, 0.52);
+  color += vec3(0.10, 0.16, 0.30) * exp(-r * r * 16.0) * 0.24;
+  color = mix(color, ringColor * 0.85, ringMask * (1.0 - planetMask));
+  color = mix(color, surface + atmosphere, planetMask);
+  float front = 1.0 - smoothstep(-0.035, 0.035, p.y);
+  color = mix(color, ringColor * 0.93, ringMask * planetMask * front);
+
+  float radius2 = length((uv - 0.5) * vec2(aspect, 1.0));
+  color *= 0.62 + 0.38 * (1.0 - smoothstep(0.30, 1.15, radius2));
+  return 1.0 - exp(-color * 1.45);
+}
+
+vec3 sceneAurora(vec2 uv) {
+  float aspect = uResolution.x / uResolution.y;
+  vec2 p = (uv - 0.5) * vec2(aspect, 1.0);
+  float t = uTime * 0.012;
+
+  vec2 limbCenter = vec2(0.02, -1.02);
+  float limbRadius = 1.30;
+  float d = length(p - limbCenter) - limbRadius;
+  float planetMask = 1.0 - smoothstep(-0.004, 0.004, d);
+  float altitude = max(d, 0.0);
+  float atmo = exp(-altitude * 10.0) * 0.30;
+
+  vec2 q1 = vec2(p.x * 2.1 + t, altitude * 4.6 - t * 1.4);
+  float n1 = fbm(q1 + 3.0);
+  vec2 q2 = vec2(p.x * 3.4 - t * 0.7 + 7.0, altitude * 7.6 + t * 0.8);
+  float n2 = fbm(q2);
+  float ribbon1 = smoothstep(0.40, 0.72, n1) * exp(-altitude * 2.0);
+  float ribbon2 = smoothstep(0.46, 0.80, n2) * exp(-altitude * 1.6);
+
+  float rays = 0.75 + 0.25 * sin(p.x * 58.0 + 4.0 * n1);
+  float rays2 = 0.82 + 0.18 * sin(p.x * 33.0 - 2.5 * n2);
+
+  vec3 deep = vec3(0.003, 0.007, 0.016);
+  vec3 green = vec3(0.12, 0.65, 0.40);
+  vec3 teal = vec3(0.09, 0.46, 0.66);
+  vec3 violet = vec3(0.38, 0.18, 0.62);
+
+  vec3 color = deep;
+  color += applyStars(uv, 0.55) * (1.0 - planetMask);
+  color += mix(green, teal, smoothstep(0.35, 0.80, n1)) * ribbon1 * rays * 1.18;
+  color += violet * ribbon2 * rays2 * 0.78;
+  color += green * exp(-altitude * 7.0) * smoothstep(0.30, 0.62, n1) * 0.26;
+  color += vec3(0.16, 0.34, 0.52) * atmo;
+
+  float band = 0.5 + 0.5 * sin(p.y * 34.0 + p.x * 4.0 + 2.0 * n1);
+  vec3 surface = mix(vec3(0.010, 0.018, 0.035),
+                     vec3(0.030, 0.050, 0.085), band * 0.35);
+  color = mix(color, surface, planetMask);
+
+  float radius = length((uv - 0.5) * vec2(aspect, 1.0));
+  color *= 0.62 + 0.38 * (1.0 - smoothstep(0.32, 1.15, radius));
+  return 1.0 - exp(-color * 1.65);
+}
+
 vec3 renderScene(float scene, vec2 uv) {
   if (scene < 0.5) return sceneNebula(uv);
   if (scene < 1.5) return sceneMilkyWay(uv);
-  return sceneSpiral(uv);
+  if (scene < 2.5) return sceneSpiral(uv);
+  if (scene < 3.5) return sceneRingedPlanet(uv);
+  return sceneAurora(uv);
 }
 
 float meteor(vec2 uv, float t) {
@@ -538,7 +654,9 @@ void main() {
 
   function draw() {
     if (!gl || !program) return;
-    const scene = sceneState(elapsed);
+    const scene = forcedScene === null
+      ? sceneState(elapsed)
+      : { a: forcedScene, b: forcedScene, mix: 0 };
     gl.viewport(0, 0, canvas.width, canvas.height);
     gl.useProgram(program);
     gl.activeTexture(gl.TEXTURE0);
@@ -633,6 +751,40 @@ void main() {
     startLoop();
   }
 
+  function setScene(value) {
+    if (value === null || value === undefined || value === "auto") {
+      forcedScene = null;
+      lastTime = performance.now();
+      draw();
+      return "auto";
+    }
+    const index = typeof value === "number"
+      ? Math.trunc(value)
+      : SCENE_NAMES.indexOf(String(value));
+    if (!Number.isInteger(index) || index < 0 || index >= SCENE_ORDER.length) {
+      throw new Error(
+        "Unknown background scene. Use one of: " + SCENE_NAMES.join(", ") + ", auto");
+    }
+    forcedScene = SCENE_ORDER[index];
+    draw();
+    return SCENE_NAMES[index];
+  }
+
+  function nextScene() {
+    const current = forcedScene === null ? -1 : SCENE_ORDER.indexOf(forcedScene);
+    return setScene((current + 1) % SCENE_ORDER.length);
+  }
+
+  function installConsoleHook() {
+    // Console-only helper for review and debugging. There is no UI for it.
+    window.__karaokeBackground = {
+      scenes: SCENE_NAMES.slice(),
+      show: setScene,
+      next: nextScene,
+      auto: () => setScene("auto")
+    };
+  }
+
   function init() {
     starSource = createStarSource();
 
@@ -658,6 +810,7 @@ void main() {
     resize();
     draw();
     canvas.classList.add("is-ready");
+    installConsoleHook();
     if (!motionQuery.matches) startLoop();
   }
 
