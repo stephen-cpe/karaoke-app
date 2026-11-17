@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import time
 import urllib.request
+from pathlib import Path
 
 import pytest
 
@@ -224,6 +225,91 @@ def test_host_join_qr_matches_visible_url_and_sits_below_note(host_page):
         timeout=5000,
     )
     assert host_page.locator("#host-join-qr svg").count() == 1
+
+
+def test_host_background_console_hook_switches_scenes(host_page):
+    host_page.wait_for_timeout(500)
+    if not host_page.evaluate("() => !!window.__karaokeBackground"):
+        pytest.skip("WebGL background unavailable")
+    assert host_page.evaluate("() => window.__karaokeBackground.scenes") == [
+        "nebula", "milky-way", "spiral-galaxy", "ringed-planet", "aurora",
+    ]
+    assert host_page.evaluate(
+        "() => window.__karaokeBackground.show('ringed-planet')") == "ringed-planet"
+    assert host_page.evaluate(
+        "() => window.__karaokeBackground.show('aurora')") == "aurora"
+    assert host_page.evaluate("() => window.__karaokeBackground.auto()") == "auto"
+
+
+def test_host_background_static_fallback_without_webgl(browser, live_server):
+    context = browser.new_context(viewport={"width": 1280, "height": 800})
+    page = context.new_page()
+    page.add_init_script("""(() => {
+      const original = HTMLCanvasElement.prototype.getContext;
+      HTMLCanvasElement.prototype.getContext = function(type, ...args) {
+        if (String(type).includes('webgl')) return null;
+        return original.call(this, type, ...args);
+      };
+    })();""")
+    try:
+        page.goto(live_server.url("/player"), wait_until="networkidle")
+        page.wait_for_function(
+            "() => document.querySelector('#host-status-text')?.textContent.includes('Player online')",
+            timeout=15000,
+        )
+        page.wait_for_timeout(500)
+        state = page.evaluate("""() => ({
+          ready: document.querySelector('#background-canvas')?.classList.contains('is-ready'),
+          opacity: getComputedStyle(document.querySelector('#background-canvas')).opacity,
+          fallback: getComputedStyle(document.querySelector('.background-fallback')).backgroundImage,
+          hook: !!window.__karaokeBackground
+        })""")
+        assert state["ready"] is False
+        assert state["opacity"] == "0"
+        assert "radial-gradient" in state["fallback"]
+        assert state["hook"] is False
+    finally:
+        context.close()
+
+
+def test_host_background_static_fallback_when_shader_fails(browser, live_server):
+    source = (
+        Path(__file__).resolve().parents[2] / "static" / "background.js"
+    ).read_text(encoding="utf-8")
+    broken = source.replace(
+        "gl_FragColor = vec4(clamp(color + grain + dither, 0.0, 1.0), 1.0);",
+        "gl_FragColor = missingFunction(color);",
+    )
+    assert broken != source
+    context = browser.new_context(viewport={"width": 1280, "height": 800})
+    page = context.new_page()
+    messages = []
+    page.on("console", lambda message: messages.append(message.text))
+    page.route("**/static/background.js", lambda route: route.fulfill(
+        status=200,
+        content_type="text/javascript; charset=utf-8",
+        body=broken,
+    ))
+    try:
+        page.goto(live_server.url("/player"), wait_until="networkidle")
+        page.wait_for_function(
+            "() => document.querySelector('#host-status-text')?.textContent.includes('Player online')",
+            timeout=15000,
+        )
+        page.wait_for_timeout(500)
+        state = page.evaluate("""() => ({
+          ready: document.querySelector('#background-canvas')?.classList.contains('is-ready'),
+          opacity: getComputedStyle(document.querySelector('#background-canvas')).opacity,
+          fallback: getComputedStyle(document.querySelector('.background-fallback')).backgroundImage,
+          hook: !!window.__karaokeBackground
+        })""")
+        assert state["ready"] is False
+        assert state["opacity"] == "0"
+        assert "radial-gradient" in state["fallback"]
+        assert state["hook"] is False
+        assert any("Shader compile failed" in message for message in messages)
+    finally:
+        context.close()
 
 
 def test_remote_queue_row_shows_pressed_state_on_touch(
