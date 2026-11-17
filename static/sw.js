@@ -2,7 +2,7 @@
 // Caches the remote shell only. Session state, songs, lyrics, and transcoded
 // audio always come from the network so stale data can never control the TV.
 
-const CACHE_VERSION = "karaoke-remote-v3";
+const CACHE_VERSION = "karaoke-remote-v4";
 const CORE_ASSETS = [
   "/remote",
   "/manifest.webmanifest",
@@ -10,6 +10,7 @@ const CORE_ASSETS = [
   "/static/remote.js",
   "/static/confirm-dialog.css",
   "/static/confirm-dialog.js",
+  "/static/lyrics_display.js",
   "/static/logo.webp",
   "/static/favicon.ico",
   "/static/icon-192.png",

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import time
 import urllib.request
 
 import pytest
@@ -90,6 +91,31 @@ def _touch_drag(
         "type": "touchCancel" if cancel else "touchEnd",
         "touchPoints": [],
     })
+
+
+def _touch_start(page, x, y):
+    """Start a real CDP touch and return the session so the test can end it."""
+    session = page.context.new_cdp_session(page)
+    session.send("Input.dispatchTouchEvent", {
+        "type": "touchStart",
+        "touchPoints": [{
+            "x": x,
+            "y": y,
+            "id": 1,
+            "radiusX": 2,
+            "radiusY": 2,
+            "force": 1,
+        }],
+    })
+    return session
+
+
+def _touch_end(session, cancel=True):
+    session.send("Input.dispatchTouchEvent", {
+        "type": "touchCancel" if cancel else "touchEnd",
+        "touchPoints": [],
+    })
+    session.detach()
 
 
 @pytest.fixture
@@ -198,6 +224,445 @@ def test_host_join_qr_matches_visible_url_and_sits_below_note(host_page):
         timeout=5000,
     )
     assert host_page.locator("#host-join-qr svg").count() == 1
+
+
+def test_remote_queue_row_shows_pressed_state_on_touch(
+        host_page, browser, live_server):
+    _add_songs(live_server, 2)
+    context = browser.new_context(
+        viewport={"width": 390, "height": 844},
+        has_touch=True,
+    )
+    try:
+        remote = _open_remote(context, live_server)
+        _wait_for_queue(remote, 1)
+        row = remote.locator("#queue-list .queue-row").nth(0)
+        box = row.bounding_box()
+        assert box
+
+        session = _touch_start(
+            remote, box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+        try:
+            remote.wait_for_timeout(60)
+            pressed = row.evaluate("""el => ({
+              pressed: el.classList.contains('is-pressed'),
+              background: getComputedStyle(el).backgroundColor
+            })""")
+            assert pressed["pressed"]
+            assert pressed["background"] != "rgba(0, 0, 0, 0)"
+        finally:
+            _touch_end(session)
+
+        remote.wait_for_function(
+            "() => !document.querySelector('#queue-list .queue-row')"
+            "?.classList.contains('is-pressed')",
+            timeout=2000,
+        )
+    finally:
+        context.close()
+
+
+def test_remote_queue_press_clears_on_early_lift_and_scroll(
+        host_page, browser, live_server):
+    _add_songs(live_server, 3)
+    context = browser.new_context(
+        viewport={"width": 390, "height": 844},
+        has_touch=True,
+    )
+    try:
+        remote = _open_remote(context, live_server)
+        _wait_for_queue(remote, 2)
+        row = remote.locator("#queue-list .queue-row").nth(0)
+        box = row.bounding_box()
+        assert box
+        x = box["x"] + box["width"] / 2
+        y = box["y"] + box["height"] / 2
+
+        session = _touch_start(remote, x, y)
+        remote.wait_for_timeout(50)
+        assert row.evaluate("el => el.classList.contains('is-pressed')")
+        _touch_end(session, cancel=False)
+        remote.wait_for_function(
+            "() => !document.querySelector('#queue-list .queue-row')"
+            "?.classList.contains('is-pressed')",
+            timeout=2000,
+        )
+        assert remote.locator(".queue-drag-ghost").count() == 0
+
+        session = _touch_start(remote, x, y)
+        remote.wait_for_timeout(50)
+        assert row.evaluate("el => el.classList.contains('is-pressed')")
+        session.send("Input.dispatchTouchEvent", {
+            "type": "touchMove",
+            "touchPoints": [{
+                "x": x + 2,
+                "y": y + 24,
+                "id": 1,
+                "radiusX": 2,
+                "radiusY": 2,
+                "force": 1,
+            }],
+        })
+        remote.wait_for_function(
+            "() => !document.querySelector('#queue-list .queue-row')"
+            "?.classList.contains('is-pressed')",
+            timeout=2000,
+        )
+        _touch_end(session)
+        assert remote.locator(".queue-drag-ghost").count() == 0
+    finally:
+        context.close()
+
+
+def test_remote_buttons_show_pressed_state_on_touch(
+        host_page, browser, live_server):
+    _add_songs(live_server, 2)
+    context = browser.new_context(
+        viewport={"width": 390, "height": 844},
+        has_touch=True,
+    )
+    try:
+        remote = _open_remote(context, live_server)
+        _wait_for_queue(remote, 1)
+
+        remote.locator("#tab-songs").click()
+        remote.wait_for_function(
+            "() => document.querySelectorAll('#song-list .song-row').length >= 3")
+        add = remote.locator("#song-list .song-row:nth-child(2) .add-song")
+        add.scroll_into_view_if_needed()
+        remote.wait_for_timeout(100)
+        add_box = add.bounding_box()
+        assert add_box
+        initial = add.evaluate("el => getComputedStyle(el).backgroundColor")
+
+        session = _touch_start(
+            remote, add_box["x"] + add_box["width"] / 2,
+            add_box["y"] + add_box["height"] / 2)
+        try:
+            remote.wait_for_timeout(60)
+            assert add.evaluate("el => el.classList.contains('is-pressed')")
+            assert add.evaluate(
+                "el => getComputedStyle(el).backgroundColor") != initial
+        finally:
+            _touch_end(session)
+        remote.wait_for_function(
+            "() => !document.querySelector('.add-song')"
+            "?.classList.contains('is-pressed')",
+            timeout=2000,
+        )
+
+        restart = remote.locator("#restart-button")
+        restart.scroll_into_view_if_needed()
+        remote.wait_for_timeout(100)
+        restart_box = restart.bounding_box()
+        assert restart_box
+        restart_initial = restart.evaluate(
+            "el => getComputedStyle(el).backgroundColor")
+        session = _touch_start(
+            remote, restart_box["x"] + restart_box["width"] / 2,
+            restart_box["y"] + restart_box["height"] / 2)
+        try:
+            remote.wait_for_timeout(60)
+            assert restart.evaluate("el => el.classList.contains('is-pressed')")
+            assert restart.evaluate(
+                "el => getComputedStyle(el).backgroundColor") != restart_initial
+        finally:
+            _touch_end(session)
+        remote.wait_for_function(
+            "() => !document.querySelector('#restart-button')"
+            "?.classList.contains('is-pressed')",
+            timeout=2000,
+        )
+    finally:
+        context.close()
+
+
+def test_remote_drag_reorders_before_the_server_replies(
+        host_page, browser, live_server):
+    _add_songs(live_server, 3)
+    context = browser.new_context(
+        viewport={"width": 390, "height": 844},
+        has_touch=True,
+    )
+    held = []
+    remote = None
+    try:
+        remote = _open_remote(context, live_server)
+        _wait_for_queue(remote, 2)
+        before = _state(live_server)["queue"]
+        assert len(before) == 2
+
+        rows = remote.locator("#queue-list .queue-row")
+        first = rows.nth(0).bounding_box()
+        second = rows.nth(1).bounding_box()
+        assert first and second
+
+        remote.route("**/api/control", lambda route: held.append(route))
+        _touch_drag(
+            remote,
+            (first["x"] + first["width"] / 2, first["y"] + first["height"] / 2),
+            (second["x"] + second["width"] / 2, second["y"] + second["height"] - 4),
+            hold_ms=350,
+        )
+
+        expected_titles = [before[1]["title"], before[0]["title"]]
+        remote.wait_for_function(
+            """(expected) => {
+              const titles = Array.from(
+                document.querySelectorAll('#queue-list .queue-row .queue-title'),
+                node => node.textContent);
+              return titles.length === expected.length &&
+                titles.every((title, index) => title === expected[index]);
+            }""",
+            arg=expected_titles,
+            timeout=3000,
+        )
+        assert [song["filename"] for song in _state(live_server)["queue"]] == [
+            before[0]["filename"],
+            before[1]["filename"],
+        ]
+        assert held, "the reorder request should still be waiting"
+
+        held.pop(0).continue_()
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            after = _state(live_server)["queue"]
+            if [song["filename"] for song in after] == [
+                    before[1]["filename"], before[0]["filename"]]:
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError("the reorder was not applied on the server")
+    finally:
+        for route in held:
+            route.continue_()
+        if remote is not None:
+            remote.unroute("**/api/control")
+        context.close()
+
+
+def test_remote_drag_reverts_and_toasts_when_reorder_fails(
+        host_page, browser, live_server):
+    _add_songs(live_server, 3)
+    context = browser.new_context(
+        viewport={"width": 390, "height": 844},
+        has_touch=True,
+    )
+    held = []
+    remote = None
+    try:
+        remote = _open_remote(context, live_server)
+        _wait_for_queue(remote, 2)
+        before = _state(live_server)["queue"]
+        assert len(before) == 2
+
+        rows = remote.locator("#queue-list .queue-row")
+        first = rows.nth(0).bounding_box()
+        second = rows.nth(1).bounding_box()
+        assert first and second
+
+        remote.route("**/api/control", lambda route: held.append(route))
+        _touch_drag(
+            remote,
+            (first["x"] + first["width"] / 2, first["y"] + first["height"] / 2),
+            (second["x"] + second["width"] / 2, second["y"] + second["height"] - 4),
+            hold_ms=350,
+        )
+        expected_titles = [before[1]["title"], before[0]["title"]]
+        remote.wait_for_function(
+            """(expected) => {
+              const titles = Array.from(
+                document.querySelectorAll('#queue-list .queue-row .queue-title'),
+                node => node.textContent);
+              return titles.length === expected.length &&
+                titles.every((title, index) => title === expected[index]);
+            }""",
+            arg=expected_titles,
+            timeout=3000,
+        )
+        assert held, "the reorder request should still be waiting"
+        held.pop(0).fulfill(
+            status=500,
+            content_type="application/json",
+            body='{"error": "Server said no."}',
+        )
+        remote.wait_for_function(
+            """(expected) => {
+              const titles = Array.from(
+                document.querySelectorAll('#queue-list .queue-row .queue-title'),
+                node => node.textContent);
+              return titles.length === expected.length &&
+                titles.every((title, index) => title === expected[index]);
+            }""",
+            arg=[before[0]["title"], before[1]["title"]],
+            timeout=5000,
+        )
+        remote.wait_for_function(
+            "() => document.querySelector('#toast')?.textContent === 'Server said no.'",
+            timeout=5000,
+        )
+        assert [song["filename"] for song in _state(live_server)["queue"]] == [
+            before[0]["filename"],
+            before[1]["filename"],
+        ]
+    finally:
+        for route in held:
+            route.continue_()
+        if remote is not None:
+            remote.unroute("**/api/control")
+        context.close()
+
+
+def test_remote_queue_tap_works_while_previous_request_is_pending(
+        host_page, browser, live_server):
+    _add_songs(live_server, 3)
+    context = browser.new_context(
+        viewport={"width": 390, "height": 844},
+        has_touch=True,
+    )
+    held = []
+    remote = None
+    try:
+        remote = _open_remote(context, live_server)
+        _wait_for_queue(remote, 2)
+        before = _state(live_server)["queue"]
+        assert len(before) == 2
+
+        remote.route("**/api/control", lambda route: held.append(route))
+
+        # Move the first queued song down, then move it straight back up while
+        # the first request is still stalled. Both taps must react at once.
+        remote.locator("#queue-list .queue-row").nth(0).locator(
+            ".queue-action").nth(1).click()
+        remote.wait_for_function(
+            """(expected) => {
+              const titles = Array.from(
+                document.querySelectorAll('#queue-list .queue-row .queue-title'),
+                node => node.textContent);
+              return titles.length === expected.length &&
+                titles.every((title, index) => title === expected[index]);
+            }""",
+            arg=[before[1]["title"], before[0]["title"]],
+            timeout=3000,
+        )
+        assert len(held) == 1
+
+        remote.locator("#queue-list .queue-row").nth(1).locator(
+            ".queue-action").nth(0).click()
+        remote.wait_for_function(
+            """(expected) => {
+              const titles = Array.from(
+                document.querySelectorAll('#queue-list .queue-row .queue-title'),
+                node => node.textContent);
+              return titles.length === expected.length &&
+                titles.every((title, index) => title === expected[index]);
+            }""",
+            arg=[before[0]["title"], before[1]["title"]],
+            timeout=3000,
+        )
+        remote.wait_for_timeout(100)
+        assert len(held) == 1, "the second request must wait for the first"
+
+        held.pop(0).continue_()
+        deadline = time.time() + 10
+        while time.time() < deadline and not held:
+            remote.wait_for_timeout(50)
+        assert len(held) == 1, "the second request should run after the first"
+
+        held.pop(0).continue_()
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            after = _state(live_server)["queue"]
+            if [song["filename"] for song in after] == [
+                    before[0]["filename"], before[1]["filename"]]:
+                break
+            remote.wait_for_timeout(50)
+        else:
+            raise AssertionError("the second reorder was not applied on the server")
+    finally:
+        for route in held:
+            route.continue_()
+        if remote is not None:
+            remote.unroute("**/api/control")
+        context.close()
+
+
+def test_remote_key_readout_updates_before_the_server_replies(
+        host_page, browser, live_server):
+    _add_songs(live_server, 1)
+    context = browser.new_context(
+        viewport={"width": 390, "height": 844},
+        has_touch=True,
+    )
+    held = []
+    remote = None
+    try:
+        remote = _open_remote(context, live_server)
+        remote.wait_for_function(
+            "() => { const button = document.querySelector('#key-up');"
+            " return button && !button.disabled; }",
+            timeout=10000,
+        )
+        remote.route("**/api/control", lambda route: held.append(route))
+        remote.click("#key-up")
+        remote.wait_for_function(
+            "() => document.querySelector('#key-readout')?.textContent === '+1'",
+            timeout=2000,
+        )
+        assert _state(live_server)["transpose"] == 0
+        assert held, "the transpose request should still be waiting"
+
+        held.pop(0).continue_()
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            if _state(live_server)["transpose"] == 1:
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError("the transpose was not applied on the server")
+    finally:
+        for route in held:
+            route.continue_()
+        if remote is not None:
+            remote.unroute("**/api/control")
+        context.close()
+
+
+def test_remote_queue_lift_requests_short_vibration(
+        host_page, browser, live_server):
+    _add_songs(live_server, 3)
+    context = browser.new_context(
+        viewport={"width": 390, "height": 844},
+        has_touch=True,
+    )
+    try:
+        remote = _open_remote(context, live_server)
+        _wait_for_queue(remote, 2)
+        remote.evaluate("""() => {
+          window.__vibrations = [];
+          navigator.vibrate = ms => {
+            window.__vibrations.push(ms);
+            return true;
+          };
+        }""")
+        rows = remote.locator("#queue-list .queue-row")
+        first = rows.nth(0).bounding_box()
+        second = rows.nth(1).bounding_box()
+        assert first and second
+        _touch_drag(
+            remote,
+            (first["x"] + first["width"] / 2, first["y"] + first["height"] / 2),
+            (second["x"] + second["width"] / 2, second["y"] + second["height"] - 4),
+            hold_ms=350,
+        )
+        remote.wait_for_function(
+            "() => Array.isArray(window.__vibrations) && "
+            "window.__vibrations.length === 1",
+            timeout=3000,
+        )
+        assert remote.evaluate("() => window.__vibrations") == [10]
+    finally:
+        context.close()
 
 
 def test_remote_touch_long_press_reorders_queue(host_page, browser, live_server):

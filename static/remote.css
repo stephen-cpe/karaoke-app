@@ -1414,6 +1414,70 @@ body.is-reordering-queue {
   to { opacity: 1; transform: translate(-50%, 0); }
 }
 
+/* ---------- Pressed feedback (pointer-driven, so touch works) ---------- */
+
+.queue-row.is-pressed {
+  background: rgba(255, 255, 255, 0.055);
+}
+
+.transport-button.is-pressed:not(:disabled) {
+  border-color: var(--line-strong);
+  background: rgba(255, 255, 255, 0.11);
+}
+
+.transport-play.is-pressed:not(:disabled) {
+  background: linear-gradient(145deg, #ff6584, #f0244c);
+}
+
+.step-button.is-pressed:not(:disabled) {
+  background: rgba(255, 255, 255, 0.11);
+}
+
+.tab.is-pressed {
+  background: rgba(255, 255, 255, 0.09);
+  color: #fff;
+}
+
+.text-button.is-pressed:not(:disabled) {
+  background: rgba(255, 255, 255, 0.07);
+  color: #fff;
+}
+
+.danger-button.is-pressed:not(:disabled) {
+  background: rgba(255, 45, 85, 0.16);
+  color: #fff;
+}
+
+.queue-action.is-pressed:not(:disabled) {
+  background: rgba(255, 255, 255, 0.08);
+  color: #fff;
+}
+
+.queue-action.is-remove.is-pressed:not(:disabled) {
+  background: rgba(255, 45, 85, 0.14);
+  color: #fecdd3;
+}
+
+.add-song.is-pressed:not(:disabled) {
+  border-color: rgba(255, 45, 85, 0.45);
+  background: rgba(255, 45, 85, 0.18);
+  color: #fff;
+}
+
+.search-clear.is-pressed {
+  background: rgba(255, 255, 255, 0.11);
+  color: #fff;
+}
+
+.retry-button.is-pressed {
+  background: rgba(255, 255, 255, 0.07);
+}
+
+.install-button.is-pressed {
+  background: rgba(255, 255, 255, 0.1);
+  color: #fff;
+}
+
 /* ---------- Responsive ---------- */
 
 @media (min-width: 700px) {

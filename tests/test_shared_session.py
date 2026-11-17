@@ -299,6 +299,12 @@ def test_manifest_and_service_worker_routes(client):
     assert worker_response.headers["Cache-Control"] == "no-cache"
 
 
+def test_remote_service_worker_caches_its_script_dependencies(client):
+    script = client.get("/sw.js").data.decode("utf-8")
+    assert 'CACHE_VERSION = "karaoke-remote-v4"' in script
+    assert '"/static/lyrics_display.js"' in script
+
+
 @pytest.mark.parametrize("filename", [
     "icon-192.png", "icon-512.png", "icon-maskable-512.png", "apple-touch-icon.png",
 ])
