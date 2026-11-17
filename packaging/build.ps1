@@ -33,7 +33,7 @@ if (-not $Version) {
 }
 $Version = $Version.Trim() -replace '^[vV]', ''
 if ($Version -notmatch '^\d+\.\d+\.\d+$') {
-    throw "Invalid version '$Version'. Use a value such as 0.0.2 or v0.0.2."
+    throw "Invalid version '$Version'. Use a value such as 0.0.3 or v0.0.3."
 }
 if ($Version -ne $SourceVersion) {
     throw "Version '$Version' does not match karaoke/version.py ('$SourceVersion')."

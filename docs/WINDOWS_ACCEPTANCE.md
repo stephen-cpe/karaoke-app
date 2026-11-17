@@ -25,7 +25,7 @@ Python installed before declaring the release ready.
 - [ ] Confirm a startup/status window appears with meaningful status text and
       the dark charcoal launcher theme.
 - [ ] Confirm the main window displays `KARAOKE APP`,
-      `Version: 0.0.2 (PRE-ALPHA)`, `Status: Running`, the local player URL,
+      `Version: 0.0.3 (PRE-ALPHA)`, `Status: Running`, the local player URL,
       and the detected LAN URLs, with light text on a dark background and
       readable accent buttons.
 - [ ] Confirm the active Windows title bar is dark where the installed Windows
@@ -91,13 +91,37 @@ Python installed before declaring the release ready.
 - [ ] Launch a second copy and confirm it does not create a second backend;
       it should direct the user to the existing tray instance.
 
+## Background and phone-remote checks for 0.0.3
+
+- [ ] On the TV player page, let the background rotate through all five scenes
+      (or use `__karaokeBackground.show("ringed-planet")` and
+      `__karaokeBackground.show("aurora")` in the browser console) and confirm
+      the nebula, Milky Way, spiral galaxy, ringed planet, and aurora all render.
+- [ ] Confirm the lyrics and the library/queue panels stay readable over every
+      scene, especially the ringed planet behind the song list and the aurora.
+- [ ] Confirm the ringed planet and both sides of its ring are fully inside the
+      frame at 16:9.
+- [ ] On the phone remote, press and hold a queue row: confirm the pressed tint
+      appears immediately, the row lifts after about 0.25 s, and a short
+      vibration occurs if the phone supports it.
+- [ ] Drag the first queued song to the end; confirm the new order appears on
+      release before the server reply, with no snap-back.
+- [ ] Scroll the queue quickly and tap a row briefly; confirm the pressed tint
+      clears and no drag starts.
+- [ ] Tap Add, the transport buttons, queue actions, key steppers, tabs, and
+      Clear; confirm each shows its pressed look while the finger is down.
+- [ ] Confirm a lyric line without word timings highlights fully in the sung
+      style.
+- [ ] After updating an installed phone remote, reload it once and confirm it
+      picks up the new remote files.
+
 ## Version and release consistency
 
 - [ ] Compare the GUI label, `karaoke-app.exe` FileVersion/ProductVersion,
       `README-DISTRIBUTION.txt`, and the release tag. All must identify
-      `0.0.2 (PRE-ALPHA)` / `v0.0.2`.
+      `0.0.3 (PRE-ALPHA)` / `v0.0.3`.
 - [ ] Confirm the GitHub Release is marked as a pre-release and titled
-      `Karaoke App v0.0.2`.
+      `Karaoke App v0.0.3`.
 - [ ] Confirm the ZIP checksum matches the published `.sha256` asset.
 - [ ] Confirm no songs, `original_songs/`, `.srt`, `.words.json`, AI models,
       caches, development tools, or personal data are in the ZIP.

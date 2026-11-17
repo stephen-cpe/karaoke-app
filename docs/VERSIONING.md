@@ -8,12 +8,15 @@ pre-alpha phase. It is intentionally not standard SemVer incrementing.
 - **Major**: Major project milestones and substantial overall evolution.
   `1.0.0` means the first stable release, not merely the introduction of a
   major feature.
-- **Minor**: User-facing improvements, meaningful feature enhancements, and
-  changes driven by feedback from friends, family, and other early users.
-- **Patch**: Internal maintenance that does not materially change the
-  application's appearance or user experience, including bug fixes,
-  performance optimizations, technical debt reduction, dependency
-  maintenance, and other behind-the-scenes improvements.
+- **Minor**: The first release shaped by feedback from real users. Move from
+  `0.0.x` to `0.1.0` only when that feedback exists; the maintainer's own
+  user-facing improvements before then do not by themselves justify a minor
+  bump.
+- **Patch**: Fixes, maintenance, and the maintainer's own improvements before
+  real-user feedback exists. This includes bug fixes, performance
+  optimizations, technical debt reduction, dependency and packaging
+  maintenance, and other behind-the-scenes or self-directed changes, even when
+  they change the application's appearance or experience.
 
 ## Current status
 
@@ -40,10 +43,10 @@ successfully building through GitHub Actions does not independently justify a
 |---|---|
 | `v0.0.1` | Initial public pre-alpha executable release |
 | `v0.0.2` | Bug fixes, optimizations, and internal maintenance |
-| `v0.0.3` | Additional bug fixes and technical improvements |
-| `v0.1.0` | User-feedback-driven improvements or meaningful user-facing enhancements |
-| `v0.1.1` | Maintenance and bug fixes following that release |
-| `v0.2.0` | Another meaningful round of user-facing improvements |
+| `v0.0.3` | Phone-remote responsiveness, five background scenes, lyric highlighting, and Python 3.14/Tcl-Tk 9 packaging; maintainer-driven improvements before real-user feedback |
+| `v0.1.0` | First release shaped by feedback from real users |
+| `v0.1.1` | Fixes and maintenance following that release |
+| `v0.2.0` | Another round of real-user feedback |
 | `v1.0.0` | First stable release after sufficient real-world testing and meaningful user feedback |
 
 These examples are illustrative, not a mandatory release schedule.
@@ -72,13 +75,15 @@ There is no independently maintained version in the GUI or CI workflow.
 
 ## Next planned pre-alpha release
 
-- Version: `0.0.2`
-- Tag: `v0.0.2`
-- Release title: `Karaoke App v0.0.2`
+- Version: `0.0.3`
+- Tag: `v0.0.3`
+- Release title: `Karaoke App v0.0.3`
 - Mark as a GitHub pre-release.
 - Label it as an early pre-alpha build.
-- Focus: touch-friendly phone-remote queue reordering, the host-player join QR
-  code, and compact host layout improvements.
+- Focus: instant phone-remote touch feedback and queue reordering, the
+  five-scene procedural background with the new ringed planet and aurora,
+  full-line highlighting for lyrics without word timings, and the Python 3.14 /
+  Tcl/Tk 9 Windows build.
 - Include a disclaimer that bugs, incomplete functionality, and unexpected
   behavior are possible.
 - Attach the Windows x64 ZIP and its SHA-256 checksum.
